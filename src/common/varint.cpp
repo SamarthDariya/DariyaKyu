@@ -57,8 +57,22 @@ size_t writeBase128(Unsigned value, span<uint8_t> out) {
 // `maxBytes` bounds the encoding so a damaged batch cannot make us read forever,
 // and so an over-long encoding of a small type is rejected rather than silently
 // truncated.
+//
+// Bounding the byte count is not sufficient on its own. The final permitted byte
+// carries seven payload bits, but only some of them fit: for an int32 the fifth
+// byte contributes bits 28-34, of which just 28-31 exist. Accepting the rest
+// would silently discard them and yield a wrong-but-plausible number from input
+// that was never a valid varint.
+//
+// The one path where that is expensive is the recovery scan, which walks a
+// partially written segment looking for where the good data ends. A length that
+// decodes to something plausible there could make us accept a torn record
+// instead of truncating at it — the single place in the system where believing
+// damaged data does real harm.
 template <typename Unsigned>
 size_t readBase128(span<const uint8_t> in, Unsigned& value, size_t maxBytes) {
+    constexpr unsigned kBitWidth = sizeof(Unsigned) * 8;
+
     Unsigned result = 0;
     size_t   read   = 0;
     unsigned shift  = 0;
@@ -71,8 +85,18 @@ size_t readBase128(span<const uint8_t> in, Unsigned& value, size_t maxBytes) {
             throw CorruptData("varint: encoding longer than " + to_string(maxBytes) +
                               " bytes, which the target type cannot hold");
 
-        const uint8_t byte = in[read++];
-        result |= static_cast<Unsigned>(byte & 0x7F) << shift;
+        const uint8_t byte    = in[read++];
+        const uint8_t payload = byte & 0x7F;
+
+        if (shift + 7 > kBitWidth) {
+            const unsigned allowedBits = (shift < kBitWidth) ? (kBitWidth - shift) : 0;
+            if (payload >= (1u << allowedBits))
+                throw CorruptData("varint: final byte payload " + to_string(payload) +
+                                  " sets bits beyond the " + to_string(kBitWidth) +
+                                  "-bit target type");
+        }
+
+        result |= static_cast<Unsigned>(payload) << shift;
         if ((byte & 0x80) == 0) break;
         shift += 7;
     }
