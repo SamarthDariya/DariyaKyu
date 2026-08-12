@@ -33,6 +33,15 @@ public:
     // A view into the underlying buffer. No copy.
     std::span<const std::uint8_t> readBytes(std::size_t count);
 
+    // Reads an int32 element count and validates it. Kafka encodes a null array
+    // as -1, which is why the return type is signed and -1 is permitted.
+    //
+    // Deliberately not a readArray<T>(fn) template: the caller loops, so the
+    // loop body is visible at the call site rather than hidden behind a
+    // callback. Used by the protocol layer, where nearly every request carries
+    // arrays of topics carrying arrays of partitions.
+    std::int32_t readArrayLength();
+
     void skip(std::size_t count);
 
     std::size_t position() const { return position_; }
@@ -74,13 +83,28 @@ public:
 
     std::size_t position() const { return bytes_.size(); }
 
-    std::span<const std::uint8_t> view() const { return bytes_; }
-    std::vector<std::uint8_t>     take() { return std::move(bytes_); }
+    // Read what has been written so far, in place. build() uses this to checksum
+    // its own output without copying it.
+    std::span<const std::uint8_t> view() const;
+
+    // Hands the buffer to the caller. This ENDS the writer's life: every span
+    // previously obtained from view() now belongs to the returned vector and
+    // dies with it, so continuing to use this writer would be reasoning about
+    // two owners of one allocation.
+    //
+    // Rather than document that and hope, the writer marks itself spent — any
+    // subsequent write, patch, or view() throws instead of quietly working.
+    // Same class of mistake as decoding a temporary buffer, caught the same way.
+    std::vector<std::uint8_t> take();
+
+    bool isSpent() const { return taken_; }
 
 private:
+    void requireLive() const;
     void requirePatchRange(std::size_t at, std::size_t count) const;
 
     std::vector<std::uint8_t> bytes_;
+    bool                      taken_ = false;
 };
 
 }  // namespace dariyakyu
