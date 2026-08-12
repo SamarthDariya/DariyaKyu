@@ -38,7 +38,7 @@ FileHandle::FileHandle(const filesystem::path& path, Mode mode) : path_(path) {
         fd_ = -1;
         throw IoError("lseek", path, saved);
     }
-    writePosition_ = static_cast<uint64_t>(end);
+    writePosition_.store(static_cast<uint64_t>(end), memory_order_relaxed);
 }
 
 FileHandle::~FileHandle() {
@@ -47,23 +47,32 @@ FileHandle::~FileHandle() {
     if (fd_ >= 0) ::close(fd_);
 }
 
+// An atomic is not itself movable, so the value is carried across by hand.
+// Relaxed ordering is correct here: a FileHandle being moved is not being
+// shared, or the move would already be a race.
 FileHandle::FileHandle(FileHandle&& other) noexcept
     : fd_(exchange(other.fd_, -1)),
       path_(std::move(other.path_)),
-      writePosition_(exchange(other.writePosition_, 0)) {}
+      writePosition_(other.writePosition_.load(memory_order_relaxed)) {
+    other.writePosition_.store(0, memory_order_relaxed);
+}
 
 FileHandle& FileHandle::operator=(FileHandle&& other) noexcept {
     if (this != &other) {
         if (fd_ >= 0) ::close(fd_);
-        fd_            = exchange(other.fd_, -1);
-        path_          = std::move(other.path_);
-        writePosition_ = exchange(other.writePosition_, 0);
+        fd_   = exchange(other.fd_, -1);
+        path_ = std::move(other.path_);
+        writePosition_.store(other.writePosition_.load(memory_order_relaxed),
+                             memory_order_relaxed);
+        other.writePosition_.store(0, memory_order_relaxed);
     }
     return *this;
 }
 
 uint64_t FileHandle::append(span<const uint8_t> bytes) {
-    const uint64_t startedAt = writePosition_;
+    // Only the appender thread writes writePosition_, so it may read its own
+    // value without acquiring.
+    const uint64_t startedAt = writePosition_.load(memory_order_relaxed);
 
     // pwrite() can return short — on a signal, or when the device is nearly
     // full. Looping is not paranoia; a partial write that we failed to finish
@@ -71,7 +80,7 @@ uint64_t FileHandle::append(span<const uint8_t> bytes) {
     size_t written = 0;
     while (written < bytes.size()) {
         const ssize_t n = ::pwrite(fd_, bytes.data() + written, bytes.size() - written,
-                                   static_cast<off_t>(writePosition_ + written));
+                                   static_cast<off_t>(startedAt + written));
         if (n < 0) {
             if (errno == EINTR) continue;
             throw IoError("pwrite", path_, errno);
@@ -79,7 +88,9 @@ uint64_t FileHandle::append(span<const uint8_t> bytes) {
         written += static_cast<size_t>(n);
     }
 
-    writePosition_ += written;
+    // Publish. Everything written above happens-before any reader that observes
+    // this new size, so a reader can never see the length without the bytes.
+    writePosition_.store(startedAt + written, memory_order_release);
     return startedAt;
 }
 
@@ -101,7 +112,7 @@ size_t FileHandle::readAt(uint64_t position, span<uint8_t> out) const {
 void FileHandle::truncate(uint64_t newSize) {
     if (::ftruncate(fd_, static_cast<off_t>(newSize)) < 0)
         throw IoError("ftruncate", path_, errno);
-    writePosition_ = newSize;
+    writePosition_.store(newSize, memory_order_release);
 }
 
 void FileHandle::sync() {

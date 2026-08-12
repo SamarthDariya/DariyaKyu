@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -56,7 +57,9 @@ public:
     // Returns bytes actually read; short at end of file.
     std::size_t readAt(std::uint64_t position, std::span<std::uint8_t> out) const;
 
-    std::uint64_t size() const { return writePosition_; }
+    // Safe to call from any thread while the appender is running: readers need
+    // to know where written data ends in order to clamp a range.
+    std::uint64_t size() const { return writePosition_.load(std::memory_order_acquire); }
 
     // Drops everything from newSize onward. Used by crash recovery, which
     // truncates the active segment at the first bad CRC (decision 13), and by
@@ -75,7 +78,15 @@ private:
 
     // Tracked rather than derived from lseek() so append() can report where it
     // wrote without a syscall, and so size() is free on the hot path.
-    std::uint64_t writePosition_ = 0;
+    //
+    // Atomic because it is the publication point of the single-writer,
+    // many-reader pattern this whole design rests on: the appender releases it,
+    // readers acquire it. That pairing does more than avoid a torn read — it
+    // guarantees a reader who sees the new size also sees the bytes behind it.
+    // With relaxed ordering a reader could observe the larger size while the
+    // data was still invisible, and read zeroes out of a file it had just
+    // measured. Same idiom as Log's atomic<Offset> highWatermark_.
+    std::atomic<std::uint64_t> writePosition_{0};
 };
 
 }  // namespace dariyakyu
