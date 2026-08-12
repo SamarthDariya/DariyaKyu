@@ -726,13 +726,25 @@ class OffsetIndex {
 public:
     struct Entry { uint32_t relativeOffset; uint32_t position; };   // 8 bytes, fixed
     void append(Offset offset, uint32_t position);
-    optional<Entry> lookup(Offset target) const;   // greatest entry <= target
+    Entry lookup(Offset target) const;             // greatest entry <= target
 private:
     Offset     baseOffset_;
     MappedFile map_;
     size_t     entryCount_;
 };
 ```
+
+**Every segment's index starts with an entry for its own base offset at position 0**, written
+when the segment is created rather than waiting for the first 4 KB boundary. That is why
+`lookup` returns an `Entry` rather than an `optional<Entry>`: the "greatest entry ≤ target"
+search can never come up empty for an offset the segment actually holds, so the hot read path
+carries no special case.
+
+Independently, a **zero-length index file must still open**. A segment that rolled on age with
+less than one index interval of data written has no entries at all, and its trimmed index is 0
+bytes; refusing to map that would fail to open a valid partition on any low-traffic topic after
+a restart. `MappedFile::openReadOnly` therefore treats an empty file as an empty mapping rather
+than an error.
 
 #### `Log` — one partition
 
