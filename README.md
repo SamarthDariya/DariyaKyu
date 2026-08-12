@@ -36,7 +36,7 @@ The design is written up in full, with the reasoning and the rejected alternativ
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
 | Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 3 of 6 chunks |
-| Implementation — M0…M9 | 🔸 M0 |
+| Implementation — M0…M9 | 🔸 M0 complete, M1 next |
 
 ---
 
@@ -45,15 +45,16 @@ The design is written up in full, with the reasoning and the rejected alternativ
 Each milestone ends in something runnable or testable, lives on its own `feature/*` branch, and
 is merged by PR.
 
-### M0 — Skeleton 🔸
+### M0 — Skeleton ✅
 - [x] CMake build, C++20, warnings as a matter of course
-- [x] ASan/UBSan and TSan build options
-- [x] `TopicPartition`, `Offset`, `Epoch` core types
-- [x] `Error` / `IoError` / `OffsetOutOfRange` / `CorruptData`
+- [x] ASan/UBSan and TSan build options, mutually exclusive
+- [x] `Offset` as a strong type, `TopicPartition`, `Epoch`, `FileRange`
+- [x] `Error` / `IoError` / `OffsetInvariantViolated` / `CorruptData`
 - [x] `FileHandle` — RAII fd, positional I/O, append reports its own position
-- [x] `MappedFile` — RAII mmap, preallocate, trim on seal
-- [x] doctest wired into `ctest`
-- [ ] suite green locally
+- [x] `MappedFile` — RAII mmap, read-only and read-write, preallocate, trim on seal
+- [x] doctest wired into `ctest` (header-only, no subproject build)
+- [x] suite green locally — 32 cases, 96 assertions
+- [x] suite green under ASan/UBSan and under TSan
 
 ### M1 — Record batch codec ⬜
 - [ ] varint / zigzag encoding

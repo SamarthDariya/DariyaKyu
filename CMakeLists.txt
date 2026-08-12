@@ -51,12 +51,28 @@ target_compile_options(dariyakyu_common PRIVATE -Wall -Wextra -Wpedantic)
 # ---------------------------------------------------------------------------
 
 include(FetchContent)
+
+# doctest is header-only, so we fetch the source and use the header directly
+# rather than building doctest's own CMake project. SOURCE_SUBDIR names a
+# directory with no CMakeLists.txt, which tells FetchContent_MakeAvailable to
+# download without calling add_subdirectory().
+#
+# This is not only tidier — it is necessary. doctest v2.4.11 declares
+# cmake_minimum_required(VERSION 3.0), and CMake 4 removed compatibility with
+# anything below 3.5, so configuring its project fails outright. Skipping a
+# build system we never needed is a better fix than forcing an old policy
+# version across the whole build.
 FetchContent_Declare(
   doctest
   GIT_REPOSITORY https://github.com/doctest/doctest.git
   GIT_TAG        v2.4.11
+  SOURCE_SUBDIR  header-only-no-cmake-project
 )
 FetchContent_MakeAvailable(doctest)
+
+add_library(doctest_headers INTERFACE)
+target_include_directories(doctest_headers INTERFACE ${doctest_SOURCE_DIR})
+add_library(doctest::doctest ALIAS doctest_headers)
 
 enable_testing()
 

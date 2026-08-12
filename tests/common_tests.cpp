@@ -244,6 +244,56 @@ TEST_CASE("FileHandle is move-only and closes exactly once") {
     CHECK(b.size() == 4);
 }
 
+TEST_CASE("FileHandle::readAt past the end returns nothing") {
+    TempDir dir("read-past-end");
+    FileHandle f(dir.file("segment.log"), FileHandle::Mode::ReadWrite);
+    f.append(asBytes("abc"));
+
+    vector<uint8_t> out(8);
+    CHECK(f.readAt(3, out) == 0);     // exactly at the end
+    CHECK(f.readAt(99, out) == 0);    // well past it
+}
+
+TEST_CASE("Appending nothing still reports where the next write lands") {
+    TempDir dir("append-empty");
+    FileHandle f(dir.file("segment.log"), FileHandle::Mode::ReadWrite);
+    f.append(asBytes("hello"));
+
+    const vector<uint8_t> nothing;
+    CHECK(f.append(nothing) == 5);
+    CHECK(f.size() == 5);
+}
+
+TEST_CASE("FileHandle::sync and explicit close succeed and are idempotent") {
+    TempDir dir("sync-close");
+    FileHandle f(dir.file("segment.log"), FileHandle::Mode::ReadWrite);
+    f.append(asBytes("durable"));
+
+    // fsync is rare by policy (durability comes from replication) but must work
+    // when a caller does ask for it.
+    CHECK_NOTHROW(f.sync());
+
+    // Unlike the destructor, explicit close reports failure — deferred write
+    // errors surface here on some filesystems.
+    CHECK_NOTHROW(f.close());
+    CHECK_FALSE(f.isOpen());
+    CHECK_NOTHROW(f.close());          // second close is a no-op, not a double close
+}
+
+TEST_CASE("FileHandle move assignment transfers ownership") {
+    TempDir dir("move-assign");
+    FileHandle a(dir.file("a.log"), FileHandle::Mode::ReadWrite);
+    a.append(asBytes("aaaa"));
+
+    FileHandle b(dir.file("b.log"), FileHandle::Mode::ReadWrite);
+    b = std::move(a);                  // b's own descriptor must be closed here
+
+    CHECK_FALSE(a.isOpen());
+    CHECK(b.isOpen());
+    CHECK(b.size() == 4);
+    CHECK(b.path().filename() == "a.log");
+}
+
 TEST_CASE("FileHandle::CreateNew refuses to clobber an existing file") {
     TempDir dir("create-new");
     const auto path = dir.file("00000000000000000000.log");
@@ -315,6 +365,36 @@ TEST_CASE("MappedFile is move-only") {
     CHECK_FALSE(a.isMapped());
     CHECK(b.isMapped());
     CHECK(b.bytes()[0] == 0x42);
+}
+
+TEST_CASE("MappedFile move assignment transfers the mapping") {
+    TempDir dir("mmap-move-assign");
+    MappedFile a(dir.file("a.index"), 4096);
+    a.mutableBytes()[0] = 0x11;
+
+    MappedFile b(dir.file("b.index"), 4096);
+    b = std::move(a);                  // b's own mapping must be released here
+
+    CHECK_FALSE(a.isMapped());
+    CHECK(b.isMapped());
+    CHECK(b.bytes()[0] == 0x11);
+    CHECK(b.path().filename() == "a.index");
+}
+
+TEST_CASE("MappedFile::flush is safe and is a no-op when read-only") {
+    TempDir dir("mmap-flush");
+    const auto path = dir.file("idx");
+
+    {
+        MappedFile writable(path, 4096);
+        writable.mutableBytes()[0] = 0x77;
+        CHECK_NOTHROW(writable.flush());
+    }
+
+    MappedFile readOnly = MappedFile::openReadOnly(path);
+    // Nothing to write back, so this must neither msync nor complain.
+    CHECK_NOTHROW(readOnly.flush());
+    CHECK(readOnly.bytes()[0] == 0x77);
 }
 
 TEST_CASE("A read-only mapping refuses to be written or trimmed") {
