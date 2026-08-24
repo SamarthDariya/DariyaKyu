@@ -925,3 +925,99 @@ Offset append(span<uint8_t> batchBytes);   // stamps 12 header bytes in place
 
 The `const` version would force a full copy of every batch — precisely the cost this design
 exists to avoid.
+
+### 3. The record batch codec
+
+The first Kafka-shaped component. It turns `{key, value, timestamp}` into the exact bytes that
+live in a segment — and by decision 13 those same bytes are what `sendfile` puts on a consumer's
+socket, so **the on-disk format is the wire format**. Pure library, no I/O, testable in memory.
+
+Three later milestones are constrained by what is decided here: the index stores relative
+offsets that only exist because of delta encoding; replication ships raw batch bytes untouched;
+and zero-copy fetch works only because the broker can serve a batch it never decompressed.
+
+#### Layout — Kafka v2, byte-exact
+
+```
+  ┌──── outside the CRC ─────────────────────────────┐
+  │ baseOffset           int64   ← broker stamps     │
+  │ batchLength          int32                       │
+  │ partitionLeaderEpoch int32   ← broker stamps     │
+  │ magic                int8    (= 2)               │
+  ├──────────────────────────────────────────────────┤
+  │ crc32c               uint32                      │
+  ├──── covered by the CRC ──────────────────────────┤
+  │ attributes           int16   (compression, flags)│
+  │ lastOffsetDelta      int32   ← record count      │
+  │ firstTimestamp       int64                       │
+  │ maxTimestamp         int64                       │
+  │ producerId           int64   ← idempotence (M7)  │
+  │ producerEpoch        int16                       │
+  │ baseSequence         int32                       │
+  │ recordCount          int32                       │
+  │ [ records ... ]              ← possibly compressed│
+  └──────────────────────────────────────────────────┘
+
+record:  length varint | attributes int8 | timestampDelta varlong | offsetDelta varint
+                       | keyLength varint | key | valueLength varint | value
+                       | headerCount varint | headers...
+```
+
+Three properties, each load-bearing:
+
+1. **Base offset and leader epoch precede the CRC**, so the broker stamps them into a compressed
+   batch without recomputing a checksum over the body.
+2. **`lastOffsetDelta` and `recordCount` sit outside the compressed body**, so the broker
+   advances its log end offset knowing only *how many* records arrived, never what they are.
+3. **Deltas, not absolutes**, so a producer can encode before knowing which offsets the broker
+   will assign.
+
+#### Fidelity: byte-exact, including fields nothing uses yet
+
+`producerId`, `producerEpoch` and `baseSequence` are written (as `-1`) from M1, and record
+headers are parsed and preserved, even though nothing consumes them until M7 and Tier A
+respectively.
+
+The alternative — a trimmed format now, extended at M7 — was rejected. The cost is not
+compatibility but sequencing: changing the format at M7 would invalidate every `.log` file and
+every test fixture, and would mean rewriting the codec, the index and the recovery scan at
+exactly the point where replication is already the hard problem. Thirty unused bytes per batch
+is cheap insurance, and byte-exactness makes "this is Kafka's v2 format" verifiable by dumping a
+file next to real Kafka's.
+
+#### Decode borrows, never owns
+
+A decoded record exposes `span`s into the caller's buffer rather than owning `vector`s. The
+broker must never own record bytes; a decoded view is valid only while its buffer lives, and
+the CLI copies when it genuinely needs to.
+
+`BatchHeaderView` parses the fixed prefix and stops — the broker's write path needs nothing
+else. Full record iteration exists for the CLI, compaction, and tests.
+
+#### Decode errors are exceptions
+
+Unlike the read path, where a lagging or caught-up consumer is routine, a batch that fails its
+CRC is genuinely exceptional and surfaces once per recovery rather than once per poll. So decode
+throws `CorruptData` and recovery catches it to decide where to truncate.
+
+#### Rejected alternatives
+
+| Alternative | Why not |
+|---|---|
+| A simpler homegrown batch format | This is the one place decision 19 says to copy Kafka exactly — the byte-level work *is* the education, and the files are then structurally real |
+| Fixed `int32` lengths instead of varints | Four 4-byte length fields on a 50-byte message is 32% overhead; deltas are small numbers and small numbers should cost one byte |
+| Absolute offsets per record | Forces the broker to decompress and re-encode every batch — the thing the whole design exists to avoid |
+| Protobuf / FlatBuffers | External dependency, no control over byte layout, no way to put the CRC boundary where it must go |
+| zlib CRC32 instead of CRC32C | Different polynomial, breaks format compatibility, and forgoes the hardware instruction |
+
+#### Banked for later
+
+- **Hardware CRC32C** (`_mm_crc32_u64`) behind a runtime CPU check — M9, with benchmarks to
+  justify it. M1 ships the portable table implementation.
+- **Compression codecs** (lz4, zstd) — the first external dependencies, deferred until there is
+  a broker to measure them on. M1 handles the attribute *flag*, not the algorithm.
+- **Producer-side batching** (`linger.ms` / `batch.size`) — client behaviour, not broker
+  behaviour; it lands in the CLI at M4 where there is something to send to.
+- **Control batches** (transaction markers) — only if transactions ever land.
+- **Buffer pooling** — decode allocates nothing, but encode allocates per batch. Wait for M9
+  numbers.
