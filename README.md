@@ -36,7 +36,7 @@ The design is written up in full, with the reasoning and the rejected alternativ
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
 | Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 3 of 6 chunks |
-| Implementation — M0…M9 | 🔸 M0 complete, M1 next |
+| Implementation — M0…M9 | 🔸 M0–M1 complete, M2 next |
 
 ---
 
@@ -56,13 +56,17 @@ is merged by PR.
 - [x] suite green locally — 32 cases, 96 assertions
 - [x] suite green under ASan/UBSan and under TSan
 
-### M1 — Record batch codec ⬜
-- [ ] varint / zigzag encoding
-- [ ] CRC32C
-- [ ] `BufferReader` / `BufferWriter`
-- [ ] Kafka v2 `RecordBatch` encode + decode
-- [ ] header fields readable without decompressing the body
-- [ ] round-trip and corruption tests
+### M1 — Record batch codec ✅
+- [x] varint / varlong with zigzag encoding
+- [x] CRC32C (Castagnoli), portable table implementation
+- [x] `BufferReader` / `BufferWriter`, big-endian, borrowing reads, patchable fields
+- [x] Kafka v2 `RecordBatch` encode + decode, byte-exact
+- [x] header fields readable without touching the body
+- [x] in-place base offset and leader epoch stamping, checksum untouched
+- [x] null vs empty distinguished (tombstones survive)
+- [x] record headers parsed and preserved
+- [x] round-trip and corruption tests — 29 cases, 172 assertions
+- [x] green under ASan/UBSan and TSan
 
 ### M2 — The log engine ⬜
 - [ ] `OffsetIndex` — fixed-size entries, binary search, mmap'd

@@ -39,12 +39,29 @@ add_library(dariyakyu_common
   src/common/errors.cpp
   src/common/file_handle.cpp
   src/common/mapped_file.cpp
+  src/common/varint.cpp
+  src/common/crc32c.cpp
+  src/common/buffer.cpp
 )
 
 # Includes are rooted at src/, so every include reads "common/file_handle.hpp" —
 # the layer a header belongs to is visible at the include site.
 target_include_directories(dariyakyu_common PUBLIC src)
 target_compile_options(dariyakyu_common PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
+# Library: storage
+# ---------------------------------------------------------------------------
+#
+# Depends on common and nothing else. The layering is enforced by the build: if
+# common ever tries to include from storage, it will not link.
+
+add_library(dariyakyu_storage
+  src/storage/record_batch.cpp
+)
+
+target_link_libraries(dariyakyu_storage PUBLIC dariyakyu_common)
+target_compile_options(dariyakyu_storage PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -80,3 +97,8 @@ add_executable(common_tests tests/common_tests.cpp)
 target_link_libraries(common_tests PRIVATE dariyakyu_common doctest::doctest)
 target_compile_options(common_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME common_tests COMMAND common_tests)
+
+add_executable(codec_tests tests/codec_tests.cpp)
+target_link_libraries(codec_tests PRIVATE dariyakyu_storage doctest::doctest)
+target_compile_options(codec_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME codec_tests COMMAND codec_tests)
