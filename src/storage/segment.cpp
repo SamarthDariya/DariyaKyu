@@ -323,6 +323,71 @@ unique_ptr<ActiveSegment> ActiveSegment::create(const filesystem::path& dir, Off
         new ActiveSegment(std::move(log), std::move(index), baseOffset, policy));
 }
 
+unique_ptr<ActiveSegment> ActiveSegment::recover(const filesystem::path& logFile,
+                                                 const RollPolicy& policy) {
+    const Offset baseOffset = baseOffsetFromLogPath(logFile);
+
+    filesystem::path indexFile = logFile;
+    indexFile.replace_extension(kIndexSuffix);
+
+    // The index is REBUILT, not opened. It is derived data, cheap to regenerate
+    // from the scan happening anyway, and a stale one would point into exactly
+    // the bytes this scan is about to truncate away.
+    FileHandle  log(logFile, FileHandle::Mode::ReadWrite);
+    OffsetIndex index = OffsetIndex::create(indexFile, baseOffset, policy.maxIndexBytes);
+
+    auto segment = unique_ptr<ActiveSegment>(
+        new ActiveSegment(std::move(log), std::move(index), baseOffset, policy));
+
+    const uint64_t limit = segment->log_.size();
+
+    uint64_t good    = 0;            // bytes proven complete AND correct
+    Offset   next    = baseOffset;
+    int64_t  largest = -1;
+
+    vector<uint8_t> batch;
+    while (good < limit) {
+        // Every way a batch can be wrong ends with the same action — stop here —
+        // so the whole step sits in one try block. Recovery must never propagate
+        // CorruptData: finding damage is its job, not its failure.
+        try {
+            const optional<BatchAt> at = segment->batchAt(good, limit);
+            if (!at) break;   // less than a whole batch remains
+
+            // The one place a record body is read. Checking a checksum means
+            // reading everything it covers, so this is unavoidable — and it is
+            // why recovery costs a pass over one segment.
+            batch.resize(at->totalSize);
+            if (segment->log_.readAt(good, batch) < at->totalSize) break;
+
+            // The checksum is the only thing that can distinguish a complete
+            // batch from a torn one.
+            if (!RecordBatch::verifyCrc(batch)) break;
+
+            // Intact bytes are not enough: the offsets must also still form a
+            // sequence. A batch that checksums but starts in the wrong place
+            // means this file stopped being a valid log here.
+            if (at->header.baseOffset != next) break;
+
+            next    = at->header.lastOffset() + 1;
+            largest = max(largest, at->header.maxTimestamp);
+            good += at->totalSize;
+        } catch (const CorruptData&) {
+            break;
+        }
+    }
+
+    // Discard everything after the last good batch. Keeping it would mean
+    // handing a consumer bytes that failed their own checksum.
+    if (good < limit) segment->log_.truncate(good);
+
+    segment->nextOffset_.store(next, memory_order_release);
+    segment->largestTimestamp_.store(largest, memory_order_release);
+    segment->firstAppendMs_ = (good > 0) ? nowMillis() : -1;
+
+    return segment;
+}
+
 void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
     // Reads the fixed 61-byte prefix and stops. The body is never touched here:
     // the broker does not know or care what the records say, and on a compressed

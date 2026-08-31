@@ -1491,3 +1491,172 @@ TEST_CASE("Unlinking twice is harmless") {
     sealed->unlinkFiles();
     CHECK_NOTHROW(sealed->unlinkFiles());
 }
+
+// ===========================================================================
+// ActiveSegment: crash recovery
+// ===========================================================================
+
+namespace {
+
+// Appends raw bytes straight onto the log file, bypassing ActiveSegment. This is
+// how the damage cases are built: append() would refuse most of them, which is
+// the point — a crash is not something the writer agreed to.
+void appendRawToFile(const filesystem::path& path, const vector<uint8_t>& bytes) {
+    ofstream out(path, ios::binary | ios::app);
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<streamsize>(bytes.size()));
+}
+
+}  // namespace
+
+TEST_CASE("Recovering an intact segment keeps every batch") {
+    TempDir dir("rec-clean");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+
+    uint64_t size = 0;
+    Offset   next{0};
+    int64_t  largest = 0;
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 20, 64);
+        size    = segment->sizeBytes();
+        next    = segment->nextOffset();
+        largest = segment->largestTimestamp();
+    }   // no seal, no flush — exactly what a crash leaves behind
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+    CHECK(recovered->sizeBytes() == size);
+    CHECK(recovered->nextOffset() == next);
+    CHECK(recovered->largestTimestamp() == largest);
+    CHECK(filesystem::file_size(logFile) == size);
+}
+
+TEST_CASE("Recovery truncates at a batch whose checksum fails") {
+    TempDir dir("rec-bad-crc");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+
+    uint64_t goodBytes = 0;
+    Offset   goodNext{0};
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 10, 64);
+        goodBytes = segment->sizeBytes();
+        goodNext  = segment->nextOffset();
+        fillSegment(*segment, 10, 64);
+    }
+
+    // Flip a byte inside the body of the eleventh batch. The header still parses
+    // and the length is still right — only the checksum knows.
+    {
+        auto bytes = readFile(logFile);
+        bytes[goodBytes + kBatchHeaderSize + 3] ^= 0xFF;
+        writeFile(logFile, bytes);
+    }
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+    CHECK(recovered->sizeBytes() == goodBytes);
+    CHECK(recovered->nextOffset() == goodNext);
+    CHECK(filesystem::file_size(logFile) == goodBytes);
+}
+
+TEST_CASE("A recovered segment is immediately writable at the offset it truncated to") {
+    TempDir dir("rec-appendable");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+
+    uint64_t goodBytes = 0;
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 6, 64);
+        goodBytes = segment->sizeBytes();
+        fillSegment(*segment, 4, 64);
+    }
+    {
+        auto bytes = readFile(logFile);
+        bytes[goodBytes + kBatchHeaderSize + 1] ^= 0xFF;
+        writeFile(logFile, bytes);
+    }
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+    const Offset resume = recovered->nextOffset();
+    CHECK(resume == Offset(6));
+
+    // Recovery has to leave the segment in a state the write path can continue
+    // from, or a broker could not restart into service.
+    auto more = makeBatch(resume, 5555, 32);
+    CHECK_NOTHROW(recovered->append(resume, more));
+    CHECK(recovered->nextOffset() == Offset(7));
+    CHECK(recovered->read(Offset(6), kBigFetch).position == goodBytes);
+}
+
+TEST_CASE("Recovery truncates a batch torn off mid-write") {
+    TempDir dir("rec-torn");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+
+    uint64_t goodBytes = 0;
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 8, 64);
+        goodBytes = segment->sizeBytes();
+        fillSegment(*segment, 1, 64);
+    }
+
+    // Cut the last batch in half: the classic crash-during-append. The header
+    // is intact and says how long the batch should be; the bytes are not there.
+    {
+        auto bytes = readFile(logFile);
+        bytes.resize(goodBytes + 20);
+        writeFile(logFile, bytes);
+    }
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+    CHECK(recovered->sizeBytes() == goodBytes);
+    CHECK(recovered->nextOffset() == Offset(8));
+}
+
+TEST_CASE("Recovery truncates a batch that checksums but breaks the offset sequence") {
+    TempDir dir("rec-gap");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+
+    uint64_t goodBytes = 0;
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 5, 64);
+        goodBytes = segment->sizeBytes();
+    }
+
+    // A batch stamped at offset 50 rather than 5, appended straight to the file.
+    // Its checksum is perfectly valid — stamping happens outside the CRC — so
+    // intact bytes alone are not enough to trust it.
+    appendRawToFile(logFile, makeBatch(Offset(50), 7777, 32));
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+    CHECK(recovered->sizeBytes() == goodBytes);
+    CHECK(recovered->nextOffset() == Offset(5));
+}
+
+TEST_CASE("Recovering a segment of pure garbage keeps nothing") {
+    TempDir dir("rec-garbage");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+    { auto s = ActiveSegment::create(dir.file(""), Offset(0), testPolicy()); (void)s; }
+
+    // An unparseable header rather than a bad checksum — CorruptData thrown from
+    // inside the walk, which recovery has to catch rather than propagate.
+    writeFile(logFile, vector<uint8_t>(300, 0x7F));
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+    CHECK(recovered->isEmpty());
+    CHECK(recovered->sizeBytes() == 0);
+    CHECK(recovered->nextOffset() == Offset(0));
+    CHECK(filesystem::file_size(logFile) == 0);
+}
+
+TEST_CASE("Recovering an empty segment does nothing") {
+    TempDir dir("rec-empty");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(30));
+    { auto s = ActiveSegment::create(dir.file(""), Offset(30), testPolicy()); (void)s; }
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+    CHECK(recovered->isEmpty());
+    CHECK(recovered->nextOffset() == Offset(30));
+    CHECK(recovered->largestTimestamp() == -1);
+}
