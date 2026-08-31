@@ -13,6 +13,7 @@
 
 #include "common/errors.hpp"
 #include "storage/offset_index.hpp"
+#include "storage/segment.hpp"
 
 using namespace std;
 using namespace dariyakyu;
@@ -496,4 +497,28 @@ TEST_CASE("A reader never observes half an entry while the appender runs") {
     CHECK(torn.load() == 0);
     CHECK(observations.load() > 0);
     CHECK(index.entryCount() == kEntries);
+}
+
+// ===========================================================================
+// Segment file naming
+// ===========================================================================
+
+TEST_CASE("A segment name is its base offset, zero padded to twenty digits") {
+    CHECK(segmentBaseName(Offset(0)) == "00000000000000000000");
+    CHECK(segmentBaseName(Offset(1073741)) == "00000000000001073741");
+    CHECK(segmentBaseName(Offset(9)).size() == 20);
+}
+
+TEST_CASE("Padded names sort in the same order as the offsets they encode") {
+    // The whole reason for the padding. Without it "9" > "10" as a string, and a
+    // sorted directory listing would no longer be a sorted segment table.
+    CHECK(segmentBaseName(Offset(0)) < segmentBaseName(Offset(1)));
+    CHECK(segmentBaseName(Offset(9)) < segmentBaseName(Offset(10)));
+    CHECK(segmentBaseName(Offset(99)) < segmentBaseName(Offset(100)));
+}
+
+TEST_CASE("A segment's two files sit in the partition directory") {
+    const filesystem::path dir = "/data/orders-0";
+    CHECK(segmentLogPath(dir, Offset(1073741)) == "/data/orders-0/00000000000001073741.log");
+    CHECK(segmentIndexPath(dir, Offset(1073741)) == "/data/orders-0/00000000000001073741.index");
 }
