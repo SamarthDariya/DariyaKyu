@@ -954,3 +954,105 @@ TEST_CASE("batchAt called off a batch boundary is corruption") {
     // as 2. This is why a forward scan must step by totalSize and never guess.
     CHECK_THROWS_AS(segment->batchAt(5, segment->sizeBytes()), CorruptData);
 }
+
+// ===========================================================================
+// SegmentBase: read — resolving an offset to a location
+// ===========================================================================
+
+TEST_CASE("Every offset resolves to the exact byte its batch begins at") {
+    TempDir dir("seg-read-exact");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    // Record the true start of every batch, then check read() finds each one.
+    vector<uint64_t> starts;
+    for (int i = 0; i < 50; ++i) {
+        starts.push_back(segment->sizeBytes());
+        const Offset base = segment->nextOffset();
+        auto bytes = makeBatch(base, 1000 + i, 48);
+        segment->append(base, bytes);
+    }
+
+    // Spans offsets whose index entry is right beside them and offsets whose
+    // nearest entry is most of an interval away — the case the forward scan
+    // exists for.
+    for (int i = 0; i < 50; ++i) {
+        const auto range = segment->read(Offset(i));
+        CHECK(range.position == starts[static_cast<size_t>(i)]);
+        CHECK(range.length > 0);
+        CHECK(range.fd == segment->fd());
+    }
+}
+
+TEST_CASE("An offset inside a multi-record batch resolves to the batch's start") {
+    TempDir dir("seg-read-mid-batch");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(500), testPolicy());
+
+    auto batch = makeBatch(Offset(500), 1000, 16, 5);   // offsets 500..504
+    segment->append(Offset(500), batch);
+
+    // A batch is the unit of transfer, so all five offsets get the same range.
+    // The consumer skips the records ahead of the one it asked for.
+    for (int64_t offset = 500; offset <= 504; ++offset) {
+        const auto range = segment->read(Offset(offset));
+        CHECK(range.position == 0);
+        CHECK(range.length == batch.size());
+    }
+}
+
+TEST_CASE("A read works with no index entries at all") {
+    TempDir dir("seg-read-no-index");
+    auto    policy = testPolicy();
+    policy.indexIntervalBytes = 1 << 20;   // nothing here will reach an interval
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), policy);
+    fillSegment(*segment, 6, 32);
+
+    // The low-traffic case. lookup() falls back to the front of the file and the
+    // scan does all the work — slower, but correct, and it is why lookup() never
+    // returns an optional.
+    REQUIRE(segment->index().isEmpty());
+    CHECK(segment->read(Offset(0)).position == 0);
+    CHECK(segment->read(Offset(5)).position > 0);
+}
+
+TEST_CASE("A caught-up read succeeds with zero bytes") {
+    TempDir dir("seg-read-caught-up");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 4);
+
+    // The most common read in the system: a consumer polling for an offset the
+    // producer has not written yet. Not an error, and it must not cost one.
+    const auto range = segment->read(Offset(4));
+    CHECK(range.empty());
+    CHECK(range.length == 0);
+    CHECK(range.position == segment->sizeBytes());
+
+    // Well past the end behaves the same way.
+    CHECK(segment->read(Offset(9999)).empty());
+
+    // And an empty segment is caught up at its own base offset.
+    auto fresh = ActiveSegment::create(dir.file(""), Offset(77), testPolicy());
+    CHECK(fresh->read(Offset(77)).empty());
+}
+
+TEST_CASE("A read below the segment's base offset is a routing bug") {
+    TempDir dir("seg-read-below-base");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(100), testPolicy());
+    fillSegment(*segment, 3);
+
+    // Log picked this segment; asking it for an offset it cannot hold means the
+    // picking was wrong. That is a bug in Log, not a routine miss, so unlike the
+    // caught-up case it throws.
+    CHECK_THROWS_AS(segment->read(Offset(99)), OffsetInvariantViolated);
+    CHECK_THROWS_AS(segment->read(Offset(0)), OffsetInvariantViolated);
+}
+
+TEST_CASE("A read never describes bytes beyond what was written") {
+    TempDir dir("seg-read-in-bounds");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 30, 64);
+
+    for (int64_t offset = 0; offset < 30; ++offset) {
+        const auto range = segment->read(Offset(offset));
+        CHECK(range.position + range.length <= segment->sizeBytes());
+    }
+}

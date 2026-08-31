@@ -100,6 +100,48 @@ SegmentBase::SegmentBase(FileHandle log, OffsetIndex index, Offset baseOffset)
       baseOffset_(baseOffset),
       nextOffset_(baseOffset) {}
 
+FileRange SegmentBase::read(Offset offset) const {
+    if (offset < baseOffset_)
+        throw OffsetInvariantViolated("segment " + logFilePath().string() + " was asked for " +
+                                      offset.toString() + ", below its base offset " +
+                                      baseOffset_.toString() + " — Log routed this read to the "
+                                      "wrong segment");
+
+    // ONE snapshot of the size, used for every step below. Take it twice and a
+    // batch the appender adds mid-scan could be visible to one check and not the
+    // next.
+    const uint64_t limit = log_.size();
+
+    // Two steps, and the split between them is the whole design.
+    //
+    // The index is sparse — one entry per 4 KB — so this gets us to within an
+    // interval of the target, cheaply, from a memory-mapped binary search. It
+    // cannot get us exactly there, and is not meant to: a dense index would cost
+    // as much memory as the data.
+    uint64_t position = index_.lookup(offset).position;
+
+    // Then the log itself finishes the job, one batch header at a time. Bounded
+    // by one index interval, so a page or two, normally already page-cached.
+    //
+    // Note this DOES read the file — the "resolves a location without doing I/O"
+    // line in DESIGN.md is wrong, and cannot be right while the index is sparse.
+    // What is true, and is what matters, is that it reads headers only and never
+    // a record body: the payload still goes out by sendfile, untouched.
+    while (auto at = batchAt(position, limit)) {
+        // The FIRST batch whose last offset reaches the target is the batch that
+        // contains it. `>=` rather than `==` because the target may sit in the
+        // middle of a multi-record batch.
+        if (at->header.lastOffset() >= offset)
+            return FileRange{log_.fd(), at->position, at->totalSize};
+
+        position += at->totalSize;
+    }
+
+    // Ran off the end without finding it: the caller is caught up with this
+    // segment. Zero length, positioned at the end, and a success.
+    return FileRange{log_.fd(), limit, 0};
+}
+
 optional<SegmentBase::BatchAt> SegmentBase::batchAt(uint64_t position, uint64_t limit) const {
     // Nothing left at all. Checked first so the subtraction below cannot wrap:
     // both operands are unsigned, and limit - position with position > limit
