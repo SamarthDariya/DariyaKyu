@@ -856,3 +856,101 @@ TEST_CASE("Every index entry points at a real batch boundary") {
         CHECK(entry.offsetFrom(Offset(0)) <= Offset(offset));
     }
 }
+
+// ===========================================================================
+// SegmentBase: batchAt
+// ===========================================================================
+
+TEST_CASE("batchAt reads the batch at a position and says how far the next one is") {
+    TempDir dir("seg-batchat");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(500), testPolicy());
+
+    auto first = makeBatch(Offset(500), 7000, 32, 3);   // offsets 500..502
+    segment->append(Offset(500), first);
+    auto second = makeBatch(Offset(503), 8000, 32, 2);  // offsets 503..504
+    segment->append(Offset(503), second);
+
+    const auto at = segment->batchAt(0, segment->sizeBytes());
+    REQUIRE(at.has_value());
+    CHECK(at->position == 0);
+    CHECK(at->totalSize == first.size());
+    CHECK(at->header.baseOffset == Offset(500));
+    CHECK(at->header.recordCount == 3);
+    CHECK(at->header.lastOffset() == Offset(502));
+    CHECK(at->header.maxTimestamp == 7002);
+}
+
+TEST_CASE("Adding totalSize walks from one batch to the next") {
+    TempDir dir("seg-batchat-walk");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 12, 48);
+
+    // This loop is the shape of every forward scan in the codebase: read a
+    // header, use it, step by totalSize, repeat until nothing comes back.
+    const uint64_t limit = segment->sizeBytes();
+    uint64_t       position = 0;
+    int            seen     = 0;
+
+    while (auto at = segment->batchAt(position, limit)) {
+        CHECK(at->position == position);
+        CHECK(at->header.baseOffset == Offset(seen));
+        position += at->totalSize;
+        ++seen;
+    }
+
+    CHECK(seen == 12);
+    CHECK(position == limit);   // the walk lands exactly on the end
+}
+
+TEST_CASE("batchAt finds nothing at or past the end") {
+    TempDir dir("seg-batchat-end");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 3);
+    const uint64_t limit = segment->sizeBytes();
+
+    CHECK_FALSE(segment->batchAt(limit, limit).has_value());
+    CHECK_FALSE(segment->batchAt(limit + 100, limit).has_value());
+
+    // An empty segment has nothing anywhere.
+    auto empty = ActiveSegment::create(dir.file(""), Offset(9), testPolicy());
+    CHECK_FALSE(empty->batchAt(0, 0).has_value());
+}
+
+TEST_CASE("A batch extending past the limit is absent, not corrupt") {
+    TempDir dir("seg-batchat-inflight");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    auto batch = makeBatch(Offset(0), 1000, 64);
+    segment->append(Offset(0), batch);
+
+    // Exactly what a reader sees mid-append: the header is on disk and parses,
+    // but the batch it describes is longer than the bytes the reader was told
+    // about. It must read as "not there yet", never as damage — otherwise every
+    // concurrent read during a write would look like corruption.
+    const uint64_t shortLimit = batch.size() - 1;
+    CHECK_FALSE(segment->batchAt(0, shortLimit).has_value());
+
+    // With the full extent it is there.
+    CHECK(segment->batchAt(0, batch.size()).has_value());
+}
+
+TEST_CASE("Fewer bytes than a header is absent too") {
+    TempDir dir("seg-batchat-tiny");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 1);
+
+    // 60 bytes cannot hold a 61-byte prefix, so there is nothing to interpret.
+    CHECK_FALSE(segment->batchAt(0, kBatchHeaderSize - 1).has_value());
+    CHECK(segment->batchAt(0, segment->sizeBytes()).has_value());
+}
+
+TEST_CASE("batchAt called off a batch boundary is corruption") {
+    TempDir dir("seg-batchat-misaligned");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 4, 64);
+
+    // The precondition made visible: position must be a real boundary. Five
+    // bytes in, the magic byte lands on part of another field and does not read
+    // as 2. This is why a forward scan must step by totalSize and never guess.
+    CHECK_THROWS_AS(segment->batchAt(5, segment->sizeBytes()), CorruptData);
+}

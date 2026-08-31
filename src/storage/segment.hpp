@@ -5,12 +5,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
 #include "common/file_handle.hpp"
 #include "common/types.hpp"
 #include "storage/offset_index.hpp"
+#include "storage/record_batch.hpp"
 
 namespace dariyakyu::storage {
 
@@ -138,6 +140,35 @@ public:
 
     // Half-open: the last offset a segment holds is nextOffset() - 1.
     bool contains(Offset offset) const { return offset >= baseOffset_ && offset < nextOffset(); }
+
+    // One batch's header, plus how far it is to the next one.
+    struct BatchAt {
+        BatchHeader   header;
+        std::uint64_t position  = 0;   // where this batch starts
+        std::size_t   totalSize = 0;   // add to position to reach the next batch
+    };
+
+    // The batch beginning at `position`, reading its header only — never a record
+    // body. This is the step that walks a segment: call it, use the header, add
+    // totalSize, call it again.
+    //
+    // `limit` is how far the caller considers the file to extend, and it is a
+    // parameter rather than read from the file each time on purpose: a caller
+    // walking a segment takes ONE snapshot of the size and passes it to every
+    // call, so a batch the appender adds part-way through the walk cannot be
+    // half-included.
+    //
+    // Returns nothing — not an error — when fewer than a whole batch remains
+    // before `limit`. On an active segment that is simply a write in flight, and
+    // treating it as absent is what lets a reader run alongside the appender
+    // with no lock. On a damaged file it means "the good data ends here", which
+    // is the same action recovery wants to take.
+    //
+    // Throws CorruptData if there ARE enough bytes but they do not parse — a bad
+    // magic byte, or a length below the header size. `position` must be a real
+    // batch boundary; called mid-batch it will read a header out of record data
+    // and almost certainly throw.
+    std::optional<BatchAt> batchAt(std::uint64_t position, std::uint64_t limit) const;
 
     // Borrowed, for sendfile() and for tests. The FileHandle stays alive as long
     // as this segment does.

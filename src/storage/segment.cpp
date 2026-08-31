@@ -1,6 +1,7 @@
 #include "storage/segment.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <format>
 #include <limits>
@@ -98,6 +99,38 @@ SegmentBase::SegmentBase(FileHandle log, OffsetIndex index, Offset baseOffset)
       index_(std::move(index)),
       baseOffset_(baseOffset),
       nextOffset_(baseOffset) {}
+
+optional<SegmentBase::BatchAt> SegmentBase::batchAt(uint64_t position, uint64_t limit) const {
+    // Nothing left at all. Checked first so the subtraction below cannot wrap:
+    // both operands are unsigned, and limit - position with position > limit
+    // would produce an enormous number rather than a negative one.
+    if (position >= limit) return nullopt;
+
+    // Not even room for a header. A batch cannot be smaller than its own fixed
+    // prefix, so there is nothing here to interpret.
+    if (limit - position < kBatchHeaderSize) return nullopt;
+
+    // std::array, not vector: exactly 61 bytes, on the stack, no allocation.
+    // This runs once per batch in every forward scan, so it is a hot path.
+    array<uint8_t, kBatchHeaderSize> headerBytes{};
+
+    // pread under the hood — it moves no file cursor, so many threads can do
+    // this on one descriptor at once. That is what makes sealed segments
+    // lock-free to read.
+    if (log_.readAt(position, headerBytes) < kBatchHeaderSize) return nullopt;
+
+    BatchAt at;
+    at.header    = RecordBatch::parseHeader(headerBytes);
+    at.position  = position;
+    at.totalSize = RecordBatch::totalSizeOf(headerBytes);
+
+    // The header parsed, but it claims a batch longer than the bytes available.
+    // On an active segment that is an append in flight; the batch simply is not
+    // there yet as far as this caller is concerned.
+    if (at.totalSize > limit - position) return nullopt;
+
+    return at;
+}
 
 // --------------------------------------------------------------------------
 // ActiveSegment
