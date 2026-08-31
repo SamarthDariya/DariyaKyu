@@ -3,6 +3,7 @@
 #include <cctype>
 #include <format>
 #include <stdexcept>
+#include <utility>
 
 #include "common/errors.hpp"
 
@@ -80,5 +81,19 @@ Offset baseOffsetFromLogPath(const filesystem::path& logFile) {
         throw CorruptData("segment: '" + name + "' encodes an offset too large for int64");
     }
 }
+
+// --------------------------------------------------------------------------
+// SegmentBase
+// --------------------------------------------------------------------------
+
+// nextOffset_ starts AT the base offset, not at zero: an empty segment's "one
+// past the last offset it holds" is the offset it would hold first. That is what
+// makes isEmpty() a comparison rather than a special case, and it is why
+// contains() is false for everything on a fresh segment.
+SegmentBase::SegmentBase(FileHandle log, OffsetIndex index, Offset baseOffset)
+    : log_(std::move(log)),
+      index_(std::move(index)),
+      baseOffset_(baseOffset),
+      nextOffset_(baseOffset) {}
 
 }  // namespace dariyakyu::storage

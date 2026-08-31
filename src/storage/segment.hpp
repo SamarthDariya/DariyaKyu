@@ -1,10 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 
+#include "common/file_handle.hpp"
 #include "common/types.hpp"
 #include "storage/offset_index.hpp"
 
@@ -96,5 +98,67 @@ static_assert((RollPolicy{}.maxIndexBytes / OffsetIndex::kEntrySize) *
                   RollPolicy{}.maxSegmentBytes,
               "the default index is too small to describe a default-sized segment, so segments "
               "would roll on a full index rather than on their size");
+
+// Everything a segment can do that does not depend on whether it is still being
+// written: report where it starts and ends, and resolve an offset to a location.
+//
+// Inherited purely to share that machinery. NOT polymorphic — there are no
+// virtual functions, because Log always knows which of the two kinds it is
+// holding and dispatches on an offset comparison rather than a vtable. The
+// destructor is protected to make that safe: `delete` through a SegmentBase*
+// does not compile, so the missing virtual destructor cannot bite.
+class SegmentBase {
+public:
+    Offset baseOffset() const { return baseOffset_; }
+
+    // One past the last offset this segment holds.
+    //
+    // On an active segment this grows under the appender's hand while readers
+    // are looking at it, so it is an atomic and this load uses acquire
+    // ordering. Paired with the release store in append(), that guarantees a
+    // reader who sees the new offset also sees the bytes behind it — without
+    // the pairing a reader could observe the larger offset while the data was
+    // still invisible, and read zeroes out of a file it had just measured.
+    Offset nextOffset() const { return nextOffset_.load(std::memory_order_acquire); }
+
+    // Bytes written. FileHandle tracks this in its own atomic for the same
+    // reason, so this is free and needs no syscall.
+    std::uint64_t sizeBytes() const { return log_.size(); }
+
+    // The largest record timestamp seen, or -1 for an empty segment. M3's
+    // retention uses this — deleting by age is the one place where the
+    // producer's notion of time is the right one.
+    std::int64_t largestTimestamp() const {
+        return largestTimestamp_.load(std::memory_order_acquire);
+    }
+
+    bool isEmpty() const { return nextOffset() == baseOffset_; }
+
+    // Half-open: the last offset a segment holds is nextOffset() - 1.
+    bool contains(Offset offset) const { return offset >= baseOffset_ && offset < nextOffset(); }
+
+    // Borrowed, for sendfile() and for tests. The FileHandle stays alive as long
+    // as this segment does.
+    int                          fd() const { return log_.fd(); }
+    const std::filesystem::path& logFilePath() const { return log_.path(); }
+    const OffsetIndex&           index() const { return index_; }
+
+    // A segment owns a file descriptor and a memory mapping. Copying one would
+    // mean two owners of both.
+    SegmentBase(const SegmentBase&)            = delete;
+    SegmentBase& operator=(const SegmentBase&) = delete;
+
+protected:
+    // FileHandle and OffsetIndex are both move-only, so they arrive by value and
+    // are moved into place. Only the two derived classes call this.
+    SegmentBase(FileHandle log, OffsetIndex index, Offset baseOffset);
+    ~SegmentBase() = default;
+
+    FileHandle                log_;
+    OffsetIndex               index_;
+    Offset                    baseOffset_{0};
+    std::atomic<Offset>       nextOffset_{Offset{0}};
+    std::atomic<std::int64_t> largestTimestamp_{-1};
+};
 
 }  // namespace dariyakyu::storage
