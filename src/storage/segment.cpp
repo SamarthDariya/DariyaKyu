@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <format>
 #include <limits>
@@ -111,6 +112,36 @@ SegmentBase::SegmentBase(FileHandle log, OffsetIndex index, Offset baseOffset)
       baseOffset_(baseOffset),
       nextOffset_(baseOffset) {}
 
+void SegmentBase::deriveEndStateFromLog() {
+    const uint64_t limit = log_.size();
+
+    // Start at the last index entry rather than at the front of the file.
+    //
+    // OffsetIndex has no "give me the last entry" call — it answers "the greatest
+    // entry at or before this offset" — so asking for the largest offset the
+    // index could possibly describe returns the last one. Relative offsets are
+    // uint32, so that ceiling is baseOffset + UINT32_MAX.
+    //
+    // An empty index answers {0, 0} and the walk starts at the front, which is
+    // still bounded: an index only stays empty while the segment holds less than
+    // one interval of data.
+    uint64_t position =
+        index_.lookup(baseOffset_ + static_cast<int64_t>(numeric_limits<uint32_t>::max()))
+            .position;
+
+    Offset  next    = baseOffset_;
+    int64_t largest = -1;
+
+    while (auto at = batchAt(position, limit)) {
+        next    = at->header.lastOffset() + 1;
+        largest = max(largest, at->header.maxTimestamp);
+        position += at->totalSize;
+    }
+
+    nextOffset_.store(next, memory_order_release);
+    largestTimestamp_.store(largest, memory_order_release);
+}
+
 FileRange SegmentBase::read(Offset offset, size_t maxBytes) const {
     if (offset < baseOffset_)
         throw OffsetInvariantViolated("segment " + logFilePath().string() + " was asked for " +
@@ -198,6 +229,40 @@ optional<SegmentBase::BatchAt> SegmentBase::batchAt(uint64_t position, uint64_t 
     if (at.totalSize > limit - position) return nullopt;
 
     return at;
+}
+
+// --------------------------------------------------------------------------
+// SealedSegment
+// --------------------------------------------------------------------------
+
+SealedSegment::SealedSegment(FileHandle log, OffsetIndex index, Offset baseOffset)
+    : SegmentBase(std::move(log), std::move(index), baseOffset) {}
+
+unique_ptr<SealedSegment> SealedSegment::open(const filesystem::path& logFile) {
+    // The filename is the only record of where this segment starts, which is why
+    // parsing it is strict.
+    const Offset baseOffset = baseOffsetFromLogPath(logFile);
+
+    filesystem::path indexFile = logFile;
+    indexFile.replace_extension(kIndexSuffix);
+
+    // An EMPTY index is fine — a segment holding less than one interval of data
+    // has none, and reads fall back to scanning from the front. An ABSENT index
+    // is different: nothing in normal operation removes one, so it means the
+    // directory was tampered with or a delete was interrupted. Rebuilding it here
+    // would mean a full scan of a segment we are otherwise trusting, so this
+    // refuses and leaves the decision to M3's LogManager, which can see the whole
+    // partition.
+    if (!filesystem::exists(indexFile)) throw IoError("open", indexFile, ENOENT);
+
+    FileHandle  log(logFile, FileHandle::Mode::ReadOnly);
+    OffsetIndex index = OffsetIndex::openSealed(indexFile, baseOffset);
+
+    auto segment = unique_ptr<SealedSegment>(
+        new SealedSegment(std::move(log), std::move(index), baseOffset));
+
+    segment->deriveEndStateFromLog();
+    return segment;
 }
 
 // --------------------------------------------------------------------------

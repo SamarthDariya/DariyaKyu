@@ -219,11 +219,39 @@ protected:
     SegmentBase(FileHandle log, OffsetIndex index, Offset baseOffset);
     ~SegmentBase() = default;
 
+    // Learns nextOffset and largestTimestamp by reading the log, for a segment
+    // opened from disk rather than built by appending.
+    //
+    // Neither number is stored anywhere: the .log file is the only authority on
+    // what a segment contains, so there is no second copy to fall out of sync
+    // with it or to be trusted when it should not be.
+    //
+    // It does not read the whole file. It starts at the LAST index entry and
+    // walks headers from there to the end, which is bounded by one index
+    // interval — a page or two — because a segment rolls when its index fills.
+    // Remove that roll trigger and this becomes a full scan of every segment at
+    // every startup.
+    void deriveEndStateFromLog();
+
     FileHandle                log_;
     OffsetIndex               index_;
     Offset                    baseOffset_{0};
     std::atomic<Offset>       nextOffset_{Offset{0}};
     std::atomic<std::int64_t> largestTimestamp_{-1};
+};
+
+// A segment that will never be written to again. Immutable, which is what makes
+// it lock-free to read and safe for retention to delete underneath a reader.
+class SealedSegment final : public SegmentBase {
+public:
+    // Opens an existing segment and TRUSTS its bytes. No checksum scan: sealing
+    // already validated them, and re-verifying every sealed segment at startup
+    // is exactly the unbounded recovery that segmenting the log exists to avoid.
+    // Only the active segment gets scanned.
+    static std::unique_ptr<SealedSegment> open(const std::filesystem::path& logFile);
+
+private:
+    SealedSegment(FileHandle log, OffsetIndex index, Offset baseOffset);
 };
 
 // The one writable segment in a partition. Everything that mutates a log lives
