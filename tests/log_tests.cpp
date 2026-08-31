@@ -579,3 +579,70 @@ TEST_CASE("The default index can describe a full-size segment") {
     // maxSegmentBytes quietly stops meaning anything.
     CHECK(entries * policy.indexIntervalBytes / policy.maxSegmentBytes == 5);
 }
+
+// ===========================================================================
+// ActiveSegment: creation
+// ===========================================================================
+
+namespace {
+
+RollPolicy testPolicy() {
+    // Deliberately small, so tests reach an index interval and a size limit
+    // without writing megabytes.
+    RollPolicy policy;
+    policy.maxSegmentBytes    = 1 << 16;
+    policy.indexIntervalBytes = 256;
+    policy.maxIndexBytes      = 1024;
+    return policy;
+}
+
+}  // namespace
+
+TEST_CASE("A new segment creates both files and starts empty at its base offset") {
+    TempDir dir("seg-create");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(100), testPolicy());
+
+    CHECK(segment->baseOffset() == Offset(100));
+    CHECK(segment->nextOffset() == Offset(100));   // one past the last it holds
+    CHECK(segment->isEmpty());
+    CHECK(segment->sizeBytes() == 0);
+    CHECK(segment->largestTimestamp() == -1);
+
+    // Nothing is in it, so it contains nothing — not even its own base offset.
+    CHECK_FALSE(segment->contains(Offset(100)));
+
+    CHECK(filesystem::exists(segmentLogPath(dir.file(""), Offset(100))));
+    CHECK(filesystem::exists(segmentIndexPath(dir.file(""), Offset(100))));
+
+    // The index is preallocated up front, because growing a live mmap and then
+    // touching the new pages raises SIGBUS.
+    CHECK(filesystem::file_size(segmentIndexPath(dir.file(""), Offset(100))) ==
+          testPolicy().maxIndexBytes);
+    CHECK(segment->index().isEmpty());
+    CHECK(segment->policy().indexIntervalBytes == 256);
+}
+
+TEST_CASE("Creating a segment that already exists is refused") {
+    TempDir dir("seg-create-twice");
+    auto    first = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    // Appending into a file that already holds a segment would interleave two
+    // segments' records — corruption no checksum could catch, since every
+    // individual batch would still verify.
+    CHECK_THROWS(ActiveSegment::create(dir.file(""), Offset(0), testPolicy()));
+}
+
+TEST_CASE("A refused create leaves the existing index untouched") {
+    TempDir dir("seg-create-preserves-index");
+    const auto indexFile = segmentIndexPath(dir.file(""), Offset(0));
+
+    auto first = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    first->index().isEmpty();
+    const auto sizeBefore = filesystem::file_size(indexFile);
+
+    // OffsetIndex::create truncates an existing index to zero. If argument
+    // evaluation order let it run before the .log was claimed, this second
+    // create would wipe the first segment's index on its way to failing.
+    CHECK_THROWS(ActiveSegment::create(dir.file(""), Offset(0), testPolicy()));
+    CHECK(filesystem::file_size(indexFile) == sizeBefore);
+}

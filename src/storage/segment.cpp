@@ -96,4 +96,36 @@ SegmentBase::SegmentBase(FileHandle log, OffsetIndex index, Offset baseOffset)
       baseOffset_(baseOffset),
       nextOffset_(baseOffset) {}
 
+// --------------------------------------------------------------------------
+// ActiveSegment
+// --------------------------------------------------------------------------
+
+ActiveSegment::ActiveSegment(FileHandle log, OffsetIndex index, Offset baseOffset,
+                             const RollPolicy& policy)
+    : SegmentBase(std::move(log), std::move(index), baseOffset), policy_(policy) {}
+
+unique_ptr<ActiveSegment> ActiveSegment::create(const filesystem::path& dir, Offset baseOffset,
+                                                const RollPolicy& policy) {
+    // The two resources are acquired in named steps rather than inline in the
+    // constructor call, and the order is load-bearing.
+    //
+    // The order of evaluation of a function's arguments is UNSPECIFIED in C++ —
+    // the compiler may run them in any order. So building both inline would let
+    // OffsetIndex::create run FIRST, and it truncates an existing index file to
+    // zero. A create() that then failed on the .log would have destroyed a
+    // perfectly good index belonging to a segment it refused to touch.
+    //
+    // Named locals force the sequence: claim the log first, and if that throws,
+    // nothing has been modified.
+    FileHandle log(segmentLogPath(dir, baseOffset), FileHandle::Mode::CreateNew);
+    OffsetIndex index =
+        OffsetIndex::create(segmentIndexPath(dir, baseOffset), baseOffset, policy.maxIndexBytes);
+
+    // make_unique cannot be used here: the constructor is private, and
+    // make_unique is not a member so it has no access. `new` inside a static
+    // member function does.
+    return unique_ptr<ActiveSegment>(
+        new ActiveSegment(std::move(log), std::move(index), baseOffset, policy));
+}
+
 }  // namespace dariyakyu::storage

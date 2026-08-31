@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 #include "common/file_handle.hpp"
@@ -159,6 +160,34 @@ protected:
     Offset                    baseOffset_{0};
     std::atomic<Offset>       nextOffset_{Offset{0}};
     std::atomic<std::int64_t> largestTimestamp_{-1};
+};
+
+// The one writable segment in a partition. Everything that mutates a log lives
+// here, which is why there is exactly one of these per partition and why only
+// one thread ever touches it.
+class ActiveSegment final : public SegmentBase {
+public:
+    // A brand-new segment: creates both files in `dir` and preallocates the
+    // index to policy.maxIndexBytes.
+    //
+    // Fails if the .log already exists. Rolling to an offset that already has a
+    // segment means the caller's offset bookkeeping is wrong, and appending into
+    // that file would interleave two segments' records into one log — a
+    // corruption no checksum would catch, because every individual batch would
+    // still be intact.
+    static std::unique_ptr<ActiveSegment> create(const std::filesystem::path& dir,
+                                                 Offset baseOffset, const RollPolicy& policy);
+
+    // The policy this segment was created with. Held rather than passed in per
+    // call, so append() and shouldRoll() cannot disagree about the interval or
+    // the size limit.
+    const RollPolicy& policy() const { return policy_; }
+
+private:
+    ActiveSegment(FileHandle log, OffsetIndex index, Offset baseOffset,
+                  const RollPolicy& policy);
+
+    RollPolicy policy_;
 };
 
 }  // namespace dariyakyu::storage
