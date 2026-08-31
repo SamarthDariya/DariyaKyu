@@ -2483,3 +2483,196 @@ TEST_CASE("A hole left by a missing middle segment is refused") {
 
     CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, partition, policy), CorruptData);
 }
+
+// ===========================================================================
+// Log: truncation
+// ===========================================================================
+
+TEST_CASE("Truncating inside the active segment drops the records above it") {
+    TempDir dir("log-trunc-active");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    for (int i = 0; i < 20; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+    REQUIRE(log->segmentCount() == 1);
+
+    log->truncateTo(Offset(12));
+
+    CHECK(log->logEndOffset() == Offset(12));
+    CHECK(log->read(Offset(11), kBigFetch).ok());
+    CHECK(log->read(Offset(12), kBigFetch).ok());                     // caught up
+    CHECK(log->read(Offset(12), kBigFetch).range.empty());
+    CHECK(log->read(Offset(13), kBigFetch).error == ReadError::AboveLogEnd);
+}
+
+TEST_CASE("Truncating inside a sealed segment deletes every segment above it") {
+    TempDir dir("log-trunc-sealed");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+    const size_t before = log->segmentCount();
+    REQUIRE(before > 3);
+
+    log->truncateTo(Offset(6));
+
+    CHECK(log->logEndOffset() <= Offset(6));
+    CHECK(log->segmentCount() < before);
+
+    // The files are gone from disk, not merely forgotten.
+    size_t logsOnDisk = 0;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log") ++logsOnDisk;
+    CHECK(logsOnDisk == log->segmentCount());
+}
+
+TEST_CASE("A truncated log can be appended to again") {
+    TempDir dir("log-trunc-append");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    for (int i = 0; i < 30; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+
+    log->truncateTo(Offset(10));
+    const Offset resume = log->logEndOffset();
+    REQUIRE(resume <= Offset(10));
+
+    // A follower truncates and then starts following, so the segment it was left
+    // with has to be writable.
+    auto bytes = makeUnstampedBatch(9999, 48);
+    CHECK(log->append(bytes) == resume);
+    CHECK(log->logEndOffset() == resume + 1);
+
+    const auto result = log->read(resume, kBigFetch);
+    REQUIRE(result.ok());
+    CHECK(RecordBatch::verifyCrc(pullRange(result.range)));
+}
+
+TEST_CASE("Every surviving offset still reads correctly after a truncation") {
+    TempDir dir("log-trunc-integrity");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+
+    log->truncateTo(Offset(17));
+    const int64_t end = log->logEndOffset().value();
+    REQUIRE(end <= 17);
+    REQUIRE(end > 0);
+
+    for (int64_t offset = 0; offset < end; ++offset) {
+        const auto result = log->read(Offset(offset), kBigFetch);
+        REQUIRE(result.ok());
+        const auto header = RecordBatch::parseHeader(pullRange(result.range));
+        CHECK(header.baseOffset <= Offset(offset));
+        CHECK(header.lastOffset() >= Offset(offset));
+    }
+}
+
+TEST_CASE("Truncating to the end of the log or beyond does nothing") {
+    TempDir dir("log-trunc-noop");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    for (int i = 0; i < 10; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        log->append(bytes);
+    }
+    const size_t segments = log->segmentCount();
+
+    log->truncateTo(Offset(10));
+    CHECK(log->logEndOffset() == Offset(10));
+    log->truncateTo(Offset(500));
+    CHECK(log->logEndOffset() == Offset(10));
+    CHECK(log->segmentCount() == segments);
+}
+
+TEST_CASE("Truncating everything away leaves an empty log that does not reuse offsets") {
+    TempDir dir("log-trunc-all");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    for (int i = 0; i < 30; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+
+    log->truncateTo(Offset(0));
+
+    CHECK(log->logEndOffset() == Offset(0));
+    CHECK(log->segmentCount() == 1);
+    CHECK(log->read(Offset(0), kBigFetch).ok());
+    CHECK(log->read(Offset(0), kBigFetch).range.empty());
+
+    auto bytes = makeUnstampedBatch(1, 48);
+    CHECK(log->append(bytes) == Offset(0));
+}
+
+TEST_CASE("A log restarted above zero after truncation does not renumber records") {
+    TempDir dir("log-trunc-no-reuse");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    for (int i = 0; i < 30; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+    const auto bases = [&] {
+        vector<Offset> out;
+        map<string, filesystem::path> logs;
+        for (const auto& entry : filesystem::directory_iterator(partition))
+            if (entry.path().extension() == ".log")
+                logs[entry.path().filename().string()] = entry.path();
+        for (const auto& [name, path] : logs) out.push_back(baseOffsetFromLogPath(path));
+        return out;
+    }();
+    REQUIRE(bases.size() > 2);
+
+    // Truncate to exactly a segment boundary: the segment starting there goes
+    // whole, and the previous one is promoted back to writable.
+    log->truncateTo(bases[1]);
+    CHECK(log->logEndOffset() == bases[1]);
+
+    // Offsets are never reused. The next record written gets the offset that was
+    // just discarded — a consumer that had read past it must not be handed
+    // different records under the same numbers, which is what leader epochs exist
+    // to detect at M8.
+    auto bytes = makeUnstampedBatch(7777, 48);
+    CHECK(log->append(bytes) == bases[1]);
+}
+
+TEST_CASE("Truncation survives a restart") {
+    TempDir dir("log-trunc-reopen");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    Offset  after{0};
+    {
+        auto log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+        for (int i = 0; i < 30; ++i) {
+            auto bytes = makeUnstampedBatch(1000 + i, 48);
+            log->append(bytes);
+        }
+        log->truncateTo(Offset(14));
+        after = log->logEndOffset();
+    }
+
+    // The truncation was to the files, not to in-memory state — so a reopen must
+    // agree, and the contiguity check must still pass.
+    auto reopened = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    CHECK(reopened->logEndOffset() == after);
+    CHECK(reopened->read(after, kBigFetch).ok());
+    CHECK(reopened->read(after + 1, kBigFetch).error == ReadError::AboveLogEnd);
+}
