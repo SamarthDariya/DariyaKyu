@@ -106,6 +106,15 @@ public:
     // Single-appender only: one thread per partition.
     Offset append(std::span<std::uint8_t> batchBytes);
 
+    // Seals the active segment and starts a new one, if the roll policy says so.
+    //
+    // append() calls this itself, so the write path needs nothing extra. It is
+    // public because M3's maintenance thread must ALSO call it: a partition
+    // receiving no writes would otherwise never re-evaluate its age, so its
+    // active segment would never seal, so retention — which only deletes sealed
+    // segments — would never free anything on an idle topic.
+    void maybeRoll(std::int64_t nowMs);
+
     // The earliest offset still on disk. Rises as retention deletes segments,
     // which is why it is a question about the segment map rather than a stored
     // number.

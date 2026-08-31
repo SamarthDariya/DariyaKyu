@@ -2013,3 +2013,159 @@ TEST_CASE("On a single node the high watermark tracks the log end offset") {
         CHECK(log->highWatermark() == log->logEndOffset());
     }
 }
+
+// ===========================================================================
+// Log: rolling
+// ===========================================================================
+
+namespace {
+
+// Walks every .log file in a partition directory in base-offset order and
+// collects the offsets it actually finds on disk. Used to prove rolling loses
+// nothing — deliberately independent of Log's own bookkeeping.
+vector<int64_t> offsetsOnDisk(const filesystem::path& partition) {
+    map<string, filesystem::path> logs;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log")
+            logs[entry.path().filename().string()] = entry.path();
+
+    vector<int64_t> offsets;
+    for (const auto& [name, path] : logs) {
+        const auto bytes = readFile(path);
+        size_t     position = 0;
+        while (position < bytes.size()) {
+            const auto batch  = span<const uint8_t>(bytes).subspan(position);
+            const auto header = RecordBatch::parseHeader(batch);
+            for (int64_t i = 0; i < header.recordCount; ++i)
+                offsets.push_back(header.baseOffset.value() + i);
+            position += RecordBatch::totalSizeOf(batch);
+        }
+    }
+    return offsets;
+}
+
+}  // namespace
+
+TEST_CASE("Exceeding the size limit rolls to a new segment") {
+    TempDir dir("log-roll-size");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 600;
+    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, policy);
+
+    CHECK(log->segmentCount() == 1);
+
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 64);
+        log->append(bytes);
+    }
+
+    CHECK(log->segmentCount() > 1);
+    CHECK(log->logEndOffset() == Offset(40));
+    CHECK(log->logStartOffset() == Offset(0));   // nothing deleted, only sealed
+}
+
+TEST_CASE("Rolling loses no records and leaves no gaps") {
+    TempDir dir("log-roll-integrity");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, policy);
+
+    constexpr int kBatches = 60;
+    for (int i = 0; i < kBatches; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+
+    // Read back from the files themselves rather than from Log, so this checks
+    // what is on disk rather than what Log believes.
+    const auto found = offsetsOnDisk(partition);
+    REQUIRE(found.size() == static_cast<size_t>(kBatches));
+    for (int i = 0; i < kBatches; ++i) CHECK(found[static_cast<size_t>(i)] == i);
+}
+
+TEST_CASE("Each new segment is named for the offset the previous one ended at") {
+    TempDir dir("log-roll-names");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, policy);
+
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+
+    // Collect base offsets from the filenames, in sorted order.
+    vector<Offset> bases;
+    map<string, filesystem::path> logs;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log")
+            logs[entry.path().filename().string()] = entry.path();
+    for (const auto& [name, path] : logs) bases.push_back(baseOffsetFromLogPath(path));
+
+    REQUIRE(bases.size() > 2);
+    CHECK(bases.front() == Offset(0));
+
+    // Contiguous: no gaps, no overlaps. This is the property that lets Log route
+    // a read by binary searching base offsets alone.
+    const auto disk = offsetsOnDisk(partition);
+    for (size_t i = 1; i < bases.size(); ++i) CHECK(bases[i] > bases[i - 1]);
+    CHECK(disk.size() == 40);
+
+    // And every sealed segment has a trimmed index while the active one is still
+    // preallocated — so the directory says which segment is live.
+    const auto activeIndex = segmentIndexPath(partition, bases.back());
+    CHECK(filesystem::file_size(activeIndex) == policy.maxIndexBytes);
+    CHECK(filesystem::file_size(segmentIndexPath(partition, bases.front())) <
+          policy.maxIndexBytes);
+}
+
+TEST_CASE("An idle partition rolls when the maintenance sweep asks it to") {
+    TempDir dir("log-roll-idle");
+    auto    policy         = testPolicy();
+    policy.maxSegmentAgeMs = 1000;
+    policy.maxSegmentBytes = 1ull << 30;
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+
+    auto bytes = makeUnstampedBatch(1000);
+    log->append(bytes);
+    REQUIRE(log->segmentCount() == 1);
+
+    // The trap this exists for: with no further writes, append() is never called
+    // again, so nothing would re-evaluate age. The active segment would never
+    // seal and retention would never free anything on this topic.
+    log->maybeRoll(wallClockMillis() + 5000);
+    CHECK(log->segmentCount() == 2);
+    CHECK(log->logEndOffset() == Offset(1));
+}
+
+TEST_CASE("An idle partition with an empty active segment does not accumulate files") {
+    TempDir dir("log-roll-idle-empty");
+    auto    policy         = testPolicy();
+    policy.maxSegmentAgeMs = 1000;
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+
+    // Repeated sweeps on a partition that has never been written to must do
+    // nothing at all, or a quiet topic would grow a segment per sweep forever.
+    for (int i = 0; i < 5; ++i) log->maybeRoll(wallClockMillis() + 100000 * (i + 1));
+    CHECK(log->segmentCount() == 1);
+}
+
+TEST_CASE("Appending continues seamlessly across a roll") {
+    TempDir dir("log-roll-continuity");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+
+    // Every returned offset must be exactly the previous log end offset, whether
+    // or not that append happened to trigger a roll.
+    for (int i = 0; i < 30; ++i) {
+        const Offset expected = log->logEndOffset();
+        auto         bytes    = makeUnstampedBatch(1000 + i, 48, 2);
+        CHECK(log->append(bytes) == expected);
+        CHECK(log->logEndOffset() == expected + 2);
+    }
+    CHECK(log->segmentCount() > 3);
+}

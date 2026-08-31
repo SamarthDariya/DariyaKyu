@@ -19,16 +19,6 @@ namespace dariyakyu::storage {
 
 namespace {
 
-// Wall clock, not a steady clock. A steady clock is immune to the system time
-// being adjusted, but it also resets when the machine reboots — and this number
-// is compared against a `nowMs` that M3's maintenance thread will take from the
-// wall clock, because retention policies are written in human time.
-int64_t nowMillis() {
-    return chrono::duration_cast<chrono::milliseconds>(
-               chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
 constexpr char   kLogSuffix[]   = ".log";
 constexpr char   kIndexSuffix[] = ".index";
 constexpr size_t kNameDigits    = 20;
@@ -38,6 +28,12 @@ constexpr size_t kNameDigits    = 20;
 constexpr size_t kLogSuffixLength = sizeof(kLogSuffix) - 1;
 
 }  // namespace
+
+int64_t wallClockMillis() {
+    return chrono::duration_cast<chrono::milliseconds>(
+               chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 string segmentBaseName(Offset baseOffset) {
     // "{:020d}" is one placeholder with a format spec after the colon:
@@ -389,7 +385,7 @@ unique_ptr<ActiveSegment> ActiveSegment::recover(const filesystem::path& logFile
 
     segment->nextOffset_.store(next, memory_order_release);
     segment->largestTimestamp_.store(largest, memory_order_release);
-    segment->firstAppendMs_ = (good > 0) ? nowMillis() : -1;
+    segment->firstAppendMs_ = (good > 0) ? wallClockMillis() : -1;
 
     return segment;
 }
@@ -460,7 +456,7 @@ void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
     // Only on the first append, so age counts from when the segment started
     // receiving data rather than from when the file was created. A segment that
     // sat empty for a week must not be instantly stale on its first record.
-    if (firstAppendMs_ < 0) firstAppendMs_ = nowMillis();
+    if (firstAppendMs_ < 0) firstAppendMs_ = wallClockMillis();
 
     // relaxed on the load: only this thread ever writes largestTimestamp_, so it
     // is reading its own last value and needs no ordering to do that. The store
