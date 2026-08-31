@@ -284,6 +284,27 @@ public:
     static std::unique_ptr<ActiveSegment> create(const std::filesystem::path& dir,
                                                  Offset baseOffset, const RollPolicy& policy);
 
+    // Opens a segment that may have been mid-write when the process died.
+    //
+    // A crash leaves bytes on disk that look like perfectly plausible data —
+    // there is no marker saying "this record is incomplete" — so the only way to
+    // find where the good data ends is to walk the batches and check their
+    // checksums. Everything from the first failure onward is truncated away,
+    // because serving a consumer bytes that failed their own checksum is worse
+    // than losing an unacknowledged write.
+    //
+    // Only ever called on ONE segment per partition: the newest. Sealed segments
+    // were validated when they were sealed and are trusted. That is what keeps
+    // startup time bounded by a segment rather than by a partition, and it is
+    // the main reason the log is split into segments at all.
+    //
+    // Note the age clock restarts. The wall-clock time of the original first
+    // append is not recorded anywhere, and the file's mtime is whatever the last
+    // write happened to leave, so a recovered segment is treated as new for
+    // age-based rolling.
+    static std::unique_ptr<ActiveSegment> recover(const std::filesystem::path& logFile,
+                                                  const RollPolicy& policy);
+
     // Appends one batch, whose header must already carry `baseOffset` — Log
     // stamps it before calling (that stamp is the only write the broker ever
     // makes to producer bytes).
