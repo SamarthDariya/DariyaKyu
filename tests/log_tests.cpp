@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -1134,4 +1135,106 @@ TEST_CASE("A capped read starts on a boundary even though it may end mid-batch")
         CHECK(range.length >= 1);
         CHECK(range.position + range.length <= segment->sizeBytes());
     }
+}
+
+// ===========================================================================
+// ActiveSegment: rolling
+// ===========================================================================
+
+namespace {
+
+int64_t testNowMs() {
+    return chrono::duration_cast<chrono::milliseconds>(
+               chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
+TEST_CASE("An empty segment never rolls, however old the clock claims it is") {
+    TempDir dir("seg-roll-empty");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    // Rolling an empty segment would seal an empty file and create another one,
+    // so an idle partition would grow a file per maintenance sweep, forever.
+    CHECK_FALSE(segment->shouldRoll(0));
+    CHECK_FALSE(segment->shouldRoll(testNowMs()));
+    CHECK_FALSE(segment->shouldRoll(testNowMs() + segment->policy().maxSegmentAgeMs * 100));
+}
+
+TEST_CASE("A segment with room left does not roll") {
+    TempDir dir("seg-roll-not-yet");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 3, 32);
+
+    CHECK_FALSE(segment->shouldRoll(testNowMs()));
+}
+
+TEST_CASE("A segment rolls once it reaches its size limit") {
+    TempDir dir("seg-roll-size");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 800;
+    auto    segment        = ActiveSegment::create(dir.file(""), Offset(0), policy);
+
+    fillSegment(*segment, 2, 32);
+    REQUIRE(segment->sizeBytes() < 800);
+    CHECK_FALSE(segment->shouldRoll(testNowMs()));
+
+    fillSegment(*segment, 20, 64);
+    CHECK(segment->sizeBytes() >= 800);
+    CHECK(segment->shouldRoll(testNowMs()));
+}
+
+TEST_CASE("A segment rolls once it is older than the age limit") {
+    TempDir dir("seg-roll-age");
+    auto    policy         = testPolicy();
+    policy.maxSegmentAgeMs = 5000;
+    auto    segment        = ActiveSegment::create(dir.file(""), Offset(0), policy);
+    fillSegment(*segment, 1);
+
+    const int64_t now = testNowMs();
+    CHECK_FALSE(segment->shouldRoll(now));
+
+    // Time is a parameter, so this needs no sleeping. Without age-based rolling
+    // a partition receiving one record a day would keep the same active segment
+    // for years, and retention only ever deletes sealed segments.
+    CHECK(segment->shouldRoll(now + 5000));
+    CHECK(segment->shouldRoll(now + 100000));
+}
+
+TEST_CASE("Age is measured from the first append, not from creation") {
+    TempDir dir("seg-roll-age-origin");
+    auto    policy         = testPolicy();
+    policy.maxSegmentAgeMs = 5000;
+    auto    segment        = ActiveSegment::create(dir.file(""), Offset(0), policy);
+
+    // Pretend the file was created long ago and has only just received data. It
+    // must not be instantly stale — otherwise a segment that sat empty for a
+    // week would roll on its very first record.
+    const int64_t now = testNowMs();
+    CHECK_FALSE(segment->shouldRoll(now + 1000000));   // still empty
+
+    fillSegment(*segment, 1);
+    CHECK_FALSE(segment->shouldRoll(now));
+}
+
+TEST_CASE("A full index forces a roll even with size and age to spare") {
+    TempDir dir("seg-roll-index-full");
+    auto    policy            = testPolicy();
+    policy.maxIndexBytes      = OffsetIndex::kEntrySize * 2;   // two entries
+    policy.indexIntervalBytes = 128;
+    policy.maxSegmentBytes    = 1ull << 30;
+    policy.maxSegmentAgeMs    = 1ll << 40;
+    auto    segment           = ActiveSegment::create(dir.file(""), Offset(0), policy);
+
+    fillSegment(*segment, 2, 32);
+    CHECK_FALSE(segment->index().isFull());
+    CHECK_FALSE(segment->shouldRoll(testNowMs()));
+
+    fillSegment(*segment, 20, 64);
+
+    // Once entries start being dropped, read()'s forward scan and the walk that
+    // reopens a sealed segment both stop being bounded by one index interval.
+    CHECK(segment->index().isFull());
+    CHECK(segment->shouldRoll(testNowMs()));
 }

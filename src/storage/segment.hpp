@@ -255,6 +255,18 @@ public:
     // throws OffsetInvariantViolated rather than CorruptData.
     void append(Offset baseOffset, std::span<const std::uint8_t> batchBytes);
 
+    // Whether this segment should be sealed and a new one started.
+    //
+    // `nowMs` is passed in rather than read from the clock here. Two reasons:
+    // tests can advance time without sleeping, and M3's maintenance thread
+    // sweeps every partition on the broker — it reads the clock once and passes
+    // the same instant to all of them, rather than making a syscall per
+    // partition and comparing against slightly different "now"s.
+    //
+    // Advisory. Log decides when to act on it, which is why a single oversized
+    // batch can still push a segment past maxSegmentBytes.
+    bool shouldRoll(std::int64_t nowMs) const;
+
     // The policy this segment was created with. Held rather than passed in per
     // call, so append() and shouldRoll() cannot disagree about the interval or
     // the size limit.
@@ -270,6 +282,11 @@ private:
     // entry goes in once this reaches policy_.indexIntervalBytes, then it resets.
     // Starting at zero is what keeps the segment's first batch out of the index.
     std::uint64_t bytesSinceIndexEntry_ = 0;
+
+    // Wall clock at the FIRST append, or -1 while the segment is empty. Age is
+    // measured from here, so a segment that sat empty for a week is not
+    // instantly stale the moment it receives a record.
+    std::int64_t firstAppendMs_ = -1;
 };
 
 }  // namespace dariyakyu::storage
