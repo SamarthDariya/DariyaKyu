@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -16,6 +17,16 @@ using namespace std;
 namespace dariyakyu::storage {
 
 namespace {
+
+// Wall clock, not a steady clock. A steady clock is immune to the system time
+// being adjusted, but it also resets when the machine reboots — and this number
+// is compared against a `nowMs` that M3's maintenance thread will take from the
+// wall clock, because retention policies are written in human time.
+int64_t nowMillis() {
+    return chrono::duration_cast<chrono::milliseconds>(
+               chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 constexpr char   kLogSuffix[]   = ".log";
 constexpr char   kIndexSuffix[] = ".index";
@@ -283,6 +294,11 @@ void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
     log_.append(batchBytes);
     bytesSinceIndexEntry_ += batchBytes.size();
 
+    // Only on the first append, so age counts from when the segment started
+    // receiving data rather than from when the file was created. A segment that
+    // sat empty for a week must not be instantly stale on its first record.
+    if (firstAppendMs_ < 0) firstAppendMs_ = nowMillis();
+
     // relaxed on the load: only this thread ever writes largestTimestamp_, so it
     // is reading its own last value and needs no ordering to do that. The store
     // is release because readers do consume it.
@@ -299,6 +315,35 @@ void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
     // outside the compressed region of the batch on purpose — so the segment
     // learns how many records arrived without decompressing anything.
     nextOffset_.store(header.lastOffset() + 1, memory_order_release);
+}
+
+bool ActiveSegment::shouldRoll(int64_t nowMs) const {
+    // An empty segment never rolls, and this has to come first.
+    //
+    // Rolling one would seal an empty file and create another empty file, so an
+    // idle partition would grow a segment per maintenance sweep, forever. It
+    // also matters that the age check below cannot fire here: firstAppendMs_ is
+    // still -1, and a segment nothing has been written to has no age.
+    if (isEmpty()) return false;
+
+    if (sizeBytes() >= policy_.maxSegmentBytes) return true;
+
+    // A full index must force a roll, and this is the non-obvious trigger.
+    //
+    // Once entries start being dropped, everything that claims to be "bounded by
+    // one index interval" stops being bounded: read()'s forward scan, and the
+    // header walk that reopens a sealed segment. Both would degrade quietly into
+    // scans of the whole segment. The static_assert on RollPolicy exists so this
+    // fires only on a deliberately mismatched configuration, never on the
+    // defaults.
+    if (index_.isFull()) return true;
+
+    // Age, from the first append. Without this a low-traffic partition never
+    // rolls, so its active segment never seals, so retention — which only
+    // touches sealed segments — never frees anything.
+    if (nowMs - firstAppendMs_ >= policy_.maxSegmentAgeMs) return true;
+
+    return false;
 }
 
 }  // namespace dariyakyu::storage
