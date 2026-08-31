@@ -555,3 +555,21 @@ TEST_CASE("Twenty digits that overflow int64 are corruption, not an out_of_range
     // different type from every other bad name.
     CHECK_THROWS_AS(baseOffsetFromLogPath("/d/99999999999999999999.log"), CorruptData);
 }
+
+// ===========================================================================
+// Roll policy
+// ===========================================================================
+
+TEST_CASE("The default index can describe a full-size segment") {
+    // Asserted at compile time in segment.hpp too; spelled out here because the
+    // relationship between the four knobs is the whole content of the struct.
+    const RollPolicy policy;
+    const size_t entries = policy.maxIndexBytes / OffsetIndex::kEntrySize;
+
+    CHECK(entries == 1310720);
+    CHECK(entries * policy.indexIntervalBytes > policy.maxSegmentBytes);
+
+    // If this ever fails, segments roll on a full index instead of on size, and
+    // maxSegmentBytes quietly stops meaning anything.
+    CHECK(entries * policy.indexIntervalBytes / policy.maxSegmentBytes == 5);
+}
