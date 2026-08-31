@@ -1238,3 +1238,108 @@ TEST_CASE("A full index forces a roll even with size and age to spare") {
     CHECK(segment->index().isFull());
     CHECK(segment->shouldRoll(testNowMs()));
 }
+
+// ===========================================================================
+// SealedSegment: opening from disk
+// ===========================================================================
+
+TEST_CASE("A segment reopened from disk agrees with the one that wrote it") {
+    TempDir dir("seg-open");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(700));
+
+    Offset   next{0};
+    uint64_t size = 0;
+    int64_t  largest = 0;
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(700), testPolicy());
+        fillSegment(*segment, 25, 64);
+        next    = segment->nextOffset();
+        size    = segment->sizeBytes();
+        largest = segment->largestTimestamp();
+    }   // closed
+
+    auto sealed = SealedSegment::open(logFile);
+
+    // None of these were written down anywhere — all three are derived by
+    // reading the log, because the .log file is the only authority on what a
+    // segment contains.
+    CHECK(sealed->baseOffset() == Offset(700));
+    CHECK(sealed->nextOffset() == next);
+    CHECK(sealed->sizeBytes() == size);
+    CHECK(sealed->largestTimestamp() == largest);
+    CHECK_FALSE(sealed->isEmpty());
+}
+
+TEST_CASE("A reopened segment resolves every offset it holds") {
+    TempDir dir("seg-open-reads");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+
+    vector<uint64_t> starts;
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        for (int i = 0; i < 30; ++i) {
+            starts.push_back(segment->sizeBytes());
+            const Offset base = segment->nextOffset();
+            auto bytes = makeBatch(base, 2000 + i, 48);
+            segment->append(base, bytes);
+        }
+    }
+
+    auto sealed = SealedSegment::open(logFile);
+    for (int i = 0; i < 30; ++i)
+        CHECK(sealed->read(Offset(i), kBigFetch).position == starts[static_cast<size_t>(i)]);
+
+    CHECK(sealed->read(Offset(30), kBigFetch).empty());
+}
+
+TEST_CASE("A reopened segment with no index entries still derives its end state") {
+    TempDir dir("seg-open-no-index");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+    auto policy = testPolicy();
+    policy.indexIntervalBytes = 1 << 20;   // never reaches an interval
+
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), policy);
+        fillSegment(*segment, 5, 32);
+    }
+
+    // The walk starts at the front of the file, which is still bounded: an index
+    // only stays empty while the segment holds less than one interval of data.
+    auto sealed = SealedSegment::open(logFile);
+    CHECK(sealed->index().isEmpty());
+    CHECK(sealed->nextOffset() == Offset(5));
+}
+
+TEST_CASE("A reopened empty segment reports itself empty") {
+    TempDir dir("seg-open-empty");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(42));
+    { auto segment = ActiveSegment::create(dir.file(""), Offset(42), testPolicy()); (void)segment; }
+
+    auto sealed = SealedSegment::open(logFile);
+    CHECK(sealed->isEmpty());
+    CHECK(sealed->nextOffset() == Offset(42));
+    CHECK(sealed->sizeBytes() == 0);
+    CHECK(sealed->largestTimestamp() == -1);
+}
+
+TEST_CASE("Opening a segment whose index is missing is refused") {
+    TempDir dir("seg-open-no-index-file");
+    const auto logFile   = segmentLogPath(dir.file(""), Offset(0));
+    const auto indexFile = segmentIndexPath(dir.file(""), Offset(0));
+
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 3);
+    }
+    filesystem::remove(indexFile);
+
+    // Nothing in normal operation deletes an index, so its absence means the
+    // directory was tampered with or a delete was interrupted. Rebuilding it
+    // would mean a full scan of a segment we are otherwise trusting.
+    CHECK_THROWS_AS(SealedSegment::open(logFile), IoError);
+}
+
+TEST_CASE("Opening something that is not a segment file is refused") {
+    TempDir dir("seg-open-bad-name");
+    CHECK_THROWS_AS(SealedSegment::open(dir.file("partition.meta")), CorruptData);
+}
