@@ -202,6 +202,11 @@ private:
                   const RollPolicy& policy);
 
     RollPolicy policy_;
+
+    // Log bytes written since the last index entry. The sparseness counter: an
+    // entry goes in once this reaches policy_.indexIntervalBytes, then it resets.
+    // Starting at zero is what keeps the segment's first batch out of the index.
+    std::uint64_t bytesSinceIndexEntry_ = 0;
 };
 
 }  // namespace dariyakyu::storage
