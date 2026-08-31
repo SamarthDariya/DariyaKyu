@@ -47,6 +47,12 @@ std::filesystem::path segmentIndexPath(const std::filesystem::path& dir, Offset 
 // offset 0 would shadow the real first segment and hide records.
 Offset baseOffsetFromLogPath(const std::filesystem::path& logFile);
 
+// Milliseconds since the epoch, on the WALL clock rather than a steady clock.
+// A steady clock is immune to the system time being adjusted, but it also resets
+// on reboot — and these numbers are compared against retention and roll policies
+// written in human time.
+std::int64_t wallClockMillis();
+
 // When to stop writing to a segment and start a new one.
 //
 // Rolling is what bounds three separate things, and a partition that never rolls
