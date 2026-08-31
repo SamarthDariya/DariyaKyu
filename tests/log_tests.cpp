@@ -1890,3 +1890,126 @@ TEST_CASE("A log keeps the policy it was created with") {
     CHECK(log->policy().maxSegmentBytes == 4242);
     CHECK(log->policy().indexIntervalBytes == policy.indexIntervalBytes);
 }
+
+// ===========================================================================
+// Log: append
+// ===========================================================================
+
+namespace {
+
+// A batch the producer would send: encoded, but never stamped. Log assigns and
+// stamps the offset, so a fixture that pre-stamped it would be testing the wrong
+// thing.
+vector<uint8_t> makeUnstampedBatch(int64_t timestamp, size_t payloadBytes = 32,
+                                   int records = 1) {
+    RecordBatchBuilder    builder;
+    const vector<uint8_t> value(payloadBytes, 0xAB);
+    for (int i = 0; i < records; ++i)
+        builder.append(timestamp + i, nullopt, span<const uint8_t>(value));
+    return builder.build();
+}
+
+}  // namespace
+
+TEST_CASE("Append assigns offsets as one sequence per partition") {
+    TempDir dir("log-append");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+
+    for (int i = 0; i < 10; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        CHECK(log->append(bytes) == Offset(i));
+    }
+
+    CHECK(log->logEndOffset() == Offset(10));
+    CHECK(log->logStartOffset() == Offset(0));
+}
+
+TEST_CASE("The log end offset advances by the batch's record count") {
+    TempDir dir("log-append-multi");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+
+    auto four = makeUnstampedBatch(1000, 16, 4);
+    CHECK(log->append(four) == Offset(0));
+    CHECK(log->logEndOffset() == Offset(4));
+
+    auto three = makeUnstampedBatch(2000, 16, 3);
+    CHECK(log->append(three) == Offset(4));
+    CHECK(log->logEndOffset() == Offset(7));
+}
+
+TEST_CASE("Append stamps the assigned offset into the bytes on disk") {
+    TempDir dir("log-append-stamp");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+
+    auto first  = makeUnstampedBatch(1000, 16, 2);
+    auto second = makeUnstampedBatch(2000, 16, 2);
+    log->append(first);
+    log->append(second);
+
+    // Read the segment file back cold and parse the headers. The producer sent
+    // both batches saying "base offset 0"; what landed must say 0 and 2.
+    const auto bytes = readFile(segmentLogPath(partition, Offset(0)));
+    const auto firstHeader = RecordBatch::parseHeader(bytes);
+    CHECK(firstHeader.baseOffset == Offset(0));
+
+    const size_t firstSize = RecordBatch::totalSizeOf(bytes);
+    const auto   secondHeader =
+        RecordBatch::parseHeader(span<const uint8_t>(bytes).subspan(firstSize));
+    CHECK(secondHeader.baseOffset == Offset(2));
+}
+
+TEST_CASE("Stamping does not disturb the checksum") {
+    TempDir dir("log-append-crc");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+
+    for (int i = 0; i < 5; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+
+    // The point of the v2 field order: baseOffset sits before the crc field, so
+    // stamping it leaves every checksum on disk still valid. If it did not, the
+    // broker would have to recompute a CRC over a body it may not be able to
+    // read.
+    const auto bytes = readFile(segmentLogPath(partition, Offset(0)));
+    size_t     position = 0;
+    int        verified = 0;
+    while (position < bytes.size()) {
+        const auto batch = span<const uint8_t>(bytes).subspan(position);
+        CHECK(RecordBatch::verifyCrc(batch));
+        position += RecordBatch::totalSizeOf(batch);
+        ++verified;
+    }
+    CHECK(verified == 5);
+    CHECK(position == bytes.size());
+}
+
+TEST_CASE("Append overwrites whatever base offset the producer sent") {
+    TempDir dir("log-append-overwrite");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+
+    // A producer that guessed, or replayed a batch from elsewhere. The broker's
+    // sequence is the only authority, so its stamp wins.
+    auto bytes = makeUnstampedBatch(1000, 16);
+    RecordBatch::stampBaseOffset(bytes, Offset(9999));
+
+    CHECK(log->append(bytes) == Offset(0));
+    CHECK(RecordBatch::parseHeader(readFile(segmentLogPath(partition, Offset(0))))
+              .baseOffset == Offset(0));
+}
+
+TEST_CASE("On a single node the high watermark tracks the log end offset") {
+    TempDir dir("log-append-hwm");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+
+    for (int i = 0; i < 5; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        log->append(bytes);
+        // Nothing is replicated, so everything written is immediately committed.
+        // M7 is where these two numbers start to differ.
+        CHECK(log->highWatermark() == log->logEndOffset());
+    }
+}

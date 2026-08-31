@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <shared_mutex>
+#include <span>
 #include <type_traits>
 
 #include "common/types.hpp"
@@ -89,6 +90,21 @@ public:
     // based at offset 0.
     static std::unique_ptr<Log> create(TopicPartition tp, std::filesystem::path dir,
                                        RollPolicy policy);
+
+    // Appends one batch and returns the offset assigned to its first record.
+    //
+    // The span is NON-const, and that is load-bearing: this function stamps the
+    // assigned base offset into the batch header in place. Twelve bytes, and the
+    // only write the broker ever makes to a producer's bytes. A const span would
+    // force a full copy of every batch, which is precisely the cost the whole
+    // design exists to avoid.
+    //
+    // Legal because the v2 layout puts baseOffset and partitionLeaderEpoch
+    // BEFORE the crc field, so the checksum does not cover them and does not
+    // need recomputing — over a body the broker may not even be able to read.
+    //
+    // Single-appender only: one thread per partition.
+    Offset append(std::span<std::uint8_t> batchBytes);
 
     // The earliest offset still on disk. Rises as retention deletes segments,
     // which is why it is a question about the segment map rather than a stored
