@@ -481,8 +481,14 @@ TEST_CASE("A reader never observes half an entry while the appender runs") {
 
     // Positions are ten times the relative offset, so any entry that is a mix
     // of two writes fails the relation.
+    //
+    // The loop also runs until at least one observation has landed. Without
+    // that, the appender can finish all 4000 entries before this thread is ever
+    // scheduled, `done` is already true, the body runs zero times, and the
+    // assertion that the reader saw something fails — a test that loses a race
+    // with itself rather than a real defect.
     thread reader([&] {
-        while (!done.load(memory_order_acquire)) {
+        while (!done.load(memory_order_acquire) || observations.load(memory_order_relaxed) == 0) {
             const auto entry = index.lookup(Offset(kEntries * 10));
             observations.fetch_add(1, memory_order_relaxed);
             if (entry.position != entry.relativeOffset * 10)
