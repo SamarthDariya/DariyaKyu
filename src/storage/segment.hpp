@@ -295,6 +295,25 @@ public:
     // batch can still push a segment past maxSegmentBytes.
     bool shouldRoll(std::int64_t nowMs) const;
 
+    // fsync the log. One of the very few sync points in the system — durability
+    // comes from replication across machines, not from forcing one machine's
+    // platter (DESIGN.md decision 14).
+    void flush();
+
+    // Consumes the active segment and yields an immutable one.
+    //
+    // Taking the unique_ptr BY VALUE is the guarantee, not a style choice. After
+    // this returns, the caller's pointer is null and the ActiveSegment object no
+    // longer exists — so a writable handle to these bytes cannot be held,
+    // because there is nothing left to hold one with. Immutability by ownership
+    // rather than by discipline.
+    //
+    // Implemented by closing everything and reopening through
+    // SealedSegment::open, so a segment sealed at runtime and a segment
+    // discovered at startup travel exactly the same code path. Costs two open()
+    // calls, once per segment — which is once per gigabyte.
+    static std::unique_ptr<SealedSegment> seal(std::unique_ptr<ActiveSegment> active);
+
     // The policy this segment was created with. Held rather than passed in per
     // call, so append() and shouldRoll() cannot disagree about the interval or
     // the size limit.
