@@ -1660,3 +1660,114 @@ TEST_CASE("Recovering an empty segment does nothing") {
     CHECK(recovered->nextOffset() == Offset(30));
     CHECK(recovered->largestTimestamp() == -1);
 }
+
+namespace {
+
+// Every distinct position the index names, in order, by sweeping lookups across
+// the segment. OffsetIndex has no iterator, and this is what its callers
+// actually observe anyway.
+vector<uint32_t> indexPositions(const SegmentBase& segment) {
+    vector<uint32_t> positions;
+    for (int64_t offset = 0; offset < segment.nextOffset() - segment.baseOffset(); ++offset) {
+        const uint32_t position =
+            segment.index().lookup(segment.baseOffset() + offset).position;
+        if (position != 0 && (positions.empty() || positions.back() != position))
+            positions.push_back(position);
+    }
+    return positions;
+}
+
+}  // namespace
+
+TEST_CASE("Recovery rebuilds the index it discarded") {
+    TempDir dir("rec-index-rebuild");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+
+    vector<uint32_t> livePositions;
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 40, 64);
+        livePositions = indexPositions(*segment);
+        REQUIRE(livePositions.size() > 1);
+    }
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+
+    // Byte-for-byte the same index the write path produced, because both go
+    // through maybeAddIndexEntry. If the two rules ever drift apart, this fails.
+    CHECK(recovered->index().entryCount() > 0);
+    CHECK(indexPositions(*recovered) == livePositions);
+}
+
+TEST_CASE("Recovery discards a stale index rather than trusting it") {
+    TempDir dir("rec-stale-index");
+    const auto logFile   = segmentLogPath(dir.file(""), Offset(0));
+    const auto indexFile = segmentIndexPath(dir.file(""), Offset(0));
+
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 30, 64);
+    }
+
+    // An index entry pointing far past the end of the log — the shape a stale
+    // index left by a previous life of this file would have. Trusting it would
+    // make read() start its scan beyond the data.
+    vector<uint8_t> bogus;
+    appendEntryBytes(bogus, 25, 999999);
+    writeFile(indexFile, bogus);
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+
+    for (int64_t offset = 0; offset < 30; ++offset)
+        CHECK(recovered->read(Offset(offset), kBigFetch).length > 0);
+
+    for (const uint32_t position : indexPositions(*recovered))
+        CHECK(position < recovered->sizeBytes());
+}
+
+TEST_CASE("Recovery only indexes the batches it kept") {
+    TempDir dir("rec-index-truncated");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+
+    uint64_t goodBytes = 0;
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+        fillSegment(*segment, 20, 64);
+        goodBytes = segment->sizeBytes();
+        fillSegment(*segment, 20, 64);
+    }
+    {
+        auto bytes = readFile(logFile);
+        bytes[goodBytes + kBatchHeaderSize + 2] ^= 0xFF;
+        writeFile(logFile, bytes);
+    }
+
+    auto recovered = ActiveSegment::recover(logFile, testPolicy());
+    REQUIRE(recovered->sizeBytes() == goodBytes);
+
+    // No entry may point into the region that was truncated away.
+    for (const uint32_t position : indexPositions(*recovered)) CHECK(position < goodBytes);
+}
+
+TEST_CASE("Appending after recovery continues the index at the right spacing") {
+    TempDir dir("rec-index-continues");
+    const auto logFile = segmentLogPath(dir.file(""), Offset(0));
+    auto policy = testPolicy();
+
+    {
+        auto segment = ActiveSegment::create(dir.file(""), Offset(0), policy);
+        fillSegment(*segment, 20, 64);
+    }
+
+    auto recovered = ActiveSegment::recover(logFile, policy);
+    const size_t afterRecovery = recovered->index().entryCount();
+
+    fillSegment(*recovered, 20, 64);
+
+    // The byte counter has to survive recovery, or the first entry after a
+    // restart would land at the wrong distance from the last one.
+    const auto positions = indexPositions(*recovered);
+    CHECK(positions.size() > afterRecovery);
+    for (size_t i = 1; i < positions.size(); ++i)
+        CHECK(positions[i] - positions[i - 1] >= policy.indexIntervalBytes);
+}

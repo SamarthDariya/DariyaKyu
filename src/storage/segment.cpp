@@ -369,9 +369,15 @@ unique_ptr<ActiveSegment> ActiveSegment::recover(const filesystem::path& logFile
             // means this file stopped being a valid log here.
             if (at->header.baseOffset != next) break;
 
+            // Rebuild the index as the walk goes, using the same rule the write
+            // path uses — so a recovered index is byte-for-byte what appending
+            // the same batches would have produced.
+            segment->maybeAddIndexEntry(at->header.baseOffset, good);
+
             next    = at->header.lastOffset() + 1;
             largest = max(largest, at->header.maxTimestamp);
             good += at->totalSize;
+            segment->bytesSinceIndexEntry_ += at->totalSize;
         } catch (const CorruptData&) {
             break;
         }
@@ -386,6 +392,36 @@ unique_ptr<ActiveSegment> ActiveSegment::recover(const filesystem::path& logFile
     segment->firstAppendMs_ = (good > 0) ? nowMillis() : -1;
 
     return segment;
+}
+
+void ActiveSegment::maybeAddIndexEntry(Offset baseOffset, uint64_t position) {
+    // One entry per interval of log written, not one per batch: 4 KB of records
+    // share an entry, so a 1 GiB segment costs a couple of megabytes of index
+    // rather than hundreds. The cost is that a lookup lands slightly BEFORE its
+    // target and the caller scans forward — the bargain the whole design rests on.
+    if (bytesSinceIndexEntry_ < policy_.indexIntervalBytes) return;
+
+    // Keeps the segment's very first batch out of the index. Two reasons, either
+    // sufficient: position 0 is OffsetIndex's marker for unwritten padding, and
+    // an entry pointing at the front of the file tells a lookup nothing it does
+    // not already fall back to.
+    if (position == 0) return;
+
+    // Index positions are uint32 — half the entry, which doubles the entries per
+    // page. That bounds a segment at 4 GiB. A silent cast would wrap a larger
+    // position into a small one that binary searches perfectly and points at the
+    // wrong record, so it is checked instead. shouldRoll() should have prevented
+    // this long before; reaching it means maxSegmentBytes was configured past
+    // what the index can describe.
+    if (position > numeric_limits<uint32_t>::max())
+        throw OffsetInvariantViolated("segment: byte position " + to_string(position) +
+                                      " exceeds what a 32-bit index position holds — "
+                                      "maxSegmentBytes is set above 4 GiB");
+
+    // A full index drops this silently and stays correct — just sparser.
+    // shouldRoll() watches for that and seals the segment.
+    index_.append(baseOffset, static_cast<uint32_t>(position));
+    bytesSinceIndexEntry_ = 0;
 }
 
 void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
@@ -416,36 +452,7 @@ void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
 
     // Where this batch is about to land. Taken BEFORE the write, because an
     // index entry has to record where the batch begins, not where it ends.
-    const uint64_t position = log_.size();
-
-    // An index entry maps an offset to a byte position, and the position is a
-    // uint32 — half the entry, which doubles the entries per page. That bounds a
-    // segment at 4 GiB. A silent cast would wrap a larger position into a small
-    // one that binary searches perfectly and points at the wrong record, so it
-    // is checked instead. shouldRoll() should have prevented this long before;
-    // reaching it means the roll policy was configured past what the index can
-    // describe.
-    if (position > numeric_limits<uint32_t>::max())
-        throw OffsetInvariantViolated("segment append: byte position " + to_string(position) +
-                                      " exceeds what a 32-bit index position holds — "
-                                      "maxSegmentBytes is set above 4 GiB");
-
-    // One entry per interval of log written, not one per batch: 4 KB of records
-    // share an entry, so a 1 GiB segment costs a couple of megabytes of index
-    // rather than hundreds. The cost is that a lookup lands slightly BEFORE its
-    // target and the caller scans forward — which is the bargain the whole
-    // design is built on.
-    //
-    // `position > 0` keeps the segment's very first batch out of the index. Two
-    // reasons, and either alone would be enough: position 0 is OffsetIndex's
-    // marker for unwritten padding, and an entry pointing at the front of the
-    // file tells a lookup nothing it does not already fall back to.
-    if (bytesSinceIndexEntry_ >= policy_.indexIntervalBytes && position > 0) {
-        // A full index drops this silently and stays correct — just sparser.
-        // shouldRoll() watches for that and seals the segment.
-        index_.append(baseOffset, static_cast<uint32_t>(position));
-        bytesSinceIndexEntry_ = 0;
-    }
+    maybeAddIndexEntry(baseOffset, log_.size());
 
     log_.append(batchBytes);
     bytesSinceIndexEntry_ += batchBytes.size();

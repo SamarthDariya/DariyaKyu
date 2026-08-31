@@ -358,6 +358,16 @@ private:
     ActiveSegment(FileHandle log, OffsetIndex index, Offset baseOffset,
                   const RollPolicy& policy);
 
+    // Adds an index entry for a batch about to be recorded at `position`, if an
+    // interval's worth of log has gone by since the last one.
+    //
+    // Shared by append() and recover() deliberately. They are the only two
+    // things that ever build an index, and if their interval rules drifted apart
+    // a rebuilt index would be spaced differently from a live one — not a
+    // correctness bug, since entries are only hints, but a difference that would
+    // make comparing the two impossible and hide real problems.
+    void maybeAddIndexEntry(Offset baseOffset, std::uint64_t position);
+
     RollPolicy policy_;
 
     // Log bytes written since the last index entry. The sparseness counter: an
