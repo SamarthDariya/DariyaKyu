@@ -28,4 +28,14 @@ std::string segmentBaseName(Offset baseOffset);
 std::filesystem::path segmentLogPath(const std::filesystem::path& dir, Offset baseOffset);
 std::filesystem::path segmentIndexPath(const std::filesystem::path& dir, Offset baseOffset);
 
+// The reverse: "…/00000000000001073741.log" -> Offset(1073741).
+//
+// Strict, and throws CorruptData on anything that is not exactly twenty digits
+// followed by ".log". M3's LogManager will iterate a partition directory it does
+// not fully own — partition.meta, leader-epoch-checkpoint, an editor's swap
+// file, whatever someone drops in. A name this cannot interpret must not
+// silently become Offset(0), because a phantom segment claiming to start at
+// offset 0 would shadow the real first segment and hide records.
+Offset baseOffsetFromLogPath(const std::filesystem::path& logFile);
+
 }  // namespace dariyakyu::storage

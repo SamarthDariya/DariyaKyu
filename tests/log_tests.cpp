@@ -522,3 +522,36 @@ TEST_CASE("A segment's two files sit in the partition directory") {
     CHECK(segmentLogPath(dir, Offset(1073741)) == "/data/orders-0/00000000000001073741.log");
     CHECK(segmentIndexPath(dir, Offset(1073741)) == "/data/orders-0/00000000000001073741.index");
 }
+
+TEST_CASE("A base offset round-trips through a log file name") {
+    const auto path = segmentLogPath("/data/orders-0", Offset(1073741));
+    CHECK(baseOffsetFromLogPath(path) == Offset(1073741));
+    CHECK(baseOffsetFromLogPath(segmentLogPath("/d", Offset(0))) == Offset(0));
+}
+
+TEST_CASE("A name that is not a segment log is rejected, not read as offset zero") {
+    // Each of these is a real thing that turns up in a partition directory. A
+    // phantom segment claiming offset 0 would shadow the real first segment.
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/partition.meta"), CorruptData);
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/leader-epoch-checkpoint"), CorruptData);
+
+    // Nineteen digits, then twenty-one.
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/0000000000000000000.log"), CorruptData);
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/000000000000000000000.log"), CorruptData);
+
+    // Right length, non-digit inside.
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/0000000000000000000x.log"), CorruptData);
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/-0000000000000000001.log"), CorruptData);
+
+    // Right digits, wrong extension — the index file must not parse as a log.
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/00000000000000000000.index"), CorruptData);
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/00000000000000000000.log.swp"), CorruptData);
+}
+
+TEST_CASE("Twenty digits that overflow int64 are corruption, not an out_of_range escape") {
+    // int64 max is 19 digits, so twenty digits can describe a number it cannot
+    // hold. stoll signals that with out_of_range; callers only ever catch
+    // CorruptData, so it has to be translated rather than escaping as a
+    // different type from every other bad name.
+    CHECK_THROWS_AS(baseOffsetFromLogPath("/d/99999999999999999999.log"), CorruptData);
+}
