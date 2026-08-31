@@ -60,6 +60,7 @@ add_library(dariyakyu_storage
   src/storage/record_batch.cpp
   src/storage/offset_index.cpp
   src/storage/segment.cpp
+  src/storage/log.cpp
 )
 
 target_link_libraries(dariyakyu_storage PUBLIC dariyakyu_common)
