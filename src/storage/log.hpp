@@ -106,6 +106,19 @@ public:
     // Single-appender only: one thread per partition.
     Offset append(std::span<std::uint8_t> batchBytes);
 
+    // Where the bytes for `offset` live, or why there are none.
+    //
+    // Resolves a location only — the blocking read happens later, on an I/O
+    // thread, when the network layer hands this range to sendfile.
+    //
+    // Bounded by the LOG END OFFSET, not the high watermark. On a single node
+    // they are equal so it makes no difference, but the distinction matters at
+    // M7: a follower fetching for replication must be able to read right up to
+    // the leader's log end, while a consumer must not see past the high
+    // watermark. So the watermark clamp belongs to the caller that knows which
+    // of the two it is serving, not here.
+    ReadResult read(Offset offset, std::size_t maxBytes) const;
+
     // Seals the active segment and starts a new one, if the roll policy says so.
     //
     // append() calls this itself, so the write path needs nothing extra. It is

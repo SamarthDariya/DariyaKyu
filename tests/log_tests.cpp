@@ -1,6 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -8,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <thread>
@@ -2168,4 +2171,141 @@ TEST_CASE("Appending continues seamlessly across a roll") {
         CHECK(log->logEndOffset() == expected + 2);
     }
     CHECK(log->segmentCount() > 3);
+}
+
+// ===========================================================================
+// Log: read
+// ===========================================================================
+
+namespace {
+
+// Pulls the bytes a FileRange describes off the descriptor, the way the network
+// layer's sendfile will. Proves the range is actually usable, not just plausible.
+vector<uint8_t> pullRange(const FileRange& range) {
+    vector<uint8_t> bytes(range.length);
+    const ssize_t   read = ::pread(range.fd, bytes.data(), bytes.size(),
+                                   static_cast<off_t>(range.position));
+    REQUIRE(read == static_cast<ssize_t>(bytes.size()));
+    return bytes;
+}
+
+}  // namespace
+
+TEST_CASE("A read resolves to a range whose first batch contains the offset") {
+    TempDir dir("log-read-basic");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;   // several segments
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+
+    constexpr int kBatches = 50;
+    for (int i = 0; i < kBatches; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+    REQUIRE(log->segmentCount() > 3);
+
+    // Every offset, across sealed segments and the active one, must resolve to a
+    // range that starts on a batch boundary and whose first batch holds it.
+    for (int64_t offset = 0; offset < kBatches; ++offset) {
+        const auto result = log->read(Offset(offset), kBigFetch);
+        REQUIRE(result.ok());
+        REQUIRE_FALSE(result.range.empty());
+
+        const auto bytes  = pullRange(result.range);
+        const auto header = RecordBatch::parseHeader(bytes);
+        CHECK(header.baseOffset <= Offset(offset));
+        CHECK(header.lastOffset() >= Offset(offset));
+        CHECK(RecordBatch::verifyCrc(bytes));
+    }
+}
+
+TEST_CASE("A caught-up read is a success with no bytes") {
+    TempDir dir("log-read-caught-up");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+
+    // An empty log is caught up at offset zero.
+    auto empty = log->read(Offset(0), kBigFetch);
+    CHECK(empty.ok());
+    CHECK(empty.range.empty());
+
+    for (int i = 0; i < 5; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        log->append(bytes);
+    }
+
+    const auto result = log->read(log->logEndOffset(), kBigFetch);
+    CHECK(result.ok());
+    CHECK(result.error == ReadError::None);
+    CHECK(result.range.empty());
+}
+
+TEST_CASE("A read past the log end is an error, not a caught-up read") {
+    TempDir dir("log-read-above");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    for (int i = 0; i < 5; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        log->append(bytes);
+    }
+
+    // One past the end is caught up; two past it means the client is confused or
+    // the log was truncated under it. Those need different recoveries, so they
+    // must not collapse into the same answer.
+    CHECK(log->read(Offset(5), kBigFetch).ok());
+    CHECK(log->read(Offset(6), kBigFetch).error == ReadError::AboveLogEnd);
+    CHECK(log->read(Offset(100000), kBigFetch).error == ReadError::AboveLogEnd);
+    CHECK(log->read(Offset(6), kBigFetch).range.empty());
+}
+
+TEST_CASE("Reads route to the right segment on both sides of a boundary") {
+    TempDir dir("log-read-routing");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+
+    for (int i = 0; i < 30; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+
+    // Collect the segment base offsets from the directory, then check that reads
+    // on either side of each boundary land in different files.
+    vector<Offset> bases;
+    map<string, filesystem::path> logs;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log")
+            logs[entry.path().filename().string()] = entry.path();
+    for (const auto& [name, path] : logs) bases.push_back(baseOffsetFromLogPath(path));
+    REQUIRE(bases.size() > 2);
+
+    for (size_t i = 1; i < bases.size(); ++i) {
+        const auto last  = log->read(bases[i] - 1, kBigFetch);
+        const auto first = log->read(bases[i], kBigFetch);
+        REQUIRE(last.ok());
+        REQUIRE(first.ok());
+
+        // Different files, so different descriptors.
+        CHECK(last.range.fd != first.range.fd);
+        // And the first read of a new segment starts at its very first byte.
+        CHECK(first.range.position == 0);
+    }
+}
+
+TEST_CASE("A fetch size cap applies through the log, not just the segment") {
+    TempDir dir("log-read-cap");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    for (int i = 0; i < 20; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 64);
+        log->append(bytes);
+    }
+
+    const auto capped = log->read(Offset(0), 300);
+    CHECK(capped.ok());
+    CHECK(capped.range.length == 300);
+
+    // And a fetch smaller than the next batch still returns a whole batch, so a
+    // conservative consumer cannot stall.
+    const auto tiny = log->read(Offset(0), 1);
+    CHECK(tiny.range.length > 1);
+    CHECK(RecordBatch::verifyCrc(pullRange(tiny.range)));
 }

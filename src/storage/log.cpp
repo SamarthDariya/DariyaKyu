@@ -76,6 +76,47 @@ Offset Log::append(span<uint8_t> batchBytes) {
     return base;
 }
 
+ReadResult Log::read(Offset offset, size_t maxBytes) const {
+    // Shared, so any number of readers proceed at once. Held across the whole
+    // call, including the segment's forward scan — which does read the file, but
+    // only batch headers, and only within one index interval. What the lock
+    // actually protects is the segment map and the active_ pointer: it stops a
+    // roll from closing a segment this read is standing on.
+    shared_lock lock(segmentsMutex_);
+
+    const Offset end = logEndOffset_.load(memory_order_acquire);
+
+    // Asking for the future. Either the client is confused, or the log was
+    // truncated under it by a failover — which needs a different recovery from
+    // ordinary lag, so it must stay distinguishable from BelowLogStart.
+    if (offset > end) return {ReadError::AboveLogEnd, {}};
+
+    // Caught up. The most common read in the system, and a success: no error, no
+    // bytes. Note this is checked before any segment is consulted, so the
+    // ordinary case costs one atomic load and nothing else.
+    if (offset == end) return {ReadError::None, {}};
+
+    // In the active segment. Checked first because it is where reads cluster —
+    // consumers are usually near the head of the log.
+    if (offset >= active_->baseOffset())
+        return {ReadError::None, active_->read(offset, maxBytes)};
+
+    // Otherwise find the sealed segment holding it. upper_bound gives the first
+    // base offset GREATER than the target, so stepping back one gives the
+    // greatest base offset at or below it — decision 11's binary search over
+    // segment names, in two lines, because the map is ordered.
+    auto it = sealed_.upper_bound(offset);
+
+    // Nothing at or below the target: every segment that old has been deleted by
+    // retention. This is also the correct answer when nothing is sealed at all —
+    // upper_bound on an empty map returns begin(), so the case needs no special
+    // handling.
+    if (it == sealed_.begin()) return {ReadError::BelowLogStart, {}};
+
+    --it;
+    return {ReadError::None, it->second->read(offset, maxBytes)};
+}
+
 void Log::maybeRoll(int64_t nowMs) {
     // Read outside the lock. Only the appender reassigns active_, and only from
     // this function, so this cannot be racing with a swap.
