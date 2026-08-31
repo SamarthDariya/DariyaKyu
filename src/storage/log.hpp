@@ -155,6 +155,18 @@ public:
     Offset highWatermark() const { return highWatermark_.load(std::memory_order_acquire); }
     void   setHighWatermark(Offset offset);
 
+    // Discards every record at or after `offset`, so the log ends there.
+    //
+    // This is failover truncation (M8). When a broker rejoins and discovers its
+    // log diverged from the new leader's, the records it has that the leader does
+    // not never existed as far as the cluster is concerned, and they have to go
+    // before it can start following.
+    //
+    // Batches are never split, so the resulting log end offset is at most
+    // `offset` and may be lower. Truncating to at or above the current end does
+    // nothing.
+    void truncateTo(Offset offset);
+
     std::size_t segmentCount() const;
 
     const TopicPartition&        topicPartition() const { return tp_; }

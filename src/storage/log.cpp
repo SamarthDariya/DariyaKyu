@@ -213,6 +213,64 @@ void Log::maybeRoll(int64_t nowMs) {
     active_ = std::move(next);
 }
 
+void Log::truncateTo(Offset offset) {
+    unique_lock lock(segmentsMutex_);
+
+    if (offset >= logEndOffset_.load(memory_order_relaxed)) return;
+
+    // The active segment always stops being active: either it holds `offset` and
+    // has to be rewritten, or it is entirely above it and has to go. Its paths
+    // are read out before it is destroyed.
+    const Offset           activeBase  = active_->baseOffset();
+    const filesystem::path activeLog   = active_->logFilePath();
+    const filesystem::path activeIndex = segmentIndexPath(dir_, activeBase);
+    const bool             activeHoldsOffset = activeBase < offset;
+
+    active_.reset();
+    if (!activeHoldsOffset) {
+        error_code ec;
+        filesystem::remove(activeLog, ec);
+        filesystem::remove(activeIndex, ec);
+    }
+
+    // Sealed segments that BEGIN at or after `offset` are entirely above it, so
+    // they go whole. lower_bound is the first such segment, and the map is
+    // ordered, so everything from there on qualifies.
+    for (auto it = sealed_.lower_bound(offset); it != sealed_.end();) {
+        it->second->unlinkFiles();
+        it = sealed_.erase(it);
+    }
+
+    // Whichever segment still contains `offset` becomes the new active one,
+    // rewritten to end there. recover() does the work: it walks batches, stops
+    // at the ceiling, truncates the file, and rebuilds the index — which the
+    // truncation has just invalidated.
+    if (activeHoldsOffset) {
+        active_ = ActiveSegment::recover(activeLog, policy_, offset);
+    } else if (!sealed_.empty()) {
+        // The newest survivor is promoted back to writable. Erase it from the map
+        // first: a segment must never be reachable as both sealed and active.
+        const auto last = prev(sealed_.end());
+        const filesystem::path path = last->second->logFilePath();
+        sealed_.erase(last);
+        active_ = ActiveSegment::recover(path, policy_, offset);
+    } else {
+        // Nothing survived. The log restarts empty at `offset` rather than at
+        // zero, because offsets are never reused — a consumer that had read to
+        // 500 must not be handed different records numbered 400.
+        active_ = ActiveSegment::create(dir_, offset, policy_);
+    }
+
+    const Offset next = active_->nextOffset();
+    logEndOffset_.store(next, memory_order_release);
+
+    // The watermark can never lead the log. It normally will not need moving,
+    // since committed data is by definition data no failover would discard, but
+    // clamping keeps the invariant true rather than assumed.
+    if (highWatermark_.load(memory_order_relaxed) > next)
+        highWatermark_.store(next, memory_order_release);
+}
+
 Offset Log::logStartOffset() const {
     shared_lock lock(segmentsMutex_);
 

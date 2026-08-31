@@ -308,8 +308,18 @@ public:
     // append is not recorded anywhere, and the file's mtime is whatever the last
     // write happened to leave, so a recovered segment is treated as new for
     // age-based rolling.
+    //
+    // `truncateAt`, when given, is an additional ceiling: batches are kept only
+    // while they end strictly below it. That is what M8's failover truncation
+    // needs, and it reuses this whole function — the checksum walk, the index
+    // rebuild, the truncate — rather than duplicating a second scan.
+    //
+    // A batch is never split, so the resulting log end offset is at most
+    // `truncateAt` and may be lower: a batch spanning offsets 3..7 truncated at
+    // 5 is dropped whole.
     static std::unique_ptr<ActiveSegment> recover(const std::filesystem::path& logFile,
-                                                  const RollPolicy& policy);
+                                                  const RollPolicy& policy,
+                                                  std::optional<Offset> truncateAt = std::nullopt);
 
     // Appends one batch, whose header must already carry `baseOffset` — Log
     // stamps it before calling (that stamp is the only write the broker ever

@@ -320,7 +320,8 @@ unique_ptr<ActiveSegment> ActiveSegment::create(const filesystem::path& dir, Off
 }
 
 unique_ptr<ActiveSegment> ActiveSegment::recover(const filesystem::path& logFile,
-                                                 const RollPolicy& policy) {
+                                                 const RollPolicy& policy,
+                                                 optional<Offset> truncateAt) {
     const Offset baseOffset = baseOffsetFromLogPath(logFile);
 
     filesystem::path indexFile = logFile;
@@ -349,6 +350,10 @@ unique_ptr<ActiveSegment> ActiveSegment::recover(const filesystem::path& logFile
         try {
             const optional<BatchAt> at = segment->batchAt(good, limit);
             if (!at) break;   // less than a whole batch remains
+
+            // Asked to stop here. Checked before the checksum, because a batch
+            // being discarded need not be validated first.
+            if (truncateAt && at->header.lastOffset() >= *truncateAt) break;
 
             // The one place a record body is read. Checking a checksum means
             // reading everything it covers, so this is unavoidable — and it is
