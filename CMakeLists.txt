@@ -59,6 +59,7 @@ target_compile_options(dariyakyu_common PRIVATE -Wall -Wextra -Wpedantic)
 add_library(dariyakyu_storage
   src/storage/record_batch.cpp
   src/storage/offset_index.cpp
+  src/storage/segment.cpp
 )
 
 target_link_libraries(dariyakyu_storage PUBLIC dariyakyu_common)
