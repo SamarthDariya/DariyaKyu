@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "common/errors.hpp"
+#include "storage/record_batch.hpp"
 
 using namespace std;
 
@@ -29,6 +30,44 @@ unique_ptr<Log> Log::create(TopicPartition tp, filesystem::path dir, RollPolicy 
 
     return unique_ptr<Log>(
         new Log(std::move(tp), std::move(dir), policy, std::move(active)));
+}
+
+Offset Log::append(span<uint8_t> batchBytes) {
+    // The producer could not know this: it encoded before the broker had seen
+    // the batch, so every offset inside it is a delta and the base is blank.
+    // Assigning it here is what makes offsets a single global sequence per
+    // partition rather than something clients negotiate.
+    //
+    // relaxed is enough for the load: only the appender writes this, so it is
+    // reading its own last value.
+    const Offset base = logEndOffset_.load(memory_order_relaxed);
+
+    RecordBatch::stampBaseOffset(batchBytes, base);
+    // partitionLeaderEpoch is left at -1 until M8, where the same in-place trick
+    // stamps the current leader epoch beside the offset.
+
+    // No lock. This is deliberate, and it is the reason the write path is fast.
+    //
+    // active_ is only ever REASSIGNED by a roll, and a roll happens inside this
+    // same function on this same thread — so the appender cannot race with
+    // itself. Readers take a shared lock and rolling takes an exclusive one, so
+    // a reader can never observe the pointer mid-swap. The appender needs no
+    // lock because it is the only writer.
+    active_->append(base, batchBytes);
+
+    const Offset next = active_->nextOffset();
+
+    // Release, so a reader that sees the new log end offset also sees the bytes
+    // and the segment state behind it.
+    logEndOffset_.store(next, memory_order_release);
+
+    // Single node: nothing is replicated, so everything written is immediately
+    // committed and visible. M7 is where this stops being a copy of the log end
+    // offset and becomes the minimum across in-sync replicas — the point of it
+    // being a separate number at all.
+    highWatermark_.store(next, memory_order_release);
+
+    return base;
 }
 
 Offset Log::logStartOffset() const {
