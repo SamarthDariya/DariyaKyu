@@ -58,6 +58,7 @@ target_compile_options(dariyakyu_common PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(dariyakyu_storage
   src/storage/record_batch.cpp
+  src/storage/offset_index.cpp
 )
 
 target_link_libraries(dariyakyu_storage PUBLIC dariyakyu_common)
@@ -102,3 +103,8 @@ add_executable(codec_tests tests/codec_tests.cpp)
 target_link_libraries(codec_tests PRIVATE dariyakyu_storage doctest::doctest)
 target_compile_options(codec_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME codec_tests COMMAND codec_tests)
+
+add_executable(log_tests tests/log_tests.cpp)
+target_link_libraries(log_tests PRIVATE dariyakyu_storage doctest::doctest)
+target_compile_options(log_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME log_tests COMMAND log_tests)
