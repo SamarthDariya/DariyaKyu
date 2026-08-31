@@ -382,6 +382,35 @@ void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
     nextOffset_.store(header.lastOffset() + 1, memory_order_release);
 }
 
+void ActiveSegment::flush() {
+    log_.sync();
+}
+
+unique_ptr<SealedSegment> ActiveSegment::seal(unique_ptr<ActiveSegment> active) {
+    if (!active) throw Error("segment seal: nothing to seal");
+
+    // Read the path out before the object is destroyed — it is the only thing
+    // needed to reopen, and it will not be reachable in a moment.
+    const filesystem::path logFile = active->logFilePath();
+
+    // Sealing is one of the few places worth an fsync: after this the file is
+    // immutable, so this is the last chance to make its contents durable while
+    // anything still owns a writable handle to them.
+    active->flush();
+
+    // Cut the preallocated index back to the entries actually used. A 10 MiB
+    // index holding 300 real entries is mostly zeroes until now. This also
+    // unmaps it, which is why the OffsetIndex is spent afterwards.
+    active->index_.flushAndTrim();
+
+    // Destroy the writable segment BEFORE reopening, not after. Closing first
+    // means there is no instant at which both a writable and a read-only handle
+    // to these bytes exist.
+    active.reset();
+
+    return SealedSegment::open(logFile);
+}
+
 bool ActiveSegment::shouldRoll(int64_t nowMs) const {
     // An empty segment never rolls, and this has to come first.
     //

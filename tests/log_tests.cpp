@@ -1343,3 +1343,100 @@ TEST_CASE("Opening something that is not a segment file is refused") {
     TempDir dir("seg-open-bad-name");
     CHECK_THROWS_AS(SealedSegment::open(dir.file("partition.meta")), CorruptData);
 }
+
+// ===========================================================================
+// ActiveSegment: sealing
+// ===========================================================================
+
+TEST_CASE("Sealing yields a segment with an identical view of the data") {
+    TempDir dir("seg-seal");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(50), testPolicy());
+    fillSegment(*segment, 30, 64);
+
+    const Offset   next    = segment->nextOffset();
+    const uint64_t size    = segment->sizeBytes();
+    const int64_t  largest = segment->largestTimestamp();
+    const auto     before  = segment->read(Offset(65), kBigFetch);
+
+    auto sealed = ActiveSegment::seal(std::move(segment));
+
+    CHECK(sealed->baseOffset() == Offset(50));
+    CHECK(sealed->nextOffset() == next);
+    CHECK(sealed->sizeBytes() == size);
+    CHECK(sealed->largestTimestamp() == largest);
+
+    const auto after = sealed->read(Offset(65), kBigFetch);
+    CHECK(after.position == before.position);
+    CHECK(after.length == before.length);
+}
+
+TEST_CASE("Sealing consumes the active segment") {
+    TempDir dir("seg-seal-consumes");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 5);
+
+    auto sealed = ActiveSegment::seal(std::move(segment));
+
+    // The signature takes the unique_ptr by value, so the caller's pointer is
+    // null and the ActiveSegment no longer exists. There is nothing left that
+    // could append to these bytes — immutability by ownership, not by rule.
+    CHECK(segment == nullptr);
+    CHECK(sealed != nullptr);
+    CHECK_FALSE(sealed->isEmpty());
+}
+
+TEST_CASE("Sealing trims the index to the entries actually used") {
+    TempDir dir("seg-seal-trim");
+    auto    policy    = testPolicy();
+    auto    segment   = ActiveSegment::create(dir.file(""), Offset(0), policy);
+    const auto indexFile = segmentIndexPath(dir.file(""), Offset(0));
+
+    fillSegment(*segment, 40, 64);
+
+    // Preallocated to its full size all through the segment's writable life,
+    // because growing a live mmap and touching the new pages raises SIGBUS.
+    REQUIRE(filesystem::file_size(indexFile) == policy.maxIndexBytes);
+    const size_t entries = segment->index().entryCount();
+    REQUIRE(entries > 0);
+
+    auto sealed = ActiveSegment::seal(std::move(segment));
+
+    CHECK(filesystem::file_size(indexFile) == entries * OffsetIndex::kEntrySize);
+    CHECK(sealed->index().entryCount() == entries);
+}
+
+TEST_CASE("Sealing a segment below one index interval leaves a zero-byte index") {
+    TempDir dir("seg-seal-tiny");
+    auto    policy = testPolicy();
+    policy.indexIntervalBytes = 1 << 20;
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), policy);
+    fillSegment(*segment, 4, 32);
+
+    auto sealed = ActiveSegment::seal(std::move(segment));
+
+    // The low-traffic case, end to end: no entries, so the trimmed file is zero
+    // bytes, MappedFile maps it as an empty mapping, and reads scan from the
+    // front. Every layer has to tolerate this or a quiet topic cannot be
+    // restarted.
+    CHECK(filesystem::file_size(segmentIndexPath(dir.file(""), Offset(0))) == 0);
+    CHECK(sealed->index().isEmpty());
+    CHECK(sealed->nextOffset() == Offset(4));
+    CHECK(sealed->read(Offset(2), kBigFetch).length > 0);
+}
+
+TEST_CASE("Sealing an empty segment is allowed and yields an empty sealed segment") {
+    TempDir dir("seg-seal-empty");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(9), testPolicy());
+
+    // shouldRoll never asks for this, but Log's shutdown path will: sealing on
+    // close should not be a special case.
+    auto sealed = ActiveSegment::seal(std::move(segment));
+    CHECK(sealed->isEmpty());
+    CHECK(sealed->nextOffset() == Offset(9));
+    CHECK(filesystem::file_size(segmentIndexPath(dir.file(""), Offset(9))) == 0);
+}
+
+TEST_CASE("Sealing nothing is a caller bug") {
+    unique_ptr<ActiveSegment> nothing;
+    CHECK_THROWS_AS(ActiveSegment::seal(std::move(nothing)), Error);
+}
