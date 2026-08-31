@@ -1815,3 +1815,78 @@ TEST_CASE("The two failure modes stay distinguishable") {
     CHECK(tooOld.range.empty());
     CHECK(tooNew.range.empty());
 }
+
+// ===========================================================================
+// Log: creation
+// ===========================================================================
+
+static_assert(!is_copy_constructible_v<Log>,
+              "a Log owns every segment of a partition; copying one would mean two owners of "
+              "the same files");
+
+TEST_CASE("A new log has one empty segment based at offset zero") {
+    TempDir dir("log-create");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+
+    CHECK(log->topicPartition().topic == "orders");
+    CHECK(log->topicPartition().partition == 0);
+    CHECK(log->directory() == partition);
+    CHECK(log->segmentCount() == 1);
+
+    // Nothing written, so the log both starts and ends at zero — an empty
+    // half-open range rather than a special "empty" state.
+    CHECK(log->logStartOffset() == Offset(0));
+    CHECK(log->logEndOffset() == Offset(0));
+    CHECK(log->highWatermark() == Offset(0));
+
+    CHECK(filesystem::exists(segmentLogPath(partition, Offset(0))));
+    CHECK(filesystem::exists(segmentIndexPath(partition, Offset(0))));
+}
+
+TEST_CASE("Creating a log makes its directory") {
+    TempDir dir("log-create-dirs");
+    const filesystem::path partition = dir.file("deep/orders-3");
+    REQUIRE_FALSE(filesystem::exists(partition));
+
+    auto log = Log::create(TopicPartition{"orders", 3}, partition, testPolicy());
+    CHECK(filesystem::is_directory(partition));
+    CHECK(log->segmentCount() == 1);
+}
+
+TEST_CASE("Creating a log over an existing partition is refused") {
+    TempDir dir("log-create-twice");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto first = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+
+    // Adopting an existing partition is a different operation with different
+    // rules — it has to recover the newest segment rather than assume an empty
+    // one. Silently appending to whatever was there would interleave two logs.
+    CHECK_THROWS(Log::create(TopicPartition{"orders", 0}, partition, testPolicy()));
+}
+
+TEST_CASE("The high watermark can be advanced") {
+    TempDir dir("log-hwm");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+
+    CHECK(log->highWatermark() == Offset(0));
+
+    // On a single node this just tracks the log end offset. M7 is where the two
+    // diverge: the watermark becomes the minimum across in-sync replicas, and it
+    // is what stops a consumer reading data that could still be lost.
+    log->setHighWatermark(Offset(5));
+    CHECK(log->highWatermark() == Offset(5));
+    CHECK(log->logEndOffset() == Offset(0));   // independent of it
+}
+
+TEST_CASE("A log keeps the policy it was created with") {
+    TempDir dir("log-policy");
+    auto    policy = testPolicy();
+    policy.maxSegmentBytes = 4242;
+
+    auto log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    CHECK(log->policy().maxSegmentBytes == 4242);
+    CHECK(log->policy().indexIntervalBytes == policy.indexIntervalBytes);
+}

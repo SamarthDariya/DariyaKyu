@@ -1,8 +1,15 @@
 #pragma once
 
+#include <atomic>
+#include <cstddef>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <shared_mutex>
 #include <type_traits>
 
 #include "common/types.hpp"
+#include "storage/segment.hpp"
 
 namespace dariyakyu::storage {
 
@@ -52,5 +59,77 @@ struct ReadResult {
 static_assert(std::is_trivially_copyable_v<ReadResult>,
               "ReadResult is returned by value on every fetch; it must not acquire anything "
               "that needs copying or destroying");
+
+// One partition's log: a directory of segments, and the rules for moving between
+// them.
+//
+// # Why a std::map
+//
+// Sealed segments live in a map keyed by base offset, so finding the segment that
+// holds an offset is upper_bound() then step back — DESIGN.md decision 11's
+// "binary search over filenames", in two lines of standard library. An
+// unordered_map would need a linear scan for exactly the query that matters.
+//
+// # Why the locking looks so thin
+//
+// One shared_mutex, and it guards the MAP — never file contents.
+//
+// That works because sealed segments are immutable: their bytes cannot change,
+// so reading them needs no synchronisation at all. The lock is held only while
+// the map itself is being modified, which happens when a segment rolls or
+// retention deletes one — rarely, and never per read.
+//
+// The two offsets are atomics rather than mutex-guarded for the same reason.
+// One appender publishes them, many readers consume them, and a reader that
+// wants the log end offset should not have to queue behind a roll
+// (DESIGN.md decision 20).
+class Log {
+public:
+    // A brand-new, empty partition: creates the directory and one active segment
+    // based at offset 0.
+    static std::unique_ptr<Log> create(TopicPartition tp, std::filesystem::path dir,
+                                       RollPolicy policy);
+
+    // The earliest offset still on disk. Rises as retention deletes segments,
+    // which is why it is a question about the segment map rather than a stored
+    // number.
+    Offset logStartOffset() const;
+
+    // One past the last offset written. Atomic, so this costs no lock.
+    Offset logEndOffset() const { return logEndOffset_.load(std::memory_order_acquire); }
+
+    // The highest offset replicated widely enough for consumers to see. On a
+    // single node it simply tracks the log end offset; M7 is where the two
+    // diverge and the distinction starts doing work.
+    Offset highWatermark() const { return highWatermark_.load(std::memory_order_acquire); }
+    void   setHighWatermark(Offset offset);
+
+    std::size_t segmentCount() const;
+
+    const TopicPartition&        topicPartition() const { return tp_; }
+    const std::filesystem::path& directory() const { return dir_; }
+    const RollPolicy&            policy() const { return policy_; }
+
+    Log(const Log&)            = delete;
+    Log& operator=(const Log&) = delete;
+
+private:
+    Log(TopicPartition tp, std::filesystem::path dir, RollPolicy policy,
+        std::unique_ptr<ActiveSegment> active);
+
+    TopicPartition        tp_;
+    std::filesystem::path dir_;
+    RollPolicy            policy_;
+
+    std::map<Offset, std::unique_ptr<SealedSegment>> sealed_;
+    std::unique_ptr<ActiveSegment>                   active_;
+
+    std::atomic<Offset> logEndOffset_{Offset{0}};
+    std::atomic<Offset> highWatermark_{Offset{0}};
+
+    // mutable, so const readers can take a shared lock. Guards the map and the
+    // active_ pointer — not the bytes either of them describes.
+    mutable std::shared_mutex segmentsMutex_;
+};
 
 }  // namespace dariyakyu::storage
