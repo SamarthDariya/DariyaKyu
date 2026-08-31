@@ -100,7 +100,7 @@ SegmentBase::SegmentBase(FileHandle log, OffsetIndex index, Offset baseOffset)
       baseOffset_(baseOffset),
       nextOffset_(baseOffset) {}
 
-FileRange SegmentBase::read(Offset offset) const {
+FileRange SegmentBase::read(Offset offset, size_t maxBytes) const {
     if (offset < baseOffset_)
         throw OffsetInvariantViolated("segment " + logFilePath().string() + " was asked for " +
                                       offset.toString() + ", below its base offset " +
@@ -131,8 +131,23 @@ FileRange SegmentBase::read(Offset offset) const {
         // The FIRST batch whose last offset reaches the target is the batch that
         // contains it. `>=` rather than `==` because the target may sit in the
         // middle of a multi-record batch.
-        if (at->header.lastOffset() >= offset)
-            return FileRange{log_.fd(), at->position, at->totalSize};
+        if (at->header.lastOffset() >= offset) {
+            // Bytes existing from this batch onward. batchAt has already checked
+            // that the batch itself fits inside this, so totalSize <= available.
+            const uint64_t available = limit - at->position;
+
+            // Read it as two rules stacked:
+            //   min(maxBytes, available)  — honour the fetch size, but do not
+            //                               promise bytes that are not there
+            //   max(totalSize, ...)       — never return less than one whole
+            //                               batch, whatever the fetch size says
+            //
+            // The max cannot push the result past `available`, because
+            // totalSize <= available.
+            const uint64_t length = max<uint64_t>(at->totalSize, min<uint64_t>(maxBytes, available));
+
+            return FileRange{log_.fd(), at->position, static_cast<size_t>(length)};
+        }
 
         position += at->totalSize;
     }
