@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <format>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -156,7 +157,41 @@ void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
                                       " but the segment ends at " + expected.toString() +
                                       " — a gap or overlap in Log's bookkeeping");
 
+    // Where this batch is about to land. Taken BEFORE the write, because an
+    // index entry has to record where the batch begins, not where it ends.
+    const uint64_t position = log_.size();
+
+    // An index entry maps an offset to a byte position, and the position is a
+    // uint32 — half the entry, which doubles the entries per page. That bounds a
+    // segment at 4 GiB. A silent cast would wrap a larger position into a small
+    // one that binary searches perfectly and points at the wrong record, so it
+    // is checked instead. shouldRoll() should have prevented this long before;
+    // reaching it means the roll policy was configured past what the index can
+    // describe.
+    if (position > numeric_limits<uint32_t>::max())
+        throw OffsetInvariantViolated("segment append: byte position " + to_string(position) +
+                                      " exceeds what a 32-bit index position holds — "
+                                      "maxSegmentBytes is set above 4 GiB");
+
+    // One entry per interval of log written, not one per batch: 4 KB of records
+    // share an entry, so a 1 GiB segment costs a couple of megabytes of index
+    // rather than hundreds. The cost is that a lookup lands slightly BEFORE its
+    // target and the caller scans forward — which is the bargain the whole
+    // design is built on.
+    //
+    // `position > 0` keeps the segment's very first batch out of the index. Two
+    // reasons, and either alone would be enough: position 0 is OffsetIndex's
+    // marker for unwritten padding, and an entry pointing at the front of the
+    // file tells a lookup nothing it does not already fall back to.
+    if (bytesSinceIndexEntry_ >= policy_.indexIntervalBytes && position > 0) {
+        // A full index drops this silently and stays correct — just sparser.
+        // shouldRoll() watches for that and seals the segment.
+        index_.append(baseOffset, static_cast<uint32_t>(position));
+        bytesSinceIndexEntry_ = 0;
+    }
+
     log_.append(batchBytes);
+    bytesSinceIndexEntry_ += batchBytes.size();
 
     // relaxed on the load: only this thread ever writes largestTimestamp_, so it
     // is reading its own last value and needs no ordering to do that. The store

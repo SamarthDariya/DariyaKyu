@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -757,4 +758,101 @@ TEST_CASE("An unstamped batch is caught rather than stored claiming offset zero"
 
     CHECK_THROWS_AS(segment->append(Offset(10), unstamped), OffsetInvariantViolated);
     CHECK(segment->isEmpty());
+}
+
+// ===========================================================================
+// ActiveSegment: sparse indexing
+// ===========================================================================
+
+TEST_CASE("The index stays empty until an interval of log has been written") {
+    TempDir dir("seg-index-start");
+    auto    policy = testPolicy();   // 256-byte interval
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), policy);
+
+    CHECK(segment->index().isEmpty());
+
+    // One batch is nowhere near an interval, so nothing is indexed yet.
+    fillSegment(*segment, 1, 32);
+    CHECK(segment->index().isEmpty());
+}
+
+TEST_CASE("Entries accumulate one per interval, not one per batch") {
+    TempDir dir("seg-index-sparse");
+    auto    policy  = testPolicy();
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), policy);
+
+    constexpr int kBatches = 60;
+    const uint64_t written = fillSegment(*segment, kBatches, 64);
+
+    const size_t entries = segment->index().entryCount();
+
+    // Sparse: far fewer entries than batches. That ratio is the whole point —
+    // it is what keeps a 1 GiB segment's index in the megabytes.
+    CHECK(entries > 0);
+    CHECK(entries < static_cast<size_t>(kBatches));
+
+    // Never DENSER than one entry per interval. This is the direction that
+    // matters: the interval is a promise about how big the index can get.
+    CHECK(entries <= written / policy.indexIntervalBytes);
+
+    // And the precise invariant, which a ratio cannot express: consecutive
+    // entries are at least one interval apart in the file.
+    //
+    // They are also usually MORE than one interval apart, because the counter
+    // resets after an entry is written and then accumulates the current batch
+    // too — so the real spacing is interval + one batch, not interval. Asserting
+    // a ratio against `written / interval` gets this wrong; asserting the gap
+    // directly does not.
+    vector<uint32_t> positions;
+    for (int64_t offset = 0; offset < segment->nextOffset() - Offset(0); ++offset) {
+        const uint32_t position = segment->index().lookup(Offset(offset)).position;
+        if (position != 0 && (positions.empty() || positions.back() != position))
+            positions.push_back(position);
+    }
+    REQUIRE(positions.size() == entries);
+
+    for (size_t i = 1; i < positions.size(); ++i)
+        CHECK(positions[i] - positions[i - 1] >= policy.indexIntervalBytes);
+}
+
+TEST_CASE("The segment's first batch is never indexed") {
+    TempDir dir("seg-index-first");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 60, 64);
+
+    REQUIRE(segment->index().entryCount() > 0);
+
+    // Position 0 is OffsetIndex's marker for unwritten padding, so an entry
+    // there would be indistinguishable from padding on the next recovery. It is
+    // also information-free: lookup() already falls back to the front of the
+    // file. OffsetIndex::append throws on position 0, so an entry ever being
+    // attempted there would have failed the appends above.
+    CHECK(segment->index().lookup(Offset(0)).position == 0);      // the fallback
+    CHECK(segment->index().lookup(segment->nextOffset() - 1).position > 0);
+}
+
+TEST_CASE("Every index entry points at a real batch boundary") {
+    TempDir dir("seg-index-boundaries");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    // Record where each batch actually starts, then check the index only ever
+    // names one of those positions. An entry pointing into the middle of a batch
+    // would make a read start on garbage.
+    vector<uint64_t> starts;
+    for (int i = 0; i < 60; ++i) {
+        starts.push_back(segment->sizeBytes());
+        const Offset base = segment->nextOffset();
+        auto bytes = makeBatch(base, 1000 + i, 64);
+        segment->append(base, bytes);
+    }
+
+    for (int64_t offset = 0; offset < segment->nextOffset() - Offset(0); ++offset) {
+        const auto entry = segment->index().lookup(Offset(offset));
+        const bool isBoundary =
+            entry.position == 0 ||
+            find(starts.begin(), starts.end(), entry.position) != starts.end();
+        CHECK(isBoundary);
+        // And the entry never overshoots the offset asked for.
+        CHECK(entry.offsetFrom(Offset(0)) <= Offset(offset));
+    }
 }
