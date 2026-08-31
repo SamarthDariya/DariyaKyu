@@ -17,6 +17,7 @@
 #include "common/errors.hpp"
 #include "storage/offset_index.hpp"
 #include "storage/record_batch.hpp"
+#include "storage/log.hpp"
 #include "storage/segment.hpp"
 
 using namespace std;
@@ -1770,4 +1771,47 @@ TEST_CASE("Appending after recovery continues the index at the right spacing") {
     CHECK(positions.size() > afterRecovery);
     for (size_t i = 1; i < positions.size(); ++i)
         CHECK(positions[i] - positions[i - 1] >= policy.indexIntervalBytes);
+}
+
+// ===========================================================================
+// ReadResult
+// ===========================================================================
+
+TEST_CASE("A default read result is a successful read of nothing") {
+    const ReadResult result;
+
+    // Which is exactly the caught-up case: no error, no bytes.
+    CHECK(result.ok());
+    CHECK(result.error == ReadError::None);
+    CHECK(result.range.empty());
+    CHECK(result.range.length == 0);
+}
+
+TEST_CASE("Success and having bytes are separate questions") {
+    // A caught-up consumer. This is the most common read in the system, so it
+    // must be a plain value on the success path rather than an exception.
+    const ReadResult caughtUp{ReadError::None, FileRange{7, 4096, 0}};
+    CHECK(caughtUp.ok());
+    CHECK(caughtUp.range.empty());
+
+    // Data to send.
+    const ReadResult found{ReadError::None, FileRange{7, 4096, 512}};
+    CHECK(found.ok());
+    CHECK_FALSE(found.range.empty());
+}
+
+TEST_CASE("The two failure modes stay distinguishable") {
+    const ReadResult tooOld{ReadError::BelowLogStart, {}};
+    const ReadResult tooNew{ReadError::AboveLogEnd, {}};
+
+    CHECK_FALSE(tooOld.ok());
+    CHECK_FALSE(tooNew.ok());
+
+    // A client's reset policy treats these differently: below the log start
+    // means "jump to the earliest offset available", while above the log end
+    // means the client is confused or the log was truncated under it. Collapsing
+    // them into one error would make a failover look like ordinary lag.
+    CHECK(tooOld.error != tooNew.error);
+    CHECK(tooOld.range.empty());
+    CHECK(tooNew.range.empty());
 }
