@@ -141,6 +141,28 @@ public:
     // Half-open: the last offset a segment holds is nextOffset() - 1.
     bool contains(Offset offset) const { return offset >= baseOffset_ && offset < nextOffset(); }
 
+    // Where the bytes for `offset` live — never the bytes themselves. The
+    // network layer hands this straight to sendfile(), so the payload never
+    // enters user space (DESIGN.md decision 13). If this ever returned a
+    // vector<uint8_t>, zero-copy would be dead, which is why the return type
+    // enforces it rather than a comment asking politely.
+    //
+    // The range starts exactly on a batch boundary — the batch CONTAINING
+    // `offset`, which may begin earlier than it. A batch is the unit of
+    // transfer, so a consumer asking for offset 503 of a batch spanning 500..504
+    // receives the whole batch from 500 and skips what it already has.
+    //
+    // For now the range is exactly that one batch. Fetch-size capping comes next.
+    //
+    // A zero-length range means "nothing here yet": the caller has caught up
+    // with what this segment holds. That is a success, and it is the most common
+    // read in the entire system — every caught-up consumer, several times a
+    // second, forever. It must not cost an exception.
+    //
+    // An offset below the segment's base offset throws: Log chose this segment,
+    // so getting here with an offset it cannot hold is a routing bug.
+    FileRange read(Offset offset) const;
+
     // One batch's header, plus how far it is to the next one.
     struct BatchAt {
         BatchHeader   header;
