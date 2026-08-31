@@ -265,6 +265,32 @@ unique_ptr<SealedSegment> SealedSegment::open(const filesystem::path& logFile) {
     return segment;
 }
 
+void SealedSegment::unlinkFiles() {
+    error_code ec;
+
+    // The .log goes FIRST, and the order is not arbitrary.
+    //
+    // A crash between these two lines leaves one file behind. Which one decides
+    // whether the partition still opens:
+    //
+    //   log removed, index left   -> an orphaned .index. M3's startup scan
+    //                                iterates .log files, so it never looks at
+    //                                it. Wasted space, nothing more.
+    //   index removed, log left   -> a .log with no .index, which
+    //                                SealedSegment::open refuses outright. The
+    //                                whole partition fails to load.
+    //
+    // So the harmless orphan is the one to risk.
+    filesystem::remove(log_.path(), ec);
+
+    // For the same reason, a failed log removal stops here rather than carrying
+    // on: leaving the pair intact keeps the segment openable, and the next sweep
+    // tries again.
+    if (ec) return;
+
+    filesystem::remove(index_.path(), ec);
+}
+
 // --------------------------------------------------------------------------
 // ActiveSegment
 // --------------------------------------------------------------------------

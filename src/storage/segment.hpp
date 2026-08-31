@@ -250,6 +250,20 @@ public:
     // Only the active segment gets scanned.
     static std::unique_ptr<SealedSegment> open(const std::filesystem::path& logFile);
 
+    // Retention: removes this segment's two files from the directory.
+    //
+    // UNLINK, not close. On POSIX, removing a directory entry does not free the
+    // inode while a descriptor is still open on it — so a consumer part-way
+    // through a sendfile from this segment keeps reading valid bytes, and the
+    // space comes back when this object is destroyed. That is what makes
+    // retention safe to run while readers are working, with no lock between
+    // them.
+    //
+    // Does not throw. A sweep across every partition must not abort because one
+    // file could not be removed, and retention is idempotent — the next sweep
+    // retries.
+    void unlinkFiles();
+
 private:
     SealedSegment(FileHandle log, OffsetIndex index, Offset baseOffset);
 };

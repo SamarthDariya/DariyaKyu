@@ -1440,3 +1440,54 @@ TEST_CASE("Sealing nothing is a caller bug") {
     unique_ptr<ActiveSegment> nothing;
     CHECK_THROWS_AS(ActiveSegment::seal(std::move(nothing)), Error);
 }
+
+// ===========================================================================
+// SealedSegment: retention
+// ===========================================================================
+
+TEST_CASE("Unlinking removes both of a segment's files") {
+    TempDir dir("seg-unlink");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 10, 64);
+    auto sealed = ActiveSegment::seal(std::move(segment));
+
+    const auto logFile   = segmentLogPath(dir.file(""), Offset(0));
+    const auto indexFile = segmentIndexPath(dir.file(""), Offset(0));
+    REQUIRE(filesystem::exists(logFile));
+
+    sealed->unlinkFiles();
+
+    CHECK_FALSE(filesystem::exists(logFile));
+    CHECK_FALSE(filesystem::exists(indexFile));
+}
+
+TEST_CASE("A read already in flight survives the segment being deleted") {
+    TempDir dir("seg-unlink-inflight");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 20, 64);
+    auto sealed = ActiveSegment::seal(std::move(segment));
+
+    const auto before = sealed->read(Offset(7), kBigFetch);
+    sealed->unlinkFiles();
+
+    // The directory entry is gone, but the descriptor still holds the inode
+    // alive, so a consumer mid-sendfile keeps reading valid bytes. This is what
+    // lets retention run without taking a lock against readers.
+    const auto after = sealed->read(Offset(7), kBigFetch);
+    CHECK(after.position == before.position);
+    CHECK(after.length == before.length);
+    CHECK(sealed->nextOffset() == Offset(20));
+    CHECK(sealed->sizeBytes() > 0);
+}
+
+TEST_CASE("Unlinking twice is harmless") {
+    TempDir dir("seg-unlink-twice");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 3);
+    auto sealed = ActiveSegment::seal(std::move(segment));
+
+    // Retention is idempotent by design: a sweep that partly failed retries the
+    // whole thing next time round, so a second removal must not throw.
+    sealed->unlinkFiles();
+    CHECK_NOTHROW(sealed->unlinkFiles());
+}
