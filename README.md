@@ -36,7 +36,7 @@ The design is written up in full, with the reasoning and the rejected alternativ
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
 | Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 3 of 6 chunks |
-| Implementation — M0…M9 | 🔸 M0–M1 complete, M2 next |
+| Implementation — M0…M9 | 🔸 M0–M1 complete, M2 in progress |
 
 ---
 
@@ -65,11 +65,11 @@ is merged by PR.
 - [x] in-place base offset and leader epoch stamping, checksum untouched
 - [x] null vs empty distinguished (tombstones survive)
 - [x] record headers parsed and preserved
-- [x] round-trip and corruption tests — 29 cases, 172 assertions
+- [x] round-trip and corruption tests — 32 cases, 203 assertions
 - [x] green under ASan/UBSan and TSan
 
-### M2 — The log engine ⬜
-- [ ] `OffsetIndex` — fixed-size entries, binary search, mmap'd
+### M2 — The log engine 🔸
+- [x] `OffsetIndex` — fixed-size entries, binary search, mmap'd
 - [ ] `SegmentBase` / `SealedSegment` / `ActiveSegment`
 - [ ] sparse indexing every 4 KB of log written
 - [ ] segment rolling on size **or** age
