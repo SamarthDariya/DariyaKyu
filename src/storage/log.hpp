@@ -91,6 +91,19 @@ public:
     static std::unique_ptr<Log> create(TopicPartition tp, std::filesystem::path dir,
                                        RollPolicy policy);
 
+    // Adopts a partition directory that already exists — the startup path.
+    //
+    // The newest segment is the only one that could have been mid-write when the
+    // process died, so it is the only one recovered: its checksums are walked and
+    // it is truncated at the first failure. Every older segment was sealed, and is
+    // opened and trusted. That asymmetry is the point of segmenting the log at
+    // all — startup costs one segment's worth of work, not one partition's.
+    //
+    // A directory with no segments in it yet is treated as a new partition, so
+    // this is safe to call on a half-created one.
+    static std::unique_ptr<Log> open(TopicPartition tp, std::filesystem::path dir,
+                                     RollPolicy policy);
+
     // Appends one batch and returns the offset assigned to its first record.
     //
     // The span is NON-const, and that is load-bearing: this function stamps the
@@ -153,6 +166,7 @@ public:
 
 private:
     Log(TopicPartition tp, std::filesystem::path dir, RollPolicy policy,
+        std::map<Offset, std::unique_ptr<SealedSegment>> sealed,
         std::unique_ptr<ActiveSegment> active);
 
     TopicPartition        tp_;

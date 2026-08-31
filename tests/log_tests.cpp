@@ -2309,3 +2309,177 @@ TEST_CASE("A fetch size cap applies through the log, not just the segment") {
     CHECK(tiny.range.length > 1);
     CHECK(RecordBatch::verifyCrc(pullRange(tiny.range)));
 }
+
+// ===========================================================================
+// Log: startup scan
+// ===========================================================================
+
+namespace {
+
+// Writes a multi-segment partition and lets it go out of scope — the state a
+// process leaves behind when it dies without a clean shutdown.
+vector<Offset> writeThenAbandon(const filesystem::path& partition, const RollPolicy& policy,
+                                int batches) {
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    for (int i = 0; i < batches; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+
+    vector<Offset> bases;
+    map<string, filesystem::path> logs;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log")
+            logs[entry.path().filename().string()] = entry.path();
+    for (const auto& [name, path] : logs) bases.push_back(baseOffsetFromLogPath(path));
+    return bases;
+}
+
+}  // namespace
+
+TEST_CASE("Reopening a partition recovers the same view of it") {
+    TempDir dir("log-open");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+
+    const auto bases = writeThenAbandon(partition, policy, 50);
+    REQUIRE(bases.size() > 3);
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+
+    CHECK(log->logStartOffset() == Offset(0));
+    CHECK(log->logEndOffset() == Offset(50));
+    CHECK(log->segmentCount() == bases.size());
+
+    // Every offset still resolves, through both the reopened sealed segments and
+    // the recovered active one.
+    for (int64_t offset = 0; offset < 50; ++offset) {
+        const auto result = log->read(Offset(offset), kBigFetch);
+        REQUIRE(result.ok());
+        const auto header = RecordBatch::parseHeader(pullRange(result.range));
+        CHECK(header.baseOffset <= Offset(offset));
+        CHECK(header.lastOffset() >= Offset(offset));
+    }
+}
+
+TEST_CASE("A reopened partition can be appended to immediately") {
+    TempDir dir("log-open-append");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    writeThenAbandon(partition, policy, 30);
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    REQUIRE(log->logEndOffset() == Offset(30));
+
+    // A broker has to restart into service, not just into read-only mode.
+    auto bytes = makeUnstampedBatch(9999, 48);
+    CHECK(log->append(bytes) == Offset(30));
+    CHECK(log->logEndOffset() == Offset(31));
+    CHECK(log->read(Offset(30), kBigFetch).ok());
+}
+
+TEST_CASE("Opening a directory with no segments starts a new partition") {
+    TempDir dir("log-open-empty-dir");
+    const filesystem::path partition = dir.file("orders-0");
+    filesystem::create_directories(partition);
+
+    // What a crash between mkdir and the first segment leaves behind.
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, testPolicy());
+    CHECK(log->segmentCount() == 1);
+    CHECK(log->logEndOffset() == Offset(0));
+    CHECK(filesystem::exists(segmentLogPath(partition, Offset(0))));
+}
+
+TEST_CASE("Opening a missing directory is refused") {
+    TempDir dir("log-open-missing");
+    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, dir.file("nope"), testPolicy()),
+                    IoError);
+}
+
+TEST_CASE("Opening ignores files that are not segments") {
+    TempDir dir("log-open-other-files");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    const auto bases = writeThenAbandon(partition, policy, 20);
+
+    // The company a segment keeps in a real partition directory from M3 onward.
+    writeFile(partition / "partition.meta", vector<uint8_t>{1, 2, 3});
+    writeFile(partition / "leader-epoch-checkpoint", vector<uint8_t>{4, 5});
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    CHECK(log->segmentCount() == bases.size());
+    CHECK(log->logEndOffset() == Offset(20));
+}
+
+TEST_CASE("Only the newest segment is scanned for damage") {
+    TempDir dir("log-open-recovers-newest");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    const auto bases = writeThenAbandon(partition, policy, 40);
+
+    // Corrupt a byte in the body of the active segment's second batch.
+    const auto activeLog = segmentLogPath(partition, bases.back());
+    {
+        auto bytes = readFile(activeLog);
+        REQUIRE(bytes.size() > kBatchHeaderSize * 2);
+        const size_t firstSize = RecordBatch::totalSizeOf(bytes);
+        bytes[firstSize + kBatchHeaderSize + 2] ^= 0xFF;
+        writeFile(activeLog, bytes);
+    }
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+
+    // Truncated at the damage, so the log ends earlier than it did — and the
+    // sealed segments are untouched.
+    CHECK(log->logEndOffset() < Offset(40));
+    CHECK(log->logEndOffset() > bases.back());
+    CHECK(log->segmentCount() == bases.size());
+    CHECK(log->read(log->logEndOffset(), kBigFetch).ok());
+}
+
+TEST_CASE("A partition whose earliest segments are gone starts later") {
+    TempDir dir("log-open-below-start");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    const auto bases = writeThenAbandon(partition, policy, 50);
+    REQUIRE(bases.size() > 3);
+
+    // What retention will do at M3: delete the oldest segment outright.
+    filesystem::remove(segmentLogPath(partition, bases[0]));
+    filesystem::remove(segmentIndexPath(partition, bases[0]));
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    CHECK(log->logStartOffset() == bases[1]);
+
+    // Reads below the new start are BelowLogStart — distinct from AboveLogEnd,
+    // because a client's reset policy treats them differently: this one means
+    // "you were too slow, jump to the earliest offset available".
+    CHECK(log->read(Offset(0), kBigFetch).error == ReadError::BelowLogStart);
+    CHECK(log->read(bases[1] - 1, kBigFetch).error == ReadError::BelowLogStart);
+
+    // And the first surviving offset still reads fine.
+    CHECK(log->read(bases[1], kBigFetch).ok());
+    CHECK_FALSE(log->read(bases[1], kBigFetch).range.empty());
+}
+
+TEST_CASE("A hole left by a missing middle segment is refused") {
+    TempDir dir("log-open-hole");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    const auto bases = writeThenAbandon(partition, policy, 50);
+    REQUIRE(bases.size() > 3);
+
+    // Remove a segment from the middle. Reads crossing the gap would silently
+    // jump forward and no consumer would ever know records were skipped, so
+    // opening has to refuse rather than serve a log with a hole in it.
+    filesystem::remove(segmentLogPath(partition, bases[1]));
+    filesystem::remove(segmentIndexPath(partition, bases[1]));
+
+    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, partition, policy), CorruptData);
+}

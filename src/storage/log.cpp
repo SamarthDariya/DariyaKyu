@@ -1,5 +1,6 @@
 #include "storage/log.hpp"
 
+#include <cerrno>
 #include <utility>
 
 #include "common/errors.hpp"
@@ -10,8 +11,12 @@ using namespace std;
 namespace dariyakyu::storage {
 
 Log::Log(TopicPartition tp, filesystem::path dir, RollPolicy policy,
-         unique_ptr<ActiveSegment> active)
-    : tp_(std::move(tp)), dir_(std::move(dir)), policy_(policy), active_(std::move(active)) {
+         map<Offset, unique_ptr<SealedSegment>> sealed, unique_ptr<ActiveSegment> active)
+    : tp_(std::move(tp)),
+      dir_(std::move(dir)),
+      policy_(policy),
+      sealed_(std::move(sealed)),
+      active_(std::move(active)) {
     // Both offsets start where the active segment does. For a new log that is
     // zero; for one being reopened it is wherever recovery left off.
     logEndOffset_.store(active_->nextOffset(), memory_order_relaxed);
@@ -29,7 +34,65 @@ unique_ptr<Log> Log::create(TopicPartition tp, filesystem::path dir, RollPolicy 
     auto active = ActiveSegment::create(dir, Offset(0), policy);
 
     return unique_ptr<Log>(
-        new Log(std::move(tp), std::move(dir), policy, std::move(active)));
+        new Log(std::move(tp), std::move(dir), policy, {}, std::move(active)));
+}
+
+unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, RollPolicy policy) {
+    if (!filesystem::is_directory(dir)) throw IoError("open", dir, ENOENT);
+
+    // Only .log files. A partition directory also holds .index files and, from
+    // M3, partition.meta and leader-epoch-checkpoint — so the scan picks out the
+    // segments and ignores everything else. A file that DOES end in .log but is
+    // not named for an offset throws from baseOffsetFromLogPath rather than being
+    // skipped: it is either a bug or tampering, and guessing would be worse.
+    map<Offset, filesystem::path> logs;
+    for (const auto& entry : filesystem::directory_iterator(dir))
+        if (entry.path().extension() == ".log")
+            logs.emplace(baseOffsetFromLogPath(entry.path()), entry.path());
+
+    // Nothing here yet — a directory created but never written to, or a partition
+    // interrupted between mkdir and its first segment.
+    //
+    // The segment is built into a named local FIRST. Inlining it into the Log
+    // constructor call would put `ActiveSegment::create(dir, ...)` and
+    // `std::move(dir)` in the same argument list, and argument evaluation order
+    // is unspecified — so the move could run first, leaving `dir` empty and
+    // creating the segment in the process's working directory instead of the
+    // partition. Exactly the hazard Log::create documents, in a second place.
+    if (logs.empty()) {
+        auto active = ActiveSegment::create(dir, Offset(0), policy);
+        return unique_ptr<Log>(
+            new Log(std::move(tp), std::move(dir), policy, {}, std::move(active)));
+    }
+
+    // The map is ordered, so the last key is the newest segment.
+    const auto newest = prev(logs.end());
+
+    // Sealed segments first, deliberately. They are cheap to open, so a broken
+    // one fails before paying for the newest segment's full checksum scan.
+    map<Offset, unique_ptr<SealedSegment>> sealed;
+    for (auto it = logs.begin(); it != newest; ++it)
+        sealed.emplace(it->first, SealedSegment::open(it->second));
+
+    // Contiguity. Each segment must begin exactly where the previous one ended,
+    // or a segment file has been removed by hand and there is a hole in the
+    // offset sequence. Reads would silently skip it — every consumer crossing the
+    // gap would jump forward and never know — so it is refused instead.
+    for (auto it = sealed.begin(); it != sealed.end(); ++it) {
+        const auto following = next(it);
+        const Offset expected =
+            (following == sealed.end()) ? newest->first : following->first;
+        if (it->second->nextOffset() != expected)
+            throw CorruptData("log " + dir.string() + ": segment " +
+                              it->first.toString() + " ends at " +
+                              it->second->nextOffset().toString() + " but the next begins at " +
+                              expected.toString() + " — a segment file is missing");
+    }
+
+    auto active = ActiveSegment::recover(newest->second, policy);
+
+    return unique_ptr<Log>(new Log(std::move(tp), std::move(dir), policy, std::move(sealed),
+                                   std::move(active)));
 }
 
 Offset Log::append(span<uint8_t> batchBytes) {
