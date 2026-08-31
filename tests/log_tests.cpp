@@ -44,7 +44,11 @@ private:
     filesystem::path path_;
 };
 
-constexpr size_t kIndexBytes = 1024;   // 128 entries, plenty for most cases here
+constexpr size_t kIndexBytes = 1024;
+
+// Larger than anything these tests write, so reads are not capped unless a test
+// is specifically about capping.
+constexpr size_t kBigFetch = 1 << 20;   // 128 entries, plenty for most cases here
 
 vector<uint8_t> readFile(const filesystem::path& path) {
     ifstream in(path, ios::binary);
@@ -976,7 +980,7 @@ TEST_CASE("Every offset resolves to the exact byte its batch begins at") {
     // nearest entry is most of an interval away — the case the forward scan
     // exists for.
     for (int i = 0; i < 50; ++i) {
-        const auto range = segment->read(Offset(i));
+        const auto range = segment->read(Offset(i), kBigFetch);
         CHECK(range.position == starts[static_cast<size_t>(i)]);
         CHECK(range.length > 0);
         CHECK(range.fd == segment->fd());
@@ -993,7 +997,7 @@ TEST_CASE("An offset inside a multi-record batch resolves to the batch's start")
     // A batch is the unit of transfer, so all five offsets get the same range.
     // The consumer skips the records ahead of the one it asked for.
     for (int64_t offset = 500; offset <= 504; ++offset) {
-        const auto range = segment->read(Offset(offset));
+        const auto range = segment->read(Offset(offset), kBigFetch);
         CHECK(range.position == 0);
         CHECK(range.length == batch.size());
     }
@@ -1010,8 +1014,8 @@ TEST_CASE("A read works with no index entries at all") {
     // scan does all the work — slower, but correct, and it is why lookup() never
     // returns an optional.
     REQUIRE(segment->index().isEmpty());
-    CHECK(segment->read(Offset(0)).position == 0);
-    CHECK(segment->read(Offset(5)).position > 0);
+    CHECK(segment->read(Offset(0), kBigFetch).position == 0);
+    CHECK(segment->read(Offset(5), kBigFetch).position > 0);
 }
 
 TEST_CASE("A caught-up read succeeds with zero bytes") {
@@ -1021,17 +1025,17 @@ TEST_CASE("A caught-up read succeeds with zero bytes") {
 
     // The most common read in the system: a consumer polling for an offset the
     // producer has not written yet. Not an error, and it must not cost one.
-    const auto range = segment->read(Offset(4));
+    const auto range = segment->read(Offset(4), kBigFetch);
     CHECK(range.empty());
     CHECK(range.length == 0);
     CHECK(range.position == segment->sizeBytes());
 
     // Well past the end behaves the same way.
-    CHECK(segment->read(Offset(9999)).empty());
+    CHECK(segment->read(Offset(9999), kBigFetch).empty());
 
     // And an empty segment is caught up at its own base offset.
     auto fresh = ActiveSegment::create(dir.file(""), Offset(77), testPolicy());
-    CHECK(fresh->read(Offset(77)).empty());
+    CHECK(fresh->read(Offset(77), kBigFetch).empty());
 }
 
 TEST_CASE("A read below the segment's base offset is a routing bug") {
@@ -1042,8 +1046,8 @@ TEST_CASE("A read below the segment's base offset is a routing bug") {
     // Log picked this segment; asking it for an offset it cannot hold means the
     // picking was wrong. That is a bug in Log, not a routine miss, so unlike the
     // caught-up case it throws.
-    CHECK_THROWS_AS(segment->read(Offset(99)), OffsetInvariantViolated);
-    CHECK_THROWS_AS(segment->read(Offset(0)), OffsetInvariantViolated);
+    CHECK_THROWS_AS(segment->read(Offset(99), kBigFetch), OffsetInvariantViolated);
+    CHECK_THROWS_AS(segment->read(Offset(0), kBigFetch), OffsetInvariantViolated);
 }
 
 TEST_CASE("A read never describes bytes beyond what was written") {
@@ -1052,7 +1056,82 @@ TEST_CASE("A read never describes bytes beyond what was written") {
     fillSegment(*segment, 30, 64);
 
     for (int64_t offset = 0; offset < 30; ++offset) {
-        const auto range = segment->read(Offset(offset));
+        const auto range = segment->read(Offset(offset), kBigFetch);
+        CHECK(range.position + range.length <= segment->sizeBytes());
+    }
+}
+
+// ===========================================================================
+// SegmentBase: read — fetch size
+// ===========================================================================
+
+TEST_CASE("A read is capped at the fetch size") {
+    TempDir dir("seg-read-cap");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    const uint64_t total = fillSegment(*segment, 40, 64);
+
+    const auto range = segment->read(Offset(0), 500);
+    CHECK(range.position == 0);
+    CHECK(range.length == 500);
+    CHECK(range.length < total);
+}
+
+TEST_CASE("A read always carries at least one whole batch") {
+    TempDir dir("seg-read-min-batch");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    auto batch = makeBatch(Offset(0), 1000, 512);
+    segment->append(Offset(0), batch);
+    REQUIRE(batch.size() > 1);
+
+    // Without this rule a consumer whose fetch size is smaller than the next
+    // batch polls forever and never advances — a permanent stall caused by a
+    // merely conservative setting.
+    CHECK(segment->read(Offset(0), 1).length == batch.size());
+    CHECK(segment->read(Offset(0), 0).length == batch.size());
+    CHECK(segment->read(Offset(0), batch.size() - 1).length == batch.size());
+
+    // At exactly the batch size, and above it, nothing changes: there is only
+    // one batch to give.
+    CHECK(segment->read(Offset(0), batch.size()).length == batch.size());
+    CHECK(segment->read(Offset(0), batch.size() * 10).length == batch.size());
+}
+
+TEST_CASE("A read never promises bytes that have not been written") {
+    TempDir dir("seg-read-available");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    const uint64_t total = fillSegment(*segment, 5, 32);
+
+    // A fetch size far larger than the segment must be clamped to what exists,
+    // or sendfile would be handed a range running past the end of the file.
+    const auto range = segment->read(Offset(0), 1 << 30);
+    CHECK(range.position == 0);
+    CHECK(range.length == total);
+
+    // Same from a later offset: the cap is bytes-from-here, not bytes-in-total.
+    const auto later = segment->read(Offset(3), 1 << 30);
+    CHECK(later.position + later.length == total);
+}
+
+TEST_CASE("A capped read starts on a boundary even though it may end mid-batch") {
+    TempDir dir("seg-read-mid-end");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    vector<uint64_t> starts;
+    for (int i = 0; i < 20; ++i) {
+        starts.push_back(segment->sizeBytes());
+        const Offset base = segment->nextOffset();
+        auto bytes = makeBatch(base, 1000 + i, 48);
+        segment->append(base, bytes);
+    }
+
+    // The contract: the START is always a batch boundary, so a consumer can
+    // always begin parsing. The END may not be, and the consumer discards an
+    // incomplete trailing batch — the same thing Kafka's clients do.
+    for (int i = 0; i < 20; ++i) {
+        const auto range = segment->read(Offset(i), 300);
+        CHECK(range.position == starts[static_cast<size_t>(i)]);
+        CHECK(range.length >= 1);
         CHECK(range.position + range.length <= segment->sizeBytes());
     }
 }

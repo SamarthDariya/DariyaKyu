@@ -152,7 +152,17 @@ public:
     // transfer, so a consumer asking for offset 503 of a batch spanning 500..504
     // receives the whole batch from 500 and skips what it already has.
     //
-    // For now the range is exactly that one batch. Fetch-size capping comes next.
+    // The range's END is not batch-aligned: it is capped at `maxBytes` wherever
+    // that falls. Aligning it would mean parsing a header per batch in the
+    // range — one pread each, so a thousand syscalls for a 1 MB fetch of small
+    // batches — to save the consumer a check it has to make anyway. So the fetch
+    // contract is Kafka's: a response may end mid-batch, and the consumer
+    // discards an incomplete trailing batch rather than treating it as damage.
+    //
+    // Except that a range ALWAYS carries at least one whole batch when one is
+    // available, even if that exceeds maxBytes. Without that, a consumer whose
+    // fetch size is smaller than the next batch would poll forever and never
+    // advance — a permanent stall from a merely conservative setting.
     //
     // A zero-length range means "nothing here yet": the caller has caught up
     // with what this segment holds. That is a success, and it is the most common
@@ -161,7 +171,7 @@ public:
     //
     // An offset below the segment's base offset throws: Log chose this segment,
     // so getting here with an offset it cannot hold is a routing bug.
-    FileRange read(Offset offset) const;
+    FileRange read(Offset offset, std::size_t maxBytes) const;
 
     // One batch's header, plus how far it is to the next one.
     struct BatchAt {
