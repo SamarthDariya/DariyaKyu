@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 
 #include "common/file_handle.hpp"
@@ -177,6 +178,19 @@ public:
     // still be intact.
     static std::unique_ptr<ActiveSegment> create(const std::filesystem::path& dir,
                                                  Offset baseOffset, const RollPolicy& policy);
+
+    // Appends one batch, whose header must already carry `baseOffset` — Log
+    // stamps it before calling (that stamp is the only write the broker ever
+    // makes to producer bytes).
+    //
+    // Single-appender only: this partition's I/O thread and nobody else. Two
+    // threads here would interleave bytes inside a batch, and no checksum would
+    // survive it.
+    //
+    // The batch must begin exactly where the segment left off. A gap or an
+    // overlap is a bug in Log's bookkeeping rather than bad data on disk, so it
+    // throws OffsetInvariantViolated rather than CorruptData.
+    void append(Offset baseOffset, std::span<const std::uint8_t> batchBytes);
 
     // The policy this segment was created with. Held rather than passed in per
     // call, so append() and shouldRoll() cannot disagree about the interval or

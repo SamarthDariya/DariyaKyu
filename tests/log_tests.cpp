@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -13,6 +14,7 @@
 
 #include "common/errors.hpp"
 #include "storage/offset_index.hpp"
+#include "storage/record_batch.hpp"
 #include "storage/segment.hpp"
 
 using namespace std;
@@ -645,4 +647,114 @@ TEST_CASE("A refused create leaves the existing index untouched") {
     // create would wipe the first segment's index on its way to failing.
     CHECK_THROWS(ActiveSegment::create(dir.file(""), Offset(0), testPolicy()));
     CHECK(filesystem::file_size(indexFile) == sizeBefore);
+}
+
+// ===========================================================================
+// ActiveSegment: append
+// ===========================================================================
+
+namespace {
+
+// One batch of `records` records, each carrying `payloadBytes` of value, stamped
+// so the header says it begins at `baseOffset`.
+vector<uint8_t> makeBatch(Offset baseOffset, int64_t timestamp, size_t payloadBytes = 32,
+                          int records = 1) {
+    RecordBatchBuilder    builder;
+    const vector<uint8_t> value(payloadBytes, 0xAB);
+    for (int i = 0; i < records; ++i)
+        builder.append(timestamp + i, nullopt, span<const uint8_t>(value));
+
+    auto bytes = builder.build();
+    // What Log will do on the write path: stamp the assigned offset into the
+    // header, in place, without recomputing the checksum.
+    RecordBatch::stampBaseOffset(bytes, baseOffset);
+    return bytes;
+}
+
+// Appends `count` single-record batches, returning total bytes written.
+uint64_t fillSegment(ActiveSegment& segment, int count, size_t payloadBytes = 32,
+                     int64_t startTimestamp = 1000) {
+    uint64_t written = 0;
+    for (int i = 0; i < count; ++i) {
+        const Offset base  = segment.nextOffset();
+        auto         bytes = makeBatch(base, startTimestamp + i, payloadBytes);
+        segment.append(base, bytes);
+        written += bytes.size();
+    }
+    return written;
+}
+
+}  // namespace
+
+TEST_CASE("Appending advances the next offset by the batch's record count") {
+    TempDir dir("seg-append");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    auto batch = makeBatch(Offset(0), 5000, 16, 3);   // three records
+    segment->append(Offset(0), batch);
+
+    CHECK(segment->nextOffset() == Offset(3));
+    CHECK(segment->sizeBytes() == batch.size());
+    CHECK_FALSE(segment->isEmpty());
+
+    CHECK(segment->contains(Offset(0)));
+    CHECK(segment->contains(Offset(2)));
+    CHECK_FALSE(segment->contains(Offset(3)));
+}
+
+TEST_CASE("The largest timestamp is the maximum seen, not the latest appended") {
+    TempDir dir("seg-timestamps");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+
+    auto first = makeBatch(Offset(0), 9000, 16);
+    segment->append(Offset(0), first);
+    CHECK(segment->largestTimestamp() == 9000);
+
+    // A producer may send an older timestamp than one already stored — clock
+    // skew, or a backfill. The segment tracks the maximum, because M3's
+    // retention asks "how old is the newest record here".
+    auto older = makeBatch(Offset(1), 500, 16);
+    segment->append(Offset(1), older);
+    CHECK(segment->largestTimestamp() == 9000);
+}
+
+TEST_CASE("Successive appends stay contiguous") {
+    TempDir dir("seg-contiguous");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(200), testPolicy());
+    const uint64_t written = fillSegment(*segment, 10);
+
+    CHECK(segment->nextOffset() == Offset(210));
+    CHECK(segment->sizeBytes() == written);
+}
+
+TEST_CASE("A batch that does not start where the segment ends is refused") {
+    TempDir dir("seg-gap");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(0), testPolicy());
+    fillSegment(*segment, 2);
+    REQUIRE(segment->nextOffset() == Offset(2));
+
+    // A gap would make the offsets in this file stop being a sequence, and every
+    // later lookup wrong.
+    auto gap = makeBatch(Offset(5), 1000);
+    CHECK_THROWS_AS(segment->append(Offset(5), gap), OffsetInvariantViolated);
+
+    // An overlap would write two records claiming the same offset.
+    auto overlap = makeBatch(Offset(1), 1000);
+    CHECK_THROWS_AS(segment->append(Offset(1), overlap), OffsetInvariantViolated);
+
+    // Neither wrote anything.
+    CHECK(segment->nextOffset() == Offset(2));
+}
+
+TEST_CASE("An unstamped batch is caught rather than stored claiming offset zero") {
+    TempDir dir("seg-unstamped");
+    auto    segment = ActiveSegment::create(dir.file(""), Offset(10), testPolicy());
+
+    RecordBatchBuilder    builder;
+    const vector<uint8_t> value(8, 0x01);
+    builder.append(1000, nullopt, span<const uint8_t>(value));
+    auto unstamped = builder.build();   // header still says base offset 0
+
+    CHECK_THROWS_AS(segment->append(Offset(10), unstamped), OffsetInvariantViolated);
+    CHECK(segment->isEmpty());
 }

@@ -1,11 +1,13 @@
 #include "storage/segment.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <format>
 #include <stdexcept>
 #include <utility>
 
 #include "common/errors.hpp"
+#include "storage/record_batch.hpp"
 
 using namespace std;
 
@@ -126,6 +128,52 @@ unique_ptr<ActiveSegment> ActiveSegment::create(const filesystem::path& dir, Off
     // member function does.
     return unique_ptr<ActiveSegment>(
         new ActiveSegment(std::move(log), std::move(index), baseOffset, policy));
+}
+
+void ActiveSegment::append(Offset baseOffset, span<const uint8_t> batchBytes) {
+    // Reads the fixed 61-byte prefix and stops. The body is never touched here:
+    // the broker does not know or care what the records say, and on a compressed
+    // batch it could not read them anyway.
+    const BatchHeader header = RecordBatch::parseHeader(batchBytes);
+
+    // Two different mistakes, two checks.
+    //
+    // First: the header must already say what the caller says it says. If Log
+    // computed an offset but forgot to stamp it into the bytes, the header still
+    // reads 0 while baseOffset reads the real value — caught here rather than
+    // written to disk as a batch claiming to start at zero.
+    if (header.baseOffset != baseOffset)
+        throw OffsetInvariantViolated("segment append: batch header says " +
+                                      header.baseOffset.toString() + " but the caller says " +
+                                      baseOffset.toString() + " — the stamp did not happen");
+
+    // Second: a log is contiguous. The new batch has to start exactly where the
+    // last one ended, or the offsets in this file stop being a sequence and
+    // every later lookup is wrong.
+    const Offset expected = nextOffset();
+    if (baseOffset != expected)
+        throw OffsetInvariantViolated("segment append: batch starts at " + baseOffset.toString() +
+                                      " but the segment ends at " + expected.toString() +
+                                      " — a gap or overlap in Log's bookkeeping");
+
+    log_.append(batchBytes);
+
+    // relaxed on the load: only this thread ever writes largestTimestamp_, so it
+    // is reading its own last value and needs no ordering to do that. The store
+    // is release because readers do consume it.
+    largestTimestamp_.store(max(largestTimestamp_.load(memory_order_relaxed),
+                                header.maxTimestamp),
+                            memory_order_release);
+
+    // Published LAST, and with release ordering. This is the moment the batch
+    // becomes visible: a reader that sees the new next offset is guaranteed to
+    // see the bytes behind it, because the release store cannot be reordered
+    // before the writes above it.
+    //
+    // lastOffset() is baseOffset + lastOffsetDelta, and lastOffsetDelta lives
+    // outside the compressed region of the batch on purpose — so the segment
+    // learns how many records arrived without decompressing anything.
+    nextOffset_.store(header.lastOffset() + 1, memory_order_release);
 }
 
 }  // namespace dariyakyu::storage
