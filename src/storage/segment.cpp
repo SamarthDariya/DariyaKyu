@@ -1,6 +1,10 @@
 #include "storage/segment.hpp"
 
+#include <cctype>
 #include <format>
+#include <stdexcept>
+
+#include "common/errors.hpp"
 
 using namespace std;
 
@@ -8,8 +12,13 @@ namespace dariyakyu::storage {
 
 namespace {
 
-constexpr char kLogSuffix[]   = ".log";
-constexpr char kIndexSuffix[] = ".index";
+constexpr char   kLogSuffix[]   = ".log";
+constexpr char   kIndexSuffix[] = ".index";
+constexpr size_t kNameDigits    = 20;
+
+// sizeof on a string literal counts the trailing NUL, which is not part of the
+// text — so ".log" is sizeof 5 and length 4.
+constexpr size_t kLogSuffixLength = sizeof(kLogSuffix) - 1;
 
 }  // namespace
 
@@ -36,6 +45,40 @@ filesystem::path segmentLogPath(const filesystem::path& dir, Offset baseOffset) 
 
 filesystem::path segmentIndexPath(const filesystem::path& dir, Offset baseOffset) {
     return dir / (segmentBaseName(baseOffset) + kIndexSuffix);
+}
+
+Offset baseOffsetFromLogPath(const filesystem::path& logFile) {
+    // .filename() drops the directories; .string() turns the path back into
+    // characters we can index.
+    const string name = logFile.filename().string();
+
+    // Length and suffix in one check. compare(pos, count, str) compares a
+    // substring against a C string and returns 0 when they match.
+    if (name.size() != kNameDigits + kLogSuffixLength ||
+        name.compare(kNameDigits, kLogSuffixLength, kLogSuffix) != 0)
+        throw CorruptData("segment: '" + name + "' is not a segment log file name — expected " +
+                          to_string(kNameDigits) + " digits followed by " + kLogSuffix);
+
+    // isdigit() is a C function taking an int, and its behaviour is undefined
+    // for values outside unsigned char. Plain `char` is signed on this platform,
+    // so a byte above 127 would arrive negative — hence the cast. This is why
+    // stoll() alone cannot do the validating: it skips leading whitespace,
+    // accepts a leading '+' or '-', and stops at the first non-digit rather
+    // than complaining about it.
+    for (size_t i = 0; i < kNameDigits; ++i)
+        if (isdigit(static_cast<unsigned char>(name[i])) == 0)
+            throw CorruptData("segment: '" + name + "' has a non-digit where its base offset "
+                              "should be");
+
+    // Twenty digits can describe a number larger than int64 holds — the maximum
+    // is 19 digits — and stoll signals that with out_of_range. That is still a
+    // malformed file name, so it is translated rather than escaping as a
+    // different exception type than the two checks above.
+    try {
+        return Offset{stoll(name.substr(0, kNameDigits))};
+    } catch (const out_of_range&) {
+        throw CorruptData("segment: '" + name + "' encodes an offset too large for int64");
+    }
 }
 
 }  // namespace dariyakyu::storage
