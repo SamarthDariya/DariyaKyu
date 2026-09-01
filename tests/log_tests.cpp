@@ -2422,9 +2422,13 @@ TEST_CASE("Opening ignores files that are not segments") {
     policy.maxSegmentBytes = 500;
     const auto bases = writeThenAbandon(partition, policy, 20);
 
-    // The company a segment keeps in a real partition directory from M3 onward.
-    writeFile(partition / "partition.meta", vector<uint8_t>{1, 2, 3});
+    // The company a segment keeps in a real partition directory. Note
+    // partition.meta is NOT in this list: it used to be just another file the
+    // scan stepped over, and since step 8 it is read and validated. Writing junk
+    // there is now a corrupt partition, which is a different test.
     writeFile(partition / "leader-epoch-checkpoint", vector<uint8_t>{4, 5});
+    writeFile(partition / ".DS_Store", vector<uint8_t>{6, 7, 8});
+    writeFile(partition / "00000000000000000000.log.swp", vector<uint8_t>{9});
 
     auto log = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
     CHECK(log->segmentCount() == bases.size());
@@ -3406,4 +3410,140 @@ TEST_CASE("A missing meta file is an I/O error, not corruption") {
     // predates the file, or was interrupted before writing it", which is
     // recoverable. Present-but-unreadable is not.
     CHECK_THROWS_AS(readPartitionMeta(partition, TopicPartition{"orders", 3}), IoError);
+}
+
+// ===========================================================================
+// partition.meta — wired into Log
+// ===========================================================================
+
+TEST_CASE("Creating a log writes its partition.meta") {
+    TempDir dir("meta-on-create");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config = testConfig();
+    config.retention.retentionMs = 12345;
+
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+
+    const auto stored = readPartitionMeta(partition, TopicPartition{"orders", 0});
+    CHECK(stored.tp.topic == "orders");
+    CHECK(stored.tp.partition == 0);
+    CHECK(stored.config.retention.retentionMs == 12345);
+    CHECK(stored.config.roll.maxSegmentBytes == config.roll.maxSegmentBytes);
+}
+
+TEST_CASE("The stored config wins over the one passed to open") {
+    TempDir dir("meta-stored-wins");
+    const filesystem::path partition = dir.file("orders-0");
+
+    LogConfig original = testConfig();
+    original.retention.retentionMs    = 60'000;
+    original.retention.retentionBytes = 4096;
+    {
+        auto log = Log::create(TopicPartition{"orders", 0}, partition, original);
+        auto bytes = makeUnstampedBatch(1000, 48);
+        log->append(bytes);
+    }
+
+    // Reopened by someone who passed the defaults. A partition told to keep one
+    // minute of data must not silently start keeping seven days.
+    LogConfig different = testConfig();
+    different.retention.retentionMs    = 7ll * 24 * 60 * 60 * 1000;
+    different.retention.retentionBytes = nullopt;
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, different);
+    CHECK(log->config().retention.retentionMs == 60'000);
+    CHECK(log->config().retention.retentionBytes == 4096u);
+}
+
+TEST_CASE("Retention after a restart follows the stored config, not the caller's") {
+    TempDir dir("meta-retention-honoured");
+    const filesystem::path partition = dir.file("orders-0");
+
+    LogConfig original = testConfig();
+    original.roll.maxSegmentBytes = 400;
+    original.retention.retentionMs = 10'000;
+    {
+        auto log = Log::create(TopicPartition{"orders", 0}, partition, original);
+        for (int i = 0; i < 40; ++i) {
+            auto bytes = makeUnstampedBatch(100'000 + i * 1'000, 48);
+            log->append(bytes);
+        }
+    }
+
+    // Reopened with an effectively infinite window. If the fallback were applied,
+    // retention would delete nothing and the disk would quietly grow forever —
+    // the exact failure partition.meta exists to prevent.
+    LogConfig wrong = testConfig();
+    wrong.roll.maxSegmentBytes  = 400;
+    wrong.retention.retentionMs = 1'000'000'000;
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, wrong);
+    log->applyRetention(100'000 + 39 * 1'000);
+
+    CHECK(log->logStartOffset() > Offset(0));
+    CHECK(log->config().retention.retentionMs == 10'000);
+}
+
+TEST_CASE("An empty partition with no meta adopts the fallback and records it") {
+    TempDir dir("meta-heal-empty");
+    const filesystem::path partition = dir.file("orders-0");
+    filesystem::create_directories(partition);
+
+    // What a crash between mkdir and the first write leaves behind. There is no
+    // stored configuration to contradict, so the fallback is safe here.
+    LogConfig fallback = testConfig();
+    fallback.retention.retentionMs = 4242;
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, fallback);
+    CHECK(log->config().retention.retentionMs == 4242);
+
+    // Written down, so the next open finds it rather than falling back again.
+    CHECK(readPartitionMeta(partition, TopicPartition{"orders", 0})
+              .config.retention.retentionMs == 4242);
+}
+
+TEST_CASE("A partition holding records with no meta is refused") {
+    TempDir dir("meta-missing-with-data");
+    const filesystem::path partition = dir.file("orders-0");
+    {
+        auto log = Log::create(TopicPartition{"orders", 0}, partition, testConfig());
+        auto bytes = makeUnstampedBatch(1000, 48);
+        log->append(bytes);
+    }
+    filesystem::remove(partition / PartitionMeta::kFileName);
+
+    // The original configuration is not derivable from the log, so adopting the
+    // caller's and writing it down would make a guess permanent — and a wrong
+    // retention window loses data or fills a disk, neither of which reports an
+    // error.
+    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, partition, testConfig()),
+                    CorruptData);
+}
+
+TEST_CASE("A corrupt meta is refused even on an empty partition") {
+    TempDir dir("meta-corrupt");
+    const filesystem::path partition = dir.file("orders-0");
+    filesystem::create_directories(partition);
+    writeFile(partition / PartitionMeta::kFileName, vector<uint8_t>{1, 2, 3});
+
+    // Present-but-unreadable is not the same as absent. Only ENOENT reaches the
+    // fallback; anything else means something is wrong that a default cannot fix.
+    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, partition, testConfig()),
+                    CorruptData);
+}
+
+TEST_CASE("A meta from another partition is refused") {
+    TempDir dir("meta-wrong-partition");
+    const filesystem::path partition = dir.file("orders-0");
+    {
+        auto log = Log::create(TopicPartition{"orders", 0}, partition, testConfig());
+        auto bytes = makeUnstampedBatch(1000, 48);
+        log->append(bytes);
+    }
+
+    // A hand-copied partition directory: the meta still names its original owner.
+    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 7}, partition, testConfig()),
+                    CorruptData);
+    CHECK_THROWS_AS(Log::open(TopicPartition{"payments", 0}, partition, testConfig()),
+                    CorruptData);
 }
