@@ -5,6 +5,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <vector>
 #include <unordered_map>
 
 #include "common/types.hpp"
@@ -23,6 +24,11 @@ namespace dariyakyu::storage {
 // re-encoding gives "orders-3", so the same partition would have two directory
 // names and whichever the scan met first would win.
 TopicPartition topicPartitionFromDirName(const std::string& name);
+
+// A partition directory being deleted is renamed to end in this, which takes it
+// out of the startup scan's sight in one atomic step. See
+// LogManager::removePartition.
+inline constexpr const char* kDeletedSuffix = ".delete";
 
 // Reserved for the controller's own state (data/meta/cluster.meta), so it is not
 // a partition and the startup scan steps over it.
@@ -100,6 +106,34 @@ public:
     // Same, with the manager's defaults.
     Log& createPartition(const TopicPartition& tp);
 
+    // Stops hosting a partition and deletes its files.
+    //
+    // The directory is RENAMED first, to `<name>.<timestamp>.delete`, and only
+    // then dropped. Two reasons, and both are about being interrupted:
+    //
+    //   - the rename is one atomic step, so the partition stops being visible to
+    //     a startup scan the instant it begins disappearing. Unlinking files one
+    //     by one and then crashing would leave a directory that still looks like
+    //     a partition but has a hole in its offset sequence, which Log::open
+    //     refuses — turning a topic deletion into a broker that will not start.
+    //   - the timestamp makes the name unique, so a partition deleted, recreated,
+    //     and deleted again does not collide with its own earlier corpse.
+    //
+    // Destruction is then deferred, for the same reason retention defers it: a
+    // FileRange already handed out names a descriptor this Log owns, and closing
+    // it early would fail the send or, worse, let the number be reused by another
+    // file. sweepDeletedPartitions does the freeing.
+    //
+    // Any Log* previously returned by get() for this partition dangles from here
+    // on. Nothing above this layer may cache one.
+    void removePartition(const TopicPartition& tp, std::int64_t nowMs);
+
+    // Frees partitions whose deletion delay has elapsed, and removes their
+    // renamed directories.
+    void sweepDeletedPartitions(std::int64_t nowMs);
+
+    std::size_t removedPartitionCount() const;
+
     std::size_t partitionCount() const;
 
     const std::filesystem::path& dataDir() const { return dataDir_; }
@@ -113,6 +147,15 @@ private:
     LogConfig             defaults_;
 
     std::unordered_map<TopicPartition, std::unique_ptr<Log>> logs_;
+
+    // Partitions whose directories are renamed away but whose descriptors are
+    // still open. The manager's counterpart to Log's segment graveyard.
+    struct RemovedPartition {
+        std::unique_ptr<Log>  log;
+        std::filesystem::path directory;   // the renamed one
+        std::int64_t          removedAtMs = 0;
+    };
+    std::vector<RemovedPartition> removed_;
 
     // mutable so const lookups can take a shared lock. Guards which entries
     // exist — never the contents of a Log, which does its own.

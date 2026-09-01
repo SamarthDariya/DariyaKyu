@@ -1,5 +1,6 @@
 #include "storage/log_manager.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <stdexcept>
 #include <string>
@@ -106,6 +107,15 @@ void LogManager::loadAll() {
         const string name = entry.path().filename().string();
         if (name == kMetaDirName) continue;   // the controller's own state
 
+        // A deletion that was interrupted. Finish it now rather than skipping it
+        // forever: a restart means there are no in-flight reads to protect, so
+        // the delay that removePartition observes serves no purpose here.
+        if (name.ends_with(kDeletedSuffix)) {
+            error_code removeEc;
+            filesystem::remove_all(entry.path(), removeEc);
+            continue;
+        }
+
         const TopicPartition tp = topicPartitionFromDirName(name);
 
         // Log::open reads this partition's own partition.meta, so `defaults_` is a
@@ -141,6 +151,56 @@ Log& LogManager::createPartition(const TopicPartition& tp, const LogConfig& conf
 
 Log& LogManager::createPartition(const TopicPartition& tp) {
     return createPartition(tp, defaults_);
+}
+
+void LogManager::removePartition(const TopicPartition& tp, int64_t nowMs) {
+    unique_lock lock(logsMutex_);
+
+    const auto it = logs_.find(tp);
+    if (it == logs_.end())
+        throw Error("partition " + tp.toString() + " is not hosted on this broker");
+
+    const filesystem::path from = dataDir_ / tp.toString();
+    const filesystem::path to =
+        dataDir_ / (tp.toString() + "." + to_string(nowMs) + kDeletedSuffix);
+
+    // Rename BEFORE unregistering, so a failure here leaves the partition intact
+    // and still served rather than orphaned: registered nowhere, files still on
+    // disk, invisible until the next restart.
+    error_code ec;
+    filesystem::rename(from, to, ec);
+    if (ec) throw IoError("rename", from, ec.value());
+
+    removed_.push_back({std::move(it->second), to, nowMs});
+    logs_.erase(it);
+}
+
+void LogManager::sweepDeletedPartitions(int64_t nowMs) {
+    unique_lock lock(logsMutex_);
+
+    const int64_t delay = defaults_.retention.segmentDeleteDelayMs;
+
+    erase_if(removed_, [&](RemovedPartition& removed) {
+        if (nowMs - removed.removedAtMs < delay) return false;
+
+        // The Log goes first, closing every descriptor it owns. remove_all would
+        // work on open files — POSIX keeps the inode alive — but doing it in this
+        // order means the space is reclaimed by the time this returns rather than
+        // whenever the last handle happens to close.
+        removed.log.reset();
+
+        error_code ec;
+        filesystem::remove_all(removed.directory, ec);
+        // A failure leaves the renamed directory behind. It is out of the startup
+        // scan's sight and the next scan finishes the job, so this does not throw
+        // and stall the sweep for every other partition.
+        return true;
+    });
+}
+
+size_t LogManager::removedPartitionCount() const {
+    shared_lock lock(logsMutex_);
+    return removed_.size();
 }
 
 Log* LogManager::get(const TopicPartition& tp) const {

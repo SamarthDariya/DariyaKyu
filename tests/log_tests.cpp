@@ -3979,3 +3979,175 @@ TEST_CASE("A reopened partition can be written to and rolls as before") {
     CHECK(log->logEndOffset() == end + 20);
     CHECK(log->segmentCount() > segmentsBefore);
 }
+
+// ===========================================================================
+// LogManager: removing partitions
+// ===========================================================================
+
+namespace {
+
+size_t partitionDirCount(const filesystem::path& dataDir) {
+    size_t count = 0;
+    for (const auto& entry : filesystem::directory_iterator(dataDir))
+        if (entry.is_directory() && !entry.path().filename().string().ends_with(kDeletedSuffix))
+            ++count;
+    return count;
+}
+
+size_t deletedDirCount(const filesystem::path& dataDir) {
+    size_t count = 0;
+    for (const auto& entry : filesystem::directory_iterator(dataDir))
+        if (entry.is_directory() && entry.path().filename().string().ends_with(kDeletedSuffix))
+            ++count;
+    return count;
+}
+
+}  // namespace
+
+TEST_CASE("Removing a partition unregisters it and renames its directory away") {
+    TempDir dir("mgr-remove");
+    const filesystem::path dataDir = dir.file("data");
+    LogManager manager(dataDir, testConfig());
+    manager.createPartition(TopicPartition{"orders", 0});
+    manager.createPartition(TopicPartition{"orders", 1});
+
+    manager.removePartition(TopicPartition{"orders", 0}, 1000);
+
+    CHECK(manager.partitionCount() == 1);
+    CHECK(manager.get(TopicPartition{"orders", 0}) == nullptr);
+    CHECK(manager.get(TopicPartition{"orders", 1}) != nullptr);
+
+    // Renamed, not yet deleted: the descriptors are still open.
+    CHECK_FALSE(filesystem::exists(dataDir / "orders-0"));
+    CHECK(deletedDirCount(dataDir) == 1);
+    CHECK(manager.removedPartitionCount() == 1);
+}
+
+TEST_CASE("A read in flight when a partition is removed still completes") {
+    TempDir dir("mgr-remove-inflight");
+    const filesystem::path dataDir = dir.file("data");
+    LogManager manager(dataDir, testConfig());
+    Log& log = manager.createPartition(TopicPartition{"orders", 0});
+    for (int i = 0; i < 5; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log.append(bytes);
+    }
+
+    // Resolved but not yet sent — the network layer would hand this to sendfile
+    // on an I/O thread some time later.
+    const auto inflight = log.read(Offset(0), kBigFetch);
+    REQUIRE(inflight.ok());
+    REQUIRE_FALSE(inflight.range.empty());
+
+    manager.removePartition(TopicPartition{"orders", 0}, 1000);
+
+    // Same reasoning as retention's graveyard, one level up: closing the
+    // descriptor early would fail this read, or let its number be reused by
+    // another file and send a consumer someone else's bytes.
+    const auto bytes = pullRange(inflight.range);
+    CHECK(RecordBatch::verifyCrc(bytes));
+    CHECK(RecordBatch::parseHeader(bytes).baseOffset == Offset(0));
+}
+
+TEST_CASE("A removed partition's files go once its delay elapses") {
+    TempDir dir("mgr-remove-sweep");
+    const filesystem::path dataDir = dir.file("data");
+    LogConfig config = testConfig();
+    config.retention.segmentDeleteDelayMs = 60'000;
+    LogManager manager(dataDir, config);
+    manager.createPartition(TopicPartition{"orders", 0});
+
+    manager.removePartition(TopicPartition{"orders", 0}, 1000);
+    REQUIRE(manager.removedPartitionCount() == 1);
+
+    manager.sweepDeletedPartitions(1000 + 59'000);
+    CHECK(manager.removedPartitionCount() == 1);
+    CHECK(deletedDirCount(dataDir) == 1);
+
+    manager.sweepDeletedPartitions(1000 + 60'000);
+    CHECK(manager.removedPartitionCount() == 0);
+    CHECK(deletedDirCount(dataDir) == 0);
+    CHECK(filesystem::is_empty(dataDir));
+}
+
+TEST_CASE("Removing a partition this broker does not host is refused") {
+    TempDir dir("mgr-remove-missing");
+    LogManager manager(dir.file("data"), testConfig());
+
+    CHECK_THROWS_AS(manager.removePartition(TopicPartition{"orders", 0}, 1000), Error);
+}
+
+TEST_CASE("A partition can be recreated after being removed") {
+    TempDir dir("mgr-remove-recreate");
+    const filesystem::path dataDir = dir.file("data");
+    LogManager manager(dataDir, testConfig());
+
+    Log& first = manager.createPartition(TopicPartition{"orders", 0});
+    auto bytes = makeUnstampedBatch(1000, 48);
+    first.append(bytes);
+    REQUIRE(first.logEndOffset() == Offset(1));
+
+    manager.removePartition(TopicPartition{"orders", 0}, 1000);
+
+    // The rename freed the name, so this does not collide with the corpse.
+    Log& second = manager.createPartition(TopicPartition{"orders", 0});
+    CHECK(second.logEndOffset() == Offset(0));
+    CHECK(manager.partitionCount() == 1);
+    CHECK(filesystem::is_directory(dataDir / "orders-0"));
+}
+
+TEST_CASE("Deleting, recreating and deleting again does not collide") {
+    TempDir dir("mgr-remove-twice");
+    const filesystem::path dataDir = dir.file("data");
+    LogManager manager(dataDir, testConfig());
+
+    manager.createPartition(TopicPartition{"orders", 0});
+    manager.removePartition(TopicPartition{"orders", 0}, 1000);
+    manager.createPartition(TopicPartition{"orders", 0});
+
+    // The timestamp in the renamed name is what keeps the second corpse from
+    // landing on the first.
+    CHECK_NOTHROW(manager.removePartition(TopicPartition{"orders", 0}, 2000));
+    CHECK(manager.removedPartitionCount() == 2);
+    CHECK(deletedDirCount(dataDir) == 2);
+}
+
+TEST_CASE("An interrupted deletion is finished at startup") {
+    TempDir dir("mgr-remove-interrupted");
+    const filesystem::path dataDir = dir.file("data");
+    {
+        LogManager manager(dataDir, testConfig());
+        manager.createPartition(TopicPartition{"orders", 0});
+        manager.createPartition(TopicPartition{"orders", 1});
+        manager.removePartition(TopicPartition{"orders", 0}, 1000);
+        // Destroyed without sweeping — the renamed directory is still on disk.
+    }
+    REQUIRE(deletedDirCount(dataDir) == 1);
+
+    LogManager reopened(dataDir, testConfig());
+    reopened.loadAll();
+
+    // A restart means there are no in-flight reads to protect, so the delay
+    // serves no purpose and the deletion is completed rather than deferred again.
+    CHECK(reopened.partitionCount() == 1);
+    CHECK(reopened.get(TopicPartition{"orders", 1}) != nullptr);
+    CHECK(reopened.get(TopicPartition{"orders", 0}) == nullptr);
+    CHECK(deletedDirCount(dataDir) == 0);
+    CHECK(partitionDirCount(dataDir) == 1);
+}
+
+TEST_CASE("A renamed directory is never parsed as a partition") {
+    TempDir dir("mgr-remove-not-parsed");
+    const filesystem::path dataDir = dir.file("data");
+    filesystem::create_directories(dataDir);
+
+    // Without the suffix skip, this name reaches topicPartitionFromDirName, which
+    // would refuse it and abort the whole scan — turning one interrupted deletion
+    // into a broker that will not start.
+    filesystem::create_directories(dataDir / ("orders-0.1000" + string(kDeletedSuffix)));
+    CHECK_THROWS_AS(topicPartitionFromDirName("orders-0.1000.delete"), CorruptData);
+
+    LogManager manager(dataDir, testConfig());
+    CHECK_NOTHROW(manager.loadAll());
+    CHECK(manager.partitionCount() == 0);
+}
