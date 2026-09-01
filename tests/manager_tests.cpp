@@ -926,3 +926,149 @@ TEST_CASE("Partitions can be created and removed while the thread runs") {
     CHECK(manager.partitionCount() == 20);
     CHECK(manager.sweepFailures() == 0);
 }
+
+// ===========================================================================
+// M3 end to end: the thread alone, with no manual calls
+// ===========================================================================
+
+namespace {
+
+uint64_t bytesUnder(const filesystem::path& root) {
+    uint64_t total = 0;
+    for (const auto& entry : filesystem::recursive_directory_iterator(root))
+        if (entry.is_regular_file()) total += filesystem::file_size(entry.path());
+    return total;
+}
+
+}  // namespace
+
+TEST_CASE("A partition is rolled, aged out and freed with no manual intervention") {
+    TempDir dir("m3-end-to-end");
+    const filesystem::path dataDir = dir.file("data");
+
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes           = 400;   // roll often
+    config.roll.maxSegmentAgeMs           = 1;     // and on age, so idle rolls too
+    config.retention.retentionMs          = 1'000;
+    config.retention.segmentDeleteDelayMs = 0;     // free as soon as swept
+
+    LogManager manager(dataDir, config);
+    Log& log = manager.createPartition(TopicPartition{"orders", 0}, config);
+
+    // Records timestamped ten seconds ago, so they are already past a one-second
+    // window. Real wall-clock values, because rolling compares against a time
+    // append captured from the same clock.
+    const int64_t past = wallClockMillis() - 10'000;
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(past + i, 48);
+        log.append(bytes);
+    }
+    const uint64_t bytesBefore = bytesUnder(dataDir);
+    REQUIRE(log.logEndOffset() == Offset(40));
+    REQUIRE(log.logStartOffset() == Offset(0));
+
+    // From here on nothing is called by hand. Everything below is the thread.
+    manager.startMaintenance(1);
+
+    // Rolling, then retention, then the graveyard drain — three steps the sweep
+    // does in that order, and the last offset only becomes unreachable once all
+    // three have happened.
+    CHECK(waitFor([&] { return log.logStartOffset() == log.logEndOffset(); }));
+    CHECK(waitFor([&] { return log.graveyardSize() == 0; }));
+
+    manager.stopMaintenance();
+
+    CHECK(manager.sweepFailures() == 0);
+    CHECK(log.logEndOffset() == Offset(40));      // offsets are never reused
+    CHECK(log.logStartOffset() == Offset(40));    // but nothing is left to read
+    CHECK(log.segmentCount() == 1);               // just a fresh active segment
+    CHECK(log.totalSizeBytes() == 0);
+
+    // The disk actually came back — the graveyard drained rather than just the
+    // map being emptied.
+    CHECK(bytesUnder(dataDir) < bytesBefore);
+
+    // And what a consumer sees: the checklist's last line, reached by the sweep
+    // rather than by a test calling applyRetention.
+    CHECK(log.read(Offset(0), kBigFetch).error == ReadError::BelowLogStart);
+    CHECK(log.read(Offset(39), kBigFetch).error == ReadError::BelowLogStart);
+    CHECK(log.read(Offset(40), kBigFetch).ok());
+    CHECK(log.read(Offset(40), kBigFetch).range.empty());
+    CHECK(log.read(Offset(41), kBigFetch).error == ReadError::AboveLogEnd);
+}
+
+TEST_CASE("A partition kept inside its window survives the sweep intact") {
+    TempDir dir("m3-end-to-end-kept");
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes  = 400;
+    config.roll.maxSegmentAgeMs  = 1;
+    config.retention.retentionMs = 1'000'000;   // nothing is old enough
+
+    LogManager manager(dir.file("data"), config);
+    Log& log = manager.createPartition(TopicPartition{"orders", 0}, config);
+
+    const int64_t now = wallClockMillis();
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(now + i, 48);
+        log.append(bytes);
+    }
+
+    manager.startMaintenance(1);
+    REQUIRE(waitFor([&] { return manager.sweepCount() >= 5; }));
+    manager.stopMaintenance();
+
+    // A sweep that deleted data inside its retention window would be the worst
+    // possible bug in this milestone, so it gets its own test rather than being
+    // implied by the aggressive one above.
+    CHECK(log.logStartOffset() == Offset(0));
+    CHECK(log.logEndOffset() == Offset(40));
+    for (int64_t offset = 0; offset < 40; ++offset)
+        CHECK(log.read(Offset(offset), kBigFetch).ok());
+}
+
+TEST_CASE("A whole broker restarts into the state the sweep left it in") {
+    TempDir dir("m3-end-to-end-restart");
+    const filesystem::path dataDir = dir.file("data");
+
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes           = 400;
+    config.roll.maxSegmentAgeMs           = 1;
+    config.retention.retentionMs          = 1'000;
+    config.retention.segmentDeleteDelayMs = 0;
+
+    Offset start{0};
+    Offset end{0};
+    {
+        LogManager manager(dataDir, config);
+        for (int p = 0; p < 3; ++p) {
+            Log& log = manager.createPartition(TopicPartition{"orders", p}, config);
+            const int64_t past = wallClockMillis() - 10'000;
+            for (int i = 0; i < 30; ++i) {
+                auto bytes = makeUnstampedBatch(past + i, 48);
+                log.append(bytes);
+            }
+        }
+        manager.startMaintenance(1);
+        Log* first = manager.get(TopicPartition{"orders", 0});
+        REQUIRE(waitFor([&] { return first->logStartOffset() > Offset(0); }));
+        manager.stopMaintenance();
+
+        start = first->logStartOffset();
+        end   = first->logEndOffset();
+    }
+
+    // Everything the sweep did was to the files, so a fresh manager scanning the
+    // same directory must agree — including a log whose earliest segment is no
+    // longer offset zero, and each partition's own config coming back from its
+    // partition.meta.
+    LogManager reopened(dataDir, testConfig());
+    reopened.loadAll();
+
+    CHECK(reopened.partitionCount() == 3);
+    Log* first = reopened.get(TopicPartition{"orders", 0});
+    REQUIRE(first != nullptr);
+    CHECK(first->logStartOffset() == start);
+    CHECK(first->logEndOffset() == end);
+    CHECK(first->config().retention.retentionMs == 1'000);
+    CHECK(first->read(Offset(0), kBigFetch).error == ReadError::BelowLogStart);
+}
