@@ -630,8 +630,31 @@ the network layer hands that straight to `sendfile`. If any read path in this co
 returns a `vector<uint8_t>`, zero-copy is dead — so decision 13 is enforced by the return type
 rather than by a comment asking politely.
 
-It also means **`Log::read` performs no I/O**. It resolves a location, which is why the lock it
-takes is held for nanoseconds; the blocking read happens later, on an I/O thread.
+**Amended at M2 — `Log::read` does perform bounded I/O.** This section originally claimed it
+performed none. That cannot be true while the index is sparse: an entry every 4 KB gets a lookup
+*close* to its target, and the batch boundary can only be found by reading batch headers forward
+from there. Kafka does the same. What survives, and is the part decision 13 actually needs, is
+that the read path reads **headers only, never a record body** — so the payload still leaves by
+`sendfile`, untouched, and the scan is bounded by one index interval (a page or two, normally
+already page-cached). The "lock held for nanoseconds" line goes with it: the shared lock is held
+across that scan.
+
+#### A range starts on a batch boundary; it does not end on one
+
+**Added at M2.** The range's start is exactly the first byte of the batch *containing* the
+requested offset — a batch is the unit of transfer, so a consumer asking for offset 503 of a
+batch spanning 500..504 receives the whole batch and skips what it already has.
+
+The end is simply capped at the fetch size, wherever that falls. Aligning it would mean parsing a
+header per batch in the range — one `pread` each, so roughly a thousand syscalls for a 1 MB fetch
+of small batches — to save the consumer a check it has to make anyway. So the fetch contract is
+Kafka's: **a response may end mid-batch, and the consumer discards an incomplete trailing
+batch** rather than treating it as corruption.
+
+One exception, and it is not optional: a range always carries **at least one whole batch** when
+one is available, even if that exceeds the fetch size. Without it, a consumer whose fetch size is
+smaller than the next batch polls forever and never advances — a permanent stall caused by
+nothing but a conservative setting.
 
 #### Reads return a result, not an exception
 
@@ -702,12 +725,21 @@ public:
     // Single-appender only: this partition's I/O thread and nobody else.
     void append(Offset baseOffset, span<const uint8_t> batchBytes);
     void flush();
-    bool shouldRoll(const RollPolicy&) const;                            // size OR age
+    bool shouldRoll(int64_t nowMs) const;              // size OR age OR a full index
 
     // Consumes the active segment and yields an immutable one.
     static unique_ptr<SealedSegment> seal(unique_ptr<ActiveSegment>);
 };
 ```
+
+**Amended at M2 — three changes to `shouldRoll`.** It takes only the current time: the segment
+holds the policy it was created with, and passing a second copy per call let `append` and
+`shouldRoll` disagree about the index interval. Time is a parameter rather than a clock read so
+tests can advance it without sleeping, and so M3's maintenance thread can read the clock once and
+sweep every partition against the same instant. And it has a **third** trigger the original two
+did not name: **a full index forces a roll.** Once entries start being dropped, everything
+claiming to be bounded by one index interval — the read scan, and the header walk that reopens a
+sealed segment — quietly degrades into a scan of the whole segment.
 
 The signature carrying the guarantee is `seal()`: it **consumes** its argument, so after the
 call the caller's pointer is null. There is no way to hold a writable handle to a sealed
@@ -734,11 +766,25 @@ private:
 };
 ```
 
-**Every segment's index starts with an entry for its own base offset at position 0**, written
-when the segment is created rather than waiting for the first 4 KB boundary. That is why
-`lookup` returns an `Entry` rather than an `optional<Entry>`: the "greatest entry ≤ target"
-search can never come up empty for an offset the segment actually holds, so the hot read path
-carries no special case.
+**Amended at M2 — no base entry is written, and `lookup` is total a different way.** The plan
+here was to write an entry for the segment's own base offset at creation, so that the "greatest
+entry ≤ target" search could never come up empty and `lookup` could return a plain `Entry`.
+
+`lookup` does return a plain `Entry`, but by **falling back to `{0, 0}`** — the segment's own
+beginning, which is always a correct place to start scanning from. That is strictly more robust,
+because it also covers two cases a written base entry cannot: a 0-byte index file, and an index
+emptied by recovery. It also keeps the paragraph below true, which a base entry would have
+falsified: with one always present, the smallest possible trimmed index is 8 bytes, and the
+low-traffic case described there could never arise.
+
+**Position 0 is reserved as a consequence, and it earns its keep.** An index whose segment was
+still active when the broker died is preallocated to full length with a zero-filled tail, so
+trusting the file size would hand out `{0, 0}` padding as though it were data. `position == 0` is
+therefore the marker that separates real entries from padding, found by one binary search rather
+than by scanning — which would fault in every page of a 10 MiB index, per segment, at startup.
+`append` rejects position 0 to keep that sound, and nothing is lost: `lookup` already answers
+"the start of this segment" when it has nothing better, so an entry pointing at byte 0 would
+carry no information anyway.
 
 Independently, a **zero-length index file must still open**. A segment that rolled on age with
 less than one index interval of data written has no entries at all, and its trimmed index is 0
