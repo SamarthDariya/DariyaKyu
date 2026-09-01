@@ -30,13 +30,13 @@ The design is written up in full, with the reasoning and the rejected alternativ
 ## Status
 
 **Design: complete.** 23 conceptual decisions locked, structural design in progress.
-**Implementation: M2 — the log engine works.**
+**Implementation: M3 — partitions, retention and a maintenance thread.**
 
 | Phase | Status |
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
-| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 3 of 6 chunks, chunk 1 amended by M2 |
-| Implementation — M0…M9 | 🔸 M0–M2 complete, M3 next |
+| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 3 of 6 chunks; chunks 1-2 amended by M2-M3. **Chunk 4 blocks M4.** |
+| Implementation — M0…M9 | 🔸 M0–M3 complete, M4 next |
 
 ---
 
@@ -81,12 +81,17 @@ is merged by PR.
 - [x] suite green locally — 137 cases, 3125 assertions
 - [x] green under ASan/UBSan and TSan
 
-### M3 — Topics and retention ⬜
-- [ ] `LogManager` — partition registry, startup scan
-- [ ] `partition.meta` — self-describing partitions
-- [ ] retention by age **and** by partition bytes
-- [ ] maintenance thread: retention **and** age-based rolling of idle partitions
-- [ ] `OffsetOutOfRange` on reads below the log start
+### M3 — Topics and retention ✅
+- [x] `LogManager` — partition registry, startup scan, create and remove
+- [x] `partition.meta` — self-describing partitions, atomic replace
+- [x] retention by age **and** by partition bytes
+- [x] maintenance thread: retention **and** age-based rolling of idle partitions
+- [x] `BelowLogStart` on reads below the log start
+- [x] deferred deletion — an in-flight `FileRange` survives retention
+- [x] topic names validated before they become directory names
+- [x] `dariyakyu-dump` — read-only partition inspector
+- [x] suite green locally — 4 storage suites, 232 cases, 3621 assertions
+- [x] green under ASan/UBSan and TSan
 
 ### M4 — First real broker ⬜
 - [ ] wire framing, request header, `correlationId` pipelining
