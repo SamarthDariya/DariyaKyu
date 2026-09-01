@@ -21,6 +21,7 @@
 #include "storage/offset_index.hpp"
 #include "storage/record_batch.hpp"
 #include "storage/log.hpp"
+#include "storage/partition_meta.hpp"
 #include "storage/segment.hpp"
 
 using namespace std;
@@ -3153,4 +3154,123 @@ TEST_CASE("Age and bytes together delete no more than either alone would need") 
 
     CHECK(log2->logStartOffset() >= ageOnly);
     CHECK(log2->totalSizeBytes() <= 900);
+}
+
+// ===========================================================================
+// partition.meta — encoding and atomic write
+// ===========================================================================
+
+namespace {
+
+PartitionMeta sampleMeta() {
+    PartitionMeta meta;
+    meta.tp = TopicPartition{"orders", 3};
+    meta.config.roll.maxSegmentBytes       = 1234;
+    meta.config.roll.maxSegmentAgeMs       = 5678;
+    meta.config.roll.indexIntervalBytes    = 91011;
+    meta.config.roll.maxIndexBytes         = 121314;
+    meta.config.retention.retentionMs      = 151617;
+    meta.config.retention.retentionBytes   = 181920;
+    meta.config.retention.segmentDeleteDelayMs = 212223;
+    return meta;
+}
+
+uint32_t be32At(const vector<uint8_t>& bytes, size_t at) {
+    return (uint32_t(bytes[at]) << 24) | (uint32_t(bytes[at + 1]) << 16) |
+           (uint32_t(bytes[at + 2]) << 8) | uint32_t(bytes[at + 3]);
+}
+
+}  // namespace
+
+TEST_CASE("The encoded meta opens with a magic and a version") {
+    const auto bytes = encodePartitionMeta(sampleMeta());
+
+    // The magic is what makes pointing this at the wrong file fail immediately
+    // rather than decoding lengths out of unrelated bytes.
+    REQUIRE(bytes.size() > 6);
+    CHECK(be32At(bytes, 0) == PartitionMeta::kMagic);
+    CHECK(bytes[0] == 'D');
+    CHECK(bytes[1] == 'K');
+    CHECK(bytes[2] == 'P');
+    CHECK(bytes[3] == 'M');
+
+    // Version next, so a future format change can be detected before anything
+    // after it is interpreted.
+    CHECK(bytes[4] == 0);
+    CHECK(bytes[5] == PartitionMeta::kVersion);
+}
+
+TEST_CASE("The encoding is a fixed size plus the topic name") {
+    const auto shortName = encodePartitionMeta(sampleMeta());
+
+    PartitionMeta longer = sampleMeta();
+    longer.tp.topic = "orders-with-a-much-longer-name";
+    const auto longName = encodePartitionMeta(longer);
+
+    // Length-prefixed, so the difference is exactly the extra characters.
+    CHECK(longName.size() - shortName.size() ==
+          longer.tp.topic.size() - string("orders").size());
+}
+
+TEST_CASE("Unlimited retention bytes encodes as -1") {
+    PartitionMeta meta = sampleMeta();
+    meta.config.retention.retentionBytes = nullopt;
+    const auto unlimited = encodePartitionMeta(meta);
+
+    meta.config.retention.retentionBytes = 0;
+    const auto zero = encodePartitionMeta(meta);
+
+    // The two must not encode the same. This is the boundary where the optional
+    // becomes a sentinel, and confusing them would turn "keep everything" into
+    // "keep nothing".
+    CHECK(unlimited.size() == zero.size());
+    CHECK(unlimited != zero);
+}
+
+TEST_CASE("Writing the meta leaves one file and no temporary") {
+    TempDir dir("meta-write");
+    const filesystem::path partition = dir.file("orders-3");
+    filesystem::create_directories(partition);
+
+    writePartitionMeta(partition, sampleMeta());
+
+    const auto target = partition / PartitionMeta::kFileName;
+    CHECK(filesystem::exists(target));
+    CHECK(filesystem::file_size(target) == encodePartitionMeta(sampleMeta()).size());
+
+    // The temp file is renamed, not copied, so nothing should be left behind.
+    CHECK_FALSE(filesystem::exists(partition / "partition.meta.tmp"));
+}
+
+TEST_CASE("Rewriting the meta replaces it rather than appending") {
+    TempDir dir("meta-rewrite");
+    const filesystem::path partition = dir.file("orders-3");
+    filesystem::create_directories(partition);
+
+    writePartitionMeta(partition, sampleMeta());
+    const auto size = filesystem::file_size(partition / PartitionMeta::kFileName);
+
+    PartitionMeta changed = sampleMeta();
+    changed.config.retention.retentionMs = 999;
+    writePartitionMeta(partition, changed);
+
+    CHECK(filesystem::file_size(partition / PartitionMeta::kFileName) == size);
+    CHECK(readFile(partition / PartitionMeta::kFileName) == encodePartitionMeta(changed));
+}
+
+TEST_CASE("A leftover temporary from an interrupted write is not appended to") {
+    TempDir dir("meta-stale-temp");
+    const filesystem::path partition = dir.file("orders-3");
+    filesystem::create_directories(partition);
+
+    // What a crash mid-write leaves: a temp file with partial or unrelated
+    // content. Without truncating it first, the next write would produce a file
+    // with two records in it and a length field that lies.
+    writeFile(partition / "partition.meta.tmp", vector<uint8_t>(500, 0xEE));
+
+    writePartitionMeta(partition, sampleMeta());
+
+    CHECK(readFile(partition / PartitionMeta::kFileName) ==
+          encodePartitionMeta(sampleMeta()));
+    CHECK_FALSE(filesystem::exists(partition / "partition.meta.tmp"));
 }
