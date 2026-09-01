@@ -30,13 +30,13 @@ The design is written up in full, with the reasoning and the rejected alternativ
 ## Status
 
 **Design: complete.** 23 conceptual decisions locked, structural design in progress.
-**Implementation: M0.**
+**Implementation: M2 — the log engine works.**
 
 | Phase | Status |
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
-| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 3 of 6 chunks |
-| Implementation — M0…M9 | 🔸 M0–M1 complete, M2 in progress |
+| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 3 of 6 chunks, chunk 1 amended by M2 |
+| Implementation — M0…M9 | 🔸 M0–M2 complete, M3 next |
 
 ---
 
@@ -68,14 +68,18 @@ is merged by PR.
 - [x] round-trip and corruption tests — 32 cases, 203 assertions
 - [x] green under ASan/UBSan and TSan
 
-### M2 — The log engine 🔸
+### M2 — The log engine ✅
 - [x] `OffsetIndex` — fixed-size entries, binary search, mmap'd
-- [ ] `SegmentBase` / `SealedSegment` / `ActiveSegment`
-- [ ] sparse indexing every 4 KB of log written
-- [ ] segment rolling on size **or** age
-- [ ] `Log` — append, read, roll, truncate
-- [ ] crash recovery: CRC scan, truncate at first bad batch
-- [ ] `Log::read` returns a `FileRange`, never bytes
+- [x] `SegmentBase` / `SealedSegment` / `ActiveSegment`, immutability by ownership
+- [x] sparse indexing every 4 KB of log written
+- [x] segment rolling on size, age, **or** a full index
+- [x] `Log` — append, read, roll, truncate, startup scan
+- [x] crash recovery: CRC scan, truncate at first bad batch, index rebuilt
+- [x] `Log::read` returns a `FileRange`, never bytes
+- [x] offsets assigned and stamped in place, checksum untouched
+- [x] `ReadResult` — caught-up reads cost no exception
+- [x] suite green locally — 137 cases, 3125 assertions
+- [x] green under ASan/UBSan and TSan
 
 ### M3 — Topics and retention ⬜
 - [ ] `LogManager` — partition registry, startup scan
