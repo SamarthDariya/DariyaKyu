@@ -67,6 +67,18 @@ target_link_libraries(dariyakyu_storage PUBLIC dariyakyu_common)
 target_compile_options(dariyakyu_storage PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+#
+# dariyakyu-dump inspects a partition directory read-only. It exists so the
+# storage layer can be looked at rather than only asserted about, and it becomes
+# a dariyakyu-cli subcommand at M4.
+
+add_executable(dariyakyu-dump apps/dariyakyu_dump.cpp)
+target_link_libraries(dariyakyu-dump PRIVATE dariyakyu_storage)
+target_compile_options(dariyakyu-dump PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
