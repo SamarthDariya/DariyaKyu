@@ -3021,3 +3021,136 @@ TEST_CASE("Retention survives a restart") {
     CHECK(reopened->logEndOffset() == end);
     CHECK(reopened->read(Offset(0), kBigFetch).error == ReadError::BelowLogStart);
 }
+
+// ===========================================================================
+// Log: retention by bytes
+// ===========================================================================
+
+TEST_CASE("Retention deletes oldest-first until the partition is under its byte limit") {
+    TempDir dir("ret-bytes");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs    = 1'000'000'000;   // age never fires
+    config.retention.retentionBytes = 1500;
+
+    auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+    REQUIRE(log->totalSizeBytes() > 1500);
+    const Offset startBefore = log->logStartOffset();
+
+    log->applyRetention(100'000);
+
+    CHECK(log->totalSizeBytes() <= 1500);
+    CHECK(log->logStartOffset() > startBefore);
+    CHECK(log->graveyardSize() > 0);
+
+    // Deleted from the oldest end, so what survives is a contiguous run ending at
+    // the log end — never a hole in the middle.
+    for (int64_t offset = log->logStartOffset().value(); offset < log->logEndOffset().value();
+         ++offset)
+        CHECK(log->read(Offset(offset), kBigFetch).ok());
+}
+
+TEST_CASE("A partition already under its byte limit is left alone") {
+    TempDir dir("ret-bytes-under");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs    = 1'000'000'000;
+    config.retention.retentionBytes = 1'000'000;
+
+    auto log = logWithAgedSegments(partition, config, 20, 100'000, 1'000);
+    const size_t before = log->segmentCount();
+
+    log->applyRetention(100'000);
+
+    CHECK(log->segmentCount() == before);
+    CHECK(log->graveyardSize() == 0);
+}
+
+TEST_CASE("No byte limit means no byte-based deletion, however large the partition") {
+    TempDir dir("ret-bytes-unlimited");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs = 1'000'000'000;
+    REQUIRE_FALSE(config.retention.bytesLimited());
+
+    auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+    const size_t before = log->segmentCount();
+
+    log->applyRetention(100'000);
+
+    CHECK(log->segmentCount() == before);
+    CHECK(log->graveyardSize() == 0);
+}
+
+TEST_CASE("A byte limit below one segment deletes all it can and stops") {
+    TempDir dir("ret-bytes-too-small");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs    = 1'000'000'000;
+    config.retention.retentionBytes = 1;   // absurdly low
+
+    auto log = logWithAgedSegments(partition, config, 30, 100'000, 1'000);
+
+    log->applyRetention(100'000);
+
+    // Every sealed segment goes; the active one cannot. So the partition sits
+    // permanently over its limit, having deleted everything it was allowed to.
+    // Documented behaviour, not a bug — but the shape of it is worth pinning.
+    CHECK(log->segmentCount() == 1);
+    CHECK(log->totalSizeBytes() > 1);
+    CHECK(log->logEndOffset() == Offset(30));
+    CHECK(log->read(log->logStartOffset(), kBigFetch).ok());
+}
+
+TEST_CASE("The byte limit still fires when timestamps block age retention") {
+    TempDir dir("ret-bytes-backstop");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.roll.maxSegmentBytes     = 400;
+    config.retention.retentionMs    = 1'000;
+    config.retention.retentionBytes = 1500;
+
+    // The first record carries a timestamp far in the future — a producer with a
+    // broken clock. Age retention stops at that segment and can never get past
+    // it, so without a byte limit this partition would grow forever.
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+    {
+        auto bytes = makeUnstampedBatch(9'000'000'000'000LL, 48);
+        log->append(bytes);
+    }
+    for (int i = 1; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(100'000 + i * 1'000, 48);
+        log->append(bytes);
+    }
+    REQUIRE(log->totalSizeBytes() > 1500);
+
+    log->applyRetention(100'000 + 40 * 1'000);
+
+    // The byte limit does not consult timestamps at all, which is precisely what
+    // makes it the backstop.
+    CHECK(log->totalSizeBytes() <= 1500);
+    CHECK(log->logStartOffset() > Offset(0));
+}
+
+TEST_CASE("Age and bytes together delete no more than either alone would need") {
+    TempDir dir("ret-both");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs    = 10'000;
+    config.retention.retentionBytes = 1'000'000;   // generous, so age does the work
+
+    auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+    log->applyRetention(100'000 + 39 * 1'000);
+    const Offset ageOnly = log->logStartOffset();
+
+    // Same log, same age window, but a tight byte limit as well: it can only ever
+    // remove more, never less.
+    TempDir dir2("ret-both-2");
+    const filesystem::path partition2 = dir2.file("orders-0");
+    config.retention.retentionBytes = 900;
+    auto log2 = logWithAgedSegments(partition2, config, 40, 100'000, 1'000);
+    log2->applyRetention(100'000 + 39 * 1'000);
+
+    CHECK(log2->logStartOffset() >= ageOnly);
+    CHECK(log2->totalSizeBytes() <= 900);
+}
