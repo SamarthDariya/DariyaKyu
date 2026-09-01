@@ -1,7 +1,11 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -128,6 +132,32 @@ public:
     // on. Nothing above this layer may cache one.
     void removePartition(const TopicPartition& tp, std::int64_t nowMs);
 
+    // Runs the sweep on a background thread every `intervalMs`.
+    //
+    // The wait is on a condition variable rather than a sleep, so stopping is
+    // immediate. With a plain sleep, a broker configured to sweep every five
+    // minutes would take up to five minutes to shut down — and a shutdown that
+    // slow gets SIGKILLed by whatever is supervising it, which is how a clean
+    // path turns into a crash-recovery path on every deploy.
+    void startMaintenance(std::int64_t intervalMs);
+
+    // Signals the thread and joins it. Idempotent, and the destructor calls it:
+    // a thread that outlived this object would be touching freed partitions.
+    void stopMaintenance();
+
+    // Sweeps completed, and sweeps that threw.
+    //
+    // A sweep that throws must not take the broker down — a single unreadable
+    // file would stop every partition being maintained. But swallowing the
+    // exception silently would leave retention quietly dead with nothing to show
+    // for it, so failures are counted where an operator can see them.
+    std::uint64_t sweepCount() const { return sweepCount_.load(std::memory_order_acquire); }
+    std::uint64_t sweepFailures() const {
+        return sweepFailures_.load(std::memory_order_acquire);
+    }
+
+    ~LogManager();
+
     // One pass of housekeeping over every partition on the broker.
     //
     // Four jobs, and the FIRST is the one that is easy to forget: a partition
@@ -172,6 +202,17 @@ private:
         std::int64_t          removedAtMs = 0;
     };
     std::vector<RemovedPartition> removed_;
+
+    // The maintenance thread and its own small state. Deliberately a separate
+    // mutex from logsMutex_: this one is held only while deciding whether to wake,
+    // and must never be held while the sweep itself runs and takes logsMutex_.
+    std::thread             maintenanceThread_;
+    std::mutex              maintenanceMutex_;
+    std::condition_variable maintenanceWake_;
+    bool                    stopRequested_ = false;
+
+    std::atomic<std::uint64_t> sweepCount_{0};
+    std::atomic<std::uint64_t> sweepFailures_{0};
 
     // mutable so const lookups can take a shared lock. Guards which entries
     // exist — never the contents of a Log, which does its own.

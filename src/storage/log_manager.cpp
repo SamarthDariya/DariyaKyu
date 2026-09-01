@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -173,6 +174,69 @@ void LogManager::removePartition(const TopicPartition& tp, int64_t nowMs) {
 
     removed_.push_back({std::move(it->second), to, nowMs});
     logs_.erase(it);
+}
+
+LogManager::~LogManager() {
+    // Before any member is destroyed. The destructor body runs first, so the
+    // thread is joined while logs_ and removed_ are still alive — otherwise it
+    // could be mid-sweep over partitions being freed underneath it.
+    //
+    // Destructors must not throw, so a failure to join is swallowed. There is
+    // nothing useful to do with it during teardown.
+    try {
+        stopMaintenance();
+    } catch (...) {
+    }
+}
+
+void LogManager::startMaintenance(int64_t intervalMs) {
+    if (intervalMs <= 0)
+        throw Error("maintenance interval must be positive, got " + to_string(intervalMs));
+    if (maintenanceThread_.joinable())
+        throw Error("maintenance is already running");
+
+    {
+        lock_guard lock(maintenanceMutex_);
+        stopRequested_ = false;
+    }
+
+    maintenanceThread_ = thread([this, intervalMs] {
+        unique_lock lock(maintenanceMutex_);
+        while (true) {
+            // Returns true only if the predicate became true — i.e. stop was
+            // signalled — and false on timeout, which is the ordinary case.
+            if (maintenanceWake_.wait_for(lock, chrono::milliseconds(intervalMs),
+                                          [this] { return stopRequested_; }))
+                return;
+
+            // The sweep takes logsMutex_, so this lock must be released for it.
+            // Holding both would mean a stop request had to wait for a sweep that
+            // was itself waiting on partition locks.
+            lock.unlock();
+            try {
+                runMaintenance(wallClockMillis());
+                sweepCount_.fetch_add(1, memory_order_release);
+            } catch (...) {
+                // One unreadable file must not stop every partition being
+                // maintained, so this continues — but counted, because retention
+                // failing silently is how a disk fills with nobody knowing.
+                sweepFailures_.fetch_add(1, memory_order_release);
+            }
+            lock.lock();
+        }
+    });
+}
+
+void LogManager::stopMaintenance() {
+    {
+        lock_guard lock(maintenanceMutex_);
+        stopRequested_ = true;
+    }
+    // Notified outside the lock: the woken thread needs it to re-check the
+    // predicate, and signalling while holding it just makes it wait.
+    maintenanceWake_.notify_all();
+
+    if (maintenanceThread_.joinable()) maintenanceThread_.join();
 }
 
 void LogManager::runMaintenance(int64_t nowMs) {

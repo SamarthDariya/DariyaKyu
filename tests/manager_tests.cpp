@@ -780,3 +780,149 @@ TEST_CASE("A sweep running against a live appender is safe") {
     for (int64_t offset = log.logStartOffset().value(); offset < kBatches; ++offset)
         CHECK(log.read(Offset(offset), kBigFetch).ok());
 }
+
+// ===========================================================================
+// LogManager: the maintenance thread
+// ===========================================================================
+
+namespace {
+
+// Spins until `predicate` holds or the deadline passes. Used instead of sleeping
+// for a fixed time: a fixed sleep is either too short on a loaded machine (flaky)
+// or too long everywhere else (slow).
+template <typename Predicate>
+bool waitFor(Predicate predicate, chrono::milliseconds limit = chrono::milliseconds(5000)) {
+    const auto deadline = chrono::steady_clock::now() + limit;
+    while (chrono::steady_clock::now() < deadline) {
+        if (predicate()) return true;
+        this_thread::sleep_for(chrono::milliseconds(1));
+    }
+    return predicate();
+}
+
+}  // namespace
+
+TEST_CASE("The maintenance thread sweeps on its interval") {
+    TempDir dir("mgr-thread-sweeps");
+    LogManager manager(dir.file("data"), testConfig());
+    manager.createPartition(TopicPartition{"orders", 0});
+
+    CHECK(manager.sweepCount() == 0);
+
+    manager.startMaintenance(1);
+    CHECK(waitFor([&] { return manager.sweepCount() >= 3; }));
+    manager.stopMaintenance();
+
+    CHECK(manager.sweepCount() >= 3);
+    CHECK(manager.sweepFailures() == 0);
+}
+
+TEST_CASE("Stopping is immediate rather than waiting out the interval") {
+    TempDir dir("mgr-thread-prompt-stop");
+    LogManager manager(dir.file("data"), testConfig());
+
+    // A ten-minute interval. With a plain sleep, this stop would take ten
+    // minutes — long enough that whatever supervises the broker SIGKILLs it, and
+    // every clean shutdown becomes a crash-recovery path on the next boot.
+    manager.startMaintenance(600'000);
+
+    const auto before = chrono::steady_clock::now();
+    manager.stopMaintenance();
+    const auto elapsed = chrono::steady_clock::now() - before;
+
+    CHECK(elapsed < chrono::seconds(2));
+}
+
+TEST_CASE("Stopping twice, and stopping without starting, are both harmless") {
+    TempDir dir("mgr-thread-stop-idempotent");
+    LogManager manager(dir.file("data"), testConfig());
+
+    CHECK_NOTHROW(manager.stopMaintenance());   // never started
+
+    manager.startMaintenance(1);
+    CHECK_NOTHROW(manager.stopMaintenance());
+    CHECK_NOTHROW(manager.stopMaintenance());
+}
+
+TEST_CASE("Starting twice is refused, and a non-positive interval is refused") {
+    TempDir dir("mgr-thread-start-twice");
+    LogManager manager(dir.file("data"), testConfig());
+
+    CHECK_THROWS_AS(manager.startMaintenance(0), Error);
+    CHECK_THROWS_AS(manager.startMaintenance(-1), Error);
+
+    manager.startMaintenance(50);
+    CHECK_THROWS_AS(manager.startMaintenance(50), Error);
+    manager.stopMaintenance();
+
+    // And it can be started again afterwards.
+    CHECK_NOTHROW(manager.startMaintenance(50));
+    manager.stopMaintenance();
+}
+
+TEST_CASE("The destructor stops the thread") {
+    TempDir dir("mgr-thread-destructor");
+    {
+        LogManager manager(dir.file("data"), testConfig());
+        manager.createPartition(TopicPartition{"orders", 0});
+        manager.startMaintenance(1);
+        REQUIRE(waitFor([&] { return manager.sweepCount() >= 1; }));
+        // No stopMaintenance() — the destructor has to do it. A thread that
+        // outlived this object would be sweeping partitions that no longer exist.
+    }
+    // Reaching here without a crash or a std::terminate from an unjoined thread
+    // is the assertion.
+    CHECK(true);
+}
+
+TEST_CASE("The thread keeps retention working while a partition is written to") {
+    TempDir dir("mgr-thread-live");
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes           = 400;
+    config.retention.retentionMs          = 1;
+    config.retention.segmentDeleteDelayMs = 0;
+
+    LogManager manager(dir.file("data"), config);
+    Log& log = manager.createPartition(TopicPartition{"orders", 0}, config);
+
+    manager.startMaintenance(1);
+
+    constexpr int kBatches = 1500;
+    for (int i = 0; i < kBatches; ++i) {
+        auto bytes = makeUnstampedBatch(100'000 + i, 48);
+        log.append(bytes);
+    }
+
+    // Retention on a live partition: the sweep must have collected something
+    // without ever tripping over the appender.
+    CHECK(waitFor([&] { return log.logStartOffset() > Offset(0); }));
+    manager.stopMaintenance();
+
+    CHECK(manager.sweepFailures() == 0);
+    CHECK(log.logEndOffset() == Offset(kBatches));
+
+    // Whatever was collected, what remains is a contiguous readable run.
+    for (int64_t offset = log.logStartOffset().value(); offset < kBatches; ++offset)
+        CHECK(log.read(Offset(offset), kBigFetch).ok());
+}
+
+TEST_CASE("Partitions can be created and removed while the thread runs") {
+    TempDir dir("mgr-thread-churn");
+    LogConfig config = testConfig();
+    config.retention.segmentDeleteDelayMs = 0;
+
+    LogManager manager(dir.file("data"), config);
+    manager.startMaintenance(1);
+
+    // The sweep holds a shared lock over the registry; these take it exclusively.
+    for (int i = 0; i < 40; ++i) {
+        manager.createPartition(TopicPartition{"orders", i});
+        if (i % 2 == 0) manager.removePartition(TopicPartition{"orders", i}, wallClockMillis());
+    }
+
+    CHECK(waitFor([&] { return manager.sweepCount() >= 2; }));
+    manager.stopMaintenance();
+
+    CHECK(manager.partitionCount() == 20);
+    CHECK(manager.sweepFailures() == 0);
+}
