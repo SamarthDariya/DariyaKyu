@@ -4,12 +4,29 @@
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 
 #include "common/types.hpp"
 #include "storage/log.hpp"
 
 namespace dariyakyu::storage {
+
+// "orders-3" -> TopicPartition{"orders", 3}. The inverse of
+// TopicPartition::toString(), and the reason that function's comment warns the
+// encoding is ambiguous in reverse: a topic name may itself contain dashes, so
+// "my-topic-5" could split three ways. It always splits at the LAST dash, which
+// is what Kafka does and what makes the round trip well-defined.
+//
+// Strict, and throws CorruptData on anything else. Notably it requires the round
+// trip to be exact, which rejects "orders-03": that parses as partition 3, but
+// re-encoding gives "orders-3", so the same partition would have two directory
+// names and whichever the scan met first would win.
+TopicPartition topicPartitionFromDirName(const std::string& name);
+
+// Reserved for the controller's own state (data/meta/cluster.meta), so it is not
+// a partition and the startup scan steps over it.
+inline constexpr const char* kMetaDirName = "meta";
 
 // Every partition this broker hosts.
 //
@@ -50,6 +67,23 @@ public:
     // this layer may hold one across a topic deletion — which is why M4's
     // request handler will look up per request rather than caching.
     Log* get(const TopicPartition& tp) const;
+
+    // Opens every partition already on disk. The startup scan.
+    //
+    // Each partition's own configuration is read from its partition.meta, so this
+    // does not impose the manager's defaults on partitions that were configured
+    // differently — the defaults apply only to a partition that has no meta file
+    // and no records, which is what an interrupted create leaves behind.
+    //
+    // Strict: a directory it cannot interpret as a partition aborts the scan
+    // rather than being skipped. `data/` belongs to dariyakyu, and silently
+    // ignoring a directory that should have been a partition is the worst
+    // outcome — the data stays on disk, invisible, while consumers get "not
+    // hosted here" forever with nothing to explain it.
+    //
+    // Startup only. Calling it twice would try to open partitions that are
+    // already open, putting two writable handles on one active segment.
+    void loadAll();
 
     // Creates a partition, registers it, and returns it.
     //
