@@ -10,11 +10,11 @@ using namespace std;
 
 namespace dariyakyu::storage {
 
-Log::Log(TopicPartition tp, filesystem::path dir, RollPolicy policy,
+Log::Log(TopicPartition tp, filesystem::path dir, LogConfig config,
          map<Offset, unique_ptr<SealedSegment>> sealed, unique_ptr<ActiveSegment> active)
     : tp_(std::move(tp)),
       dir_(std::move(dir)),
-      policy_(policy),
+      config_(config),
       sealed_(std::move(sealed)),
       active_(std::move(active)) {
     // Both offsets start where the active segment does. For a new log that is
@@ -23,7 +23,7 @@ Log::Log(TopicPartition tp, filesystem::path dir, RollPolicy policy,
     highWatermark_.store(active_->nextOffset(), memory_order_relaxed);
 }
 
-unique_ptr<Log> Log::create(TopicPartition tp, filesystem::path dir, RollPolicy policy) {
+unique_ptr<Log> Log::create(TopicPartition tp, filesystem::path dir, LogConfig config) {
     error_code ec;
     filesystem::create_directories(dir, ec);
     if (ec) throw IoError("create_directories", dir, ec.value());
@@ -31,13 +31,13 @@ unique_ptr<Log> Log::create(TopicPartition tp, filesystem::path dir, RollPolicy 
     // A new partition's first segment is based at offset 0 — the first record it
     // will ever hold. ActiveSegment::create refuses if a segment is already
     // there, so this cannot quietly adopt an existing partition.
-    auto active = ActiveSegment::create(dir, Offset(0), policy);
+    auto active = ActiveSegment::create(dir, Offset(0), config.roll);
 
     return unique_ptr<Log>(
-        new Log(std::move(tp), std::move(dir), policy, {}, std::move(active)));
+        new Log(std::move(tp), std::move(dir), config, {}, std::move(active)));
 }
 
-unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, RollPolicy policy) {
+unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, LogConfig config) {
     if (!filesystem::is_directory(dir)) throw IoError("open", dir, ENOENT);
 
     // Only .log files. A partition directory also holds .index files and, from
@@ -60,9 +60,9 @@ unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, RollPolicy po
     // creating the segment in the process's working directory instead of the
     // partition. Exactly the hazard Log::create documents, in a second place.
     if (logs.empty()) {
-        auto active = ActiveSegment::create(dir, Offset(0), policy);
+        auto active = ActiveSegment::create(dir, Offset(0), config.roll);
         return unique_ptr<Log>(
-            new Log(std::move(tp), std::move(dir), policy, {}, std::move(active)));
+            new Log(std::move(tp), std::move(dir), config, {}, std::move(active)));
     }
 
     // The map is ordered, so the last key is the newest segment.
@@ -89,9 +89,9 @@ unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, RollPolicy po
                               expected.toString() + " — a segment file is missing");
     }
 
-    auto active = ActiveSegment::recover(newest->second, policy);
+    auto active = ActiveSegment::recover(newest->second, config.roll);
 
-    return unique_ptr<Log>(new Log(std::move(tp), std::move(dir), policy, std::move(sealed),
+    return unique_ptr<Log>(new Log(std::move(tp), std::move(dir), config, std::move(sealed),
                                    std::move(active)));
 }
 
@@ -198,7 +198,7 @@ void Log::maybeRoll(int64_t nowMs) {
     // it adopts the empty one and treats the previous one as sealed — untrimmed
     // index and all, which OffsetIndex::openSealed already handles. Survivable,
     // which is the most that can be asked of a crash window.
-    auto next = ActiveSegment::create(dir_, base, policy_);
+    auto next = ActiveSegment::create(dir_, base, config_.roll);
 
     // Exclusive, and this is the only place in the write path that takes a lock.
     // Readers hold a shared lock across a whole read, so this waits for them —
@@ -246,19 +246,19 @@ void Log::truncateTo(Offset offset) {
     // at the ceiling, truncates the file, and rebuilds the index — which the
     // truncation has just invalidated.
     if (activeHoldsOffset) {
-        active_ = ActiveSegment::recover(activeLog, policy_, offset);
+        active_ = ActiveSegment::recover(activeLog, config_.roll, offset);
     } else if (!sealed_.empty()) {
         // The newest survivor is promoted back to writable. Erase it from the map
         // first: a segment must never be reachable as both sealed and active.
         const auto last = prev(sealed_.end());
         const filesystem::path path = last->second->logFilePath();
         sealed_.erase(last);
-        active_ = ActiveSegment::recover(path, policy_, offset);
+        active_ = ActiveSegment::recover(path, config_.roll, offset);
     } else {
         // Nothing survived. The log restarts empty at `offset` rather than at
         // zero, because offsets are never reused — a consumer that had read to
         // 500 must not be handed different records numbered 400.
-        active_ = ActiveSegment::create(dir_, offset, policy_);
+        active_ = ActiveSegment::create(dir_, offset, config_.roll);
     }
 
     const Offset next = active_->nextOffset();

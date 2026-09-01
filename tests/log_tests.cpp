@@ -608,6 +608,17 @@ RollPolicy testPolicy() {
     return policy;
 }
 
+// The same small policy wrapped in a full config, for Log-level tests.
+LogConfig configWith(const RollPolicy& roll) {
+    LogConfig config;
+    config.roll = roll;
+    return config;
+}
+
+LogConfig testConfig() {
+    return configWith(testPolicy());
+}
+
 }  // namespace
 
 TEST_CASE("A new segment creates both files and starts empty at its base offset") {
@@ -1831,7 +1842,7 @@ TEST_CASE("A new log has one empty segment based at offset zero") {
     TempDir dir("log-create");
     const filesystem::path partition = dir.file("orders-0");
 
-    auto log = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, testConfig());
 
     CHECK(log->topicPartition().topic == "orders");
     CHECK(log->topicPartition().partition == 0);
@@ -1853,7 +1864,7 @@ TEST_CASE("Creating a log makes its directory") {
     const filesystem::path partition = dir.file("deep/orders-3");
     REQUIRE_FALSE(filesystem::exists(partition));
 
-    auto log = Log::create(TopicPartition{"orders", 3}, partition, testPolicy());
+    auto log = Log::create(TopicPartition{"orders", 3}, partition, testConfig());
     CHECK(filesystem::is_directory(partition));
     CHECK(log->segmentCount() == 1);
 }
@@ -1862,17 +1873,17 @@ TEST_CASE("Creating a log over an existing partition is refused") {
     TempDir dir("log-create-twice");
     const filesystem::path partition = dir.file("orders-0");
 
-    auto first = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+    auto first = Log::create(TopicPartition{"orders", 0}, partition, testConfig());
 
     // Adopting an existing partition is a different operation with different
     // rules — it has to recover the newest segment rather than assume an empty
     // one. Silently appending to whatever was there would interleave two logs.
-    CHECK_THROWS(Log::create(TopicPartition{"orders", 0}, partition, testPolicy()));
+    CHECK_THROWS(Log::create(TopicPartition{"orders", 0}, partition, testConfig()));
 }
 
 TEST_CASE("The high watermark can be advanced") {
     TempDir dir("log-hwm");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
 
     CHECK(log->highWatermark() == Offset(0));
 
@@ -1884,14 +1895,19 @@ TEST_CASE("The high watermark can be advanced") {
     CHECK(log->logEndOffset() == Offset(0));   // independent of it
 }
 
-TEST_CASE("A log keeps the policy it was created with") {
+TEST_CASE("A log keeps the config it was created with") {
     TempDir dir("log-policy");
     auto    policy = testPolicy();
     policy.maxSegmentBytes = 4242;
+    LogConfig config = configWith(policy);
+    config.retention.retentionMs    = 60000;
+    config.retention.retentionBytes = 8192;
 
-    auto log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
-    CHECK(log->policy().maxSegmentBytes == 4242);
-    CHECK(log->policy().indexIntervalBytes == policy.indexIntervalBytes);
+    auto log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), config);
+    CHECK(log->config().roll.maxSegmentBytes == 4242);
+    CHECK(log->config().roll.indexIntervalBytes == policy.indexIntervalBytes);
+    CHECK(log->config().retention.retentionMs == 60000);
+    CHECK(log->config().retention.retentionBytes == 8192u);
 }
 
 // ===========================================================================
@@ -1916,7 +1932,7 @@ vector<uint8_t> makeUnstampedBatch(int64_t timestamp, size_t payloadBytes = 32,
 
 TEST_CASE("Append assigns offsets as one sequence per partition") {
     TempDir dir("log-append");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
 
     for (int i = 0; i < 10; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i);
@@ -1929,7 +1945,7 @@ TEST_CASE("Append assigns offsets as one sequence per partition") {
 
 TEST_CASE("The log end offset advances by the batch's record count") {
     TempDir dir("log-append-multi");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
 
     auto four = makeUnstampedBatch(1000, 16, 4);
     CHECK(log->append(four) == Offset(0));
@@ -1943,7 +1959,7 @@ TEST_CASE("The log end offset advances by the batch's record count") {
 TEST_CASE("Append stamps the assigned offset into the bytes on disk") {
     TempDir dir("log-append-stamp");
     const filesystem::path partition = dir.file("orders-0");
-    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testConfig());
 
     auto first  = makeUnstampedBatch(1000, 16, 2);
     auto second = makeUnstampedBatch(2000, 16, 2);
@@ -1965,7 +1981,7 @@ TEST_CASE("Append stamps the assigned offset into the bytes on disk") {
 TEST_CASE("Stamping does not disturb the checksum") {
     TempDir dir("log-append-crc");
     const filesystem::path partition = dir.file("orders-0");
-    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testConfig());
 
     for (int i = 0; i < 5; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
@@ -1992,7 +2008,7 @@ TEST_CASE("Stamping does not disturb the checksum") {
 TEST_CASE("Append overwrites whatever base offset the producer sent") {
     TempDir dir("log-append-overwrite");
     const filesystem::path partition = dir.file("orders-0");
-    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testConfig());
 
     // A producer that guessed, or replayed a batch from elsewhere. The broker's
     // sequence is the only authority, so its stamp wins.
@@ -2006,7 +2022,7 @@ TEST_CASE("Append overwrites whatever base offset the producer sent") {
 
 TEST_CASE("On a single node the high watermark tracks the log end offset") {
     TempDir dir("log-append-hwm");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
 
     for (int i = 0; i < 5; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i);
@@ -2054,7 +2070,7 @@ TEST_CASE("Exceeding the size limit rolls to a new segment") {
     const filesystem::path partition = dir.file("orders-0");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 600;
-    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
 
     CHECK(log->segmentCount() == 1);
 
@@ -2073,7 +2089,7 @@ TEST_CASE("Rolling loses no records and leaves no gaps") {
     const filesystem::path partition = dir.file("orders-0");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 500;
-    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
 
     constexpr int kBatches = 60;
     for (int i = 0; i < kBatches; ++i) {
@@ -2093,7 +2109,7 @@ TEST_CASE("Each new segment is named for the offset the previous one ended at") 
     const filesystem::path partition = dir.file("orders-0");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 500;
-    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    auto    log            = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
 
     for (int i = 0; i < 40; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
@@ -2130,7 +2146,7 @@ TEST_CASE("An idle partition rolls when the maintenance sweep asks it to") {
     auto    policy         = testPolicy();
     policy.maxSegmentAgeMs = 1000;
     policy.maxSegmentBytes = 1ull << 30;
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), configWith(policy));
 
     auto bytes = makeUnstampedBatch(1000);
     log->append(bytes);
@@ -2148,7 +2164,7 @@ TEST_CASE("An idle partition with an empty active segment does not accumulate fi
     TempDir dir("log-roll-idle-empty");
     auto    policy         = testPolicy();
     policy.maxSegmentAgeMs = 1000;
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), configWith(policy));
 
     // Repeated sweeps on a partition that has never been written to must do
     // nothing at all, or a quiet topic would grow a segment per sweep forever.
@@ -2160,7 +2176,7 @@ TEST_CASE("Appending continues seamlessly across a roll") {
     TempDir dir("log-roll-continuity");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 400;
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), configWith(policy));
 
     // Every returned offset must be exactly the previous log end offset, whether
     // or not that append happened to trigger a roll.
@@ -2195,7 +2211,7 @@ TEST_CASE("A read resolves to a range whose first batch contains the offset") {
     TempDir dir("log-read-basic");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 500;   // several segments
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), configWith(policy));
 
     constexpr int kBatches = 50;
     for (int i = 0; i < kBatches; ++i) {
@@ -2221,7 +2237,7 @@ TEST_CASE("A read resolves to a range whose first batch contains the offset") {
 
 TEST_CASE("A caught-up read is a success with no bytes") {
     TempDir dir("log-read-caught-up");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
 
     // An empty log is caught up at offset zero.
     auto empty = log->read(Offset(0), kBigFetch);
@@ -2241,7 +2257,7 @@ TEST_CASE("A caught-up read is a success with no bytes") {
 
 TEST_CASE("A read past the log end is an error, not a caught-up read") {
     TempDir dir("log-read-above");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
     for (int i = 0; i < 5; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i);
         log->append(bytes);
@@ -2261,7 +2277,7 @@ TEST_CASE("Reads route to the right segment on both sides of a boundary") {
     const filesystem::path partition = dir.file("orders-0");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 400;
-    auto    log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
 
     for (int i = 0; i < 30; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
@@ -2293,7 +2309,7 @@ TEST_CASE("Reads route to the right segment on both sides of a boundary") {
 
 TEST_CASE("A fetch size cap applies through the log, not just the segment") {
     TempDir dir("log-read-cap");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
     for (int i = 0; i < 20; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 64);
         log->append(bytes);
@@ -2320,7 +2336,7 @@ namespace {
 // process leaves behind when it dies without a clean shutdown.
 vector<Offset> writeThenAbandon(const filesystem::path& partition, const RollPolicy& policy,
                                 int batches) {
-    auto log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
     for (int i = 0; i < batches; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
         log->append(bytes);
@@ -2346,7 +2362,7 @@ TEST_CASE("Reopening a partition recovers the same view of it") {
     const auto bases = writeThenAbandon(partition, policy, 50);
     REQUIRE(bases.size() > 3);
 
-    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
 
     CHECK(log->logStartOffset() == Offset(0));
     CHECK(log->logEndOffset() == Offset(50));
@@ -2370,7 +2386,7 @@ TEST_CASE("A reopened partition can be appended to immediately") {
     policy.maxSegmentBytes = 500;
     writeThenAbandon(partition, policy, 30);
 
-    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
     REQUIRE(log->logEndOffset() == Offset(30));
 
     // A broker has to restart into service, not just into read-only mode.
@@ -2386,7 +2402,7 @@ TEST_CASE("Opening a directory with no segments starts a new partition") {
     filesystem::create_directories(partition);
 
     // What a crash between mkdir and the first segment leaves behind.
-    auto log = Log::open(TopicPartition{"orders", 0}, partition, testPolicy());
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, testConfig());
     CHECK(log->segmentCount() == 1);
     CHECK(log->logEndOffset() == Offset(0));
     CHECK(filesystem::exists(segmentLogPath(partition, Offset(0))));
@@ -2394,7 +2410,7 @@ TEST_CASE("Opening a directory with no segments starts a new partition") {
 
 TEST_CASE("Opening a missing directory is refused") {
     TempDir dir("log-open-missing");
-    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, dir.file("nope"), testPolicy()),
+    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, dir.file("nope"), testConfig()),
                     IoError);
 }
 
@@ -2409,7 +2425,7 @@ TEST_CASE("Opening ignores files that are not segments") {
     writeFile(partition / "partition.meta", vector<uint8_t>{1, 2, 3});
     writeFile(partition / "leader-epoch-checkpoint", vector<uint8_t>{4, 5});
 
-    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
     CHECK(log->segmentCount() == bases.size());
     CHECK(log->logEndOffset() == Offset(20));
 }
@@ -2431,7 +2447,7 @@ TEST_CASE("Only the newest segment is scanned for damage") {
         writeFile(activeLog, bytes);
     }
 
-    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
 
     // Truncated at the damage, so the log ends earlier than it did — and the
     // sealed segments are untouched.
@@ -2453,7 +2469,7 @@ TEST_CASE("A partition whose earliest segments are gone starts later") {
     filesystem::remove(segmentLogPath(partition, bases[0]));
     filesystem::remove(segmentIndexPath(partition, bases[0]));
 
-    auto log = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
     CHECK(log->logStartOffset() == bases[1]);
 
     // Reads below the new start are BelowLogStart — distinct from AboveLogEnd,
@@ -2481,7 +2497,7 @@ TEST_CASE("A hole left by a missing middle segment is refused") {
     filesystem::remove(segmentLogPath(partition, bases[1]));
     filesystem::remove(segmentIndexPath(partition, bases[1]));
 
-    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, partition, policy), CorruptData);
+    CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, partition, configWith(policy)), CorruptData);
 }
 
 // ===========================================================================
@@ -2490,7 +2506,7 @@ TEST_CASE("A hole left by a missing middle segment is refused") {
 
 TEST_CASE("Truncating inside the active segment drops the records above it") {
     TempDir dir("log-trunc-active");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
     for (int i = 0; i < 20; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
         log->append(bytes);
@@ -2511,7 +2527,7 @@ TEST_CASE("Truncating inside a sealed segment deletes every segment above it") {
     const filesystem::path partition = dir.file("orders-0");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 400;
-    auto    log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
 
     for (int i = 0; i < 40; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
@@ -2536,7 +2552,7 @@ TEST_CASE("A truncated log can be appended to again") {
     TempDir dir("log-trunc-append");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 400;
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), configWith(policy));
     for (int i = 0; i < 30; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
         log->append(bytes);
@@ -2561,7 +2577,7 @@ TEST_CASE("Every surviving offset still reads correctly after a truncation") {
     TempDir dir("log-trunc-integrity");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 400;
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), configWith(policy));
     for (int i = 0; i < 40; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
         log->append(bytes);
@@ -2583,7 +2599,7 @@ TEST_CASE("Every surviving offset still reads correctly after a truncation") {
 
 TEST_CASE("Truncating to the end of the log or beyond does nothing") {
     TempDir dir("log-trunc-noop");
-    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testPolicy());
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
     for (int i = 0; i < 10; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i);
         log->append(bytes);
@@ -2602,7 +2618,7 @@ TEST_CASE("Truncating everything away leaves an empty log that does not reuse of
     const filesystem::path partition = dir.file("orders-0");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 400;
-    auto    log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
     for (int i = 0; i < 30; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
         log->append(bytes);
@@ -2624,7 +2640,7 @@ TEST_CASE("A log restarted above zero after truncation does not renumber records
     const filesystem::path partition = dir.file("orders-0");
     auto    policy         = testPolicy();
     policy.maxSegmentBytes = 400;
-    auto    log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
     for (int i = 0; i < 30; ++i) {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
         log->append(bytes);
@@ -2660,7 +2676,7 @@ TEST_CASE("Truncation survives a restart") {
     policy.maxSegmentBytes = 400;
     Offset  after{0};
     {
-        auto log = Log::create(TopicPartition{"orders", 0}, partition, policy);
+        auto log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
         for (int i = 0; i < 30; ++i) {
             auto bytes = makeUnstampedBatch(1000 + i, 48);
             log->append(bytes);
@@ -2671,8 +2687,59 @@ TEST_CASE("Truncation survives a restart") {
 
     // The truncation was to the files, not to in-memory state — so a reopen must
     // agree, and the contiguity check must still pass.
-    auto reopened = Log::open(TopicPartition{"orders", 0}, partition, policy);
+    auto reopened = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
     CHECK(reopened->logEndOffset() == after);
     CHECK(reopened->read(after, kBigFetch).ok());
     CHECK(reopened->read(after + 1, kBigFetch).error == ReadError::AboveLogEnd);
+}
+
+// ===========================================================================
+// Retention policy
+// ===========================================================================
+
+TEST_CASE("Retention defaults to a week and to keeping everything by size") {
+    const RetentionPolicy retention;
+
+    CHECK(retention.retentionMs == 7ll * 24 * 60 * 60 * 1000);
+
+    // Unlimited by default: a byte limit is an explicit operational choice, and
+    // silently capping a partition would lose data nobody asked to lose.
+    CHECK_FALSE(retention.bytesLimited());
+    CHECK_FALSE(retention.retentionBytes.has_value());
+}
+
+TEST_CASE("Unlimited and very small byte limits are different states") {
+    RetentionPolicy retention;
+
+    // The reason for an optional rather than -1 as a sentinel: with a bare
+    // integer, "no limit" and "keep almost nothing" are both just numbers, and a
+    // config path that forgot to translate -1 would delete everything.
+    retention.retentionBytes = 0;
+    CHECK(retention.bytesLimited());
+    CHECK(retention.retentionBytes == 0u);
+
+    retention.retentionBytes = nullopt;
+    CHECK_FALSE(retention.bytesLimited());
+}
+
+TEST_CASE("A log config carries both the roll and the retention rules") {
+    const LogConfig config;
+
+    // Two policies, one object, because partition.meta has to persist both — a
+    // broker booting without a controller needs the whole picture from disk.
+    CHECK(config.roll.maxSegmentBytes == RollPolicy{}.maxSegmentBytes);
+    CHECK(config.retention.retentionMs == RetentionPolicy{}.retentionMs);
+}
+
+TEST_CASE("A byte limit below one segment cannot be honoured") {
+    LogConfig config;
+    config.roll.maxSegmentBytes      = 1 << 20;
+    config.retention.retentionBytes  = 1024;
+
+    // Documenting a foot-gun rather than preventing it: the active segment is
+    // never deleted, so a partition can never shrink below the size of one
+    // segment however low the limit is set. Retention will delete every sealed
+    // segment and then stop, permanently over the limit.
+    CHECK(config.retention.retentionBytes < config.roll.maxSegmentBytes);
+    CHECK(config.retention.bytesLimited());
 }

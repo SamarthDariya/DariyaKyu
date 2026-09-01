@@ -2,9 +2,11 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <type_traits>
@@ -61,6 +63,45 @@ static_assert(std::is_trivially_copyable_v<ReadResult>,
               "ReadResult is returned by value on every fetch; it must not acquire anything "
               "that needs copying or destroying");
 
+// When a sealed segment stops being worth keeping.
+//
+// Retention is a promise about TIME, not about consumers (DESIGN.md decision 4).
+// A consumer that lags past the window loses data, and that is accepted up
+// front — the alternative is letting one dead consumer grow the disk until the
+// broker dies, taking every healthy consumer with it.
+//
+// Enforced by a periodic sweep, so both limits are approximate by design: a
+// partition may sit slightly over its byte limit until the next pass, and a
+// segment may outlive its age limit by up to one sweep interval.
+struct RetentionPolicy {
+    // A sealed segment goes when its NEWEST record is older than this.
+    //
+    // Measured against record timestamps, which come from producers — so a
+    // skewed producer clock can pin data past its window or discard it early.
+    // That is accepted for the same reason Kafka accepts it: the alternative is
+    // deleting data by when the broker happened to receive it, which makes
+    // retention meaningless after any replay or backfill.
+    std::int64_t retentionMs = 7ll * 24 * 60 * 60 * 1000;   // 7 days
+
+    // Total bytes to keep per PARTITION — not per topic, which is the classic
+    // operational foot-gun: twelve partitions with a 1 GiB limit is 12 GiB.
+    //
+    // nullopt means unlimited. An optional rather than -1 as a sentinel, so the
+    // "no limit" case cannot be confused with a very small one; the wire and
+    // config encoding maps -1 to nullopt at the boundary.
+    std::optional<std::uint64_t> retentionBytes = std::nullopt;
+
+    bool bytesLimited() const { return retentionBytes.has_value(); }
+};
+
+// Everything a partition needs to know about itself. Written to partition.meta so
+// a broker that boots while the controller is down still opens its logs with the
+// right rules rather than with whatever the defaults happen to be.
+struct LogConfig {
+    RollPolicy      roll;
+    RetentionPolicy retention;
+};
+
 // One partition's log: a directory of segments, and the rules for moving between
 // them.
 //
@@ -89,7 +130,7 @@ public:
     // A brand-new, empty partition: creates the directory and one active segment
     // based at offset 0.
     static std::unique_ptr<Log> create(TopicPartition tp, std::filesystem::path dir,
-                                       RollPolicy policy);
+                                       LogConfig config);
 
     // Adopts a partition directory that already exists — the startup path.
     //
@@ -102,7 +143,7 @@ public:
     // A directory with no segments in it yet is treated as a new partition, so
     // this is safe to call on a half-created one.
     static std::unique_ptr<Log> open(TopicPartition tp, std::filesystem::path dir,
-                                     RollPolicy policy);
+                                     LogConfig config);
 
     // Appends one batch and returns the offset assigned to its first record.
     //
@@ -171,19 +212,19 @@ public:
 
     const TopicPartition&        topicPartition() const { return tp_; }
     const std::filesystem::path& directory() const { return dir_; }
-    const RollPolicy&            policy() const { return policy_; }
+    const LogConfig&             config() const { return config_; }
 
     Log(const Log&)            = delete;
     Log& operator=(const Log&) = delete;
 
 private:
-    Log(TopicPartition tp, std::filesystem::path dir, RollPolicy policy,
+    Log(TopicPartition tp, std::filesystem::path dir, LogConfig config,
         std::map<Offset, std::unique_ptr<SealedSegment>> sealed,
         std::unique_ptr<ActiveSegment> active);
 
     TopicPartition        tp_;
     std::filesystem::path dir_;
-    RollPolicy            policy_;
+    LogConfig             config_;
 
     std::map<Offset, std::unique_ptr<SealedSegment>> sealed_;
     std::unique_ptr<ActiveSegment>                   active_;
