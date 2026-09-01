@@ -594,3 +594,189 @@ TEST_CASE("A renamed directory is never parsed as a partition") {
     CHECK_NOTHROW(manager.loadAll());
     CHECK(manager.partitionCount() == 0);
 }
+
+// ===========================================================================
+// LogManager: the maintenance sweep
+// ===========================================================================
+
+TEST_CASE("The sweep rolls an idle partition so retention has something to delete") {
+    TempDir dir("mgr-sweep-idle");
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes = 1ull << 30;   // size will never trigger
+    config.roll.maxSegmentAgeMs = 1'000;
+    config.retention.retentionMs = 1'000;
+
+    LogManager manager(dir.file("data"), config);
+    Log& log = manager.createPartition(TopicPartition{"orders", 0});
+
+    // Times here must be on the WALL clock, not synthetic. shouldRoll compares
+    // the nowMs it is handed against firstAppendMs_, which append captures from
+    // wallClockMillis() itself — so a caller passing made-up numbers gets an
+    // enormous negative difference and no roll ever fires. The two are implicitly
+    // required to be on the same clock; see the note in the review.
+    const int64_t now = wallClockMillis();
+    auto bytes = makeUnstampedBatch(now, 48);
+    log.append(bytes);
+    REQUIRE(log.segmentCount() == 1);
+
+    // This is the trap DESIGN.md decision 11 names. With no further writes,
+    // append is never called again, so nothing re-evaluates age — the active
+    // segment never seals, and retention only ever deletes sealed segments.
+    manager.runMaintenance(now + 5'000);
+
+    // Rolled, then the sealed segment aged out and was collected.
+    CHECK(log.logStartOffset() > Offset(0));
+    CHECK(log.logEndOffset() == Offset(1));
+    CHECK(log.segmentCount() == 1);   // just the fresh active one
+}
+
+TEST_CASE("The sweep applies retention across every partition") {
+    TempDir dir("mgr-sweep-retention");
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes  = 400;
+    config.retention.retentionMs = 10'000;
+
+    LogManager manager(dir.file("data"), config);
+    for (int p = 0; p < 3; ++p) {
+        Log& log = manager.createPartition(TopicPartition{"orders", p}, config);
+        for (int i = 0; i < 40; ++i) {
+            auto bytes = makeUnstampedBatch(100'000 + i * 1'000, 48);
+            log.append(bytes);
+        }
+    }
+
+    manager.runMaintenance(100'000 + 39 * 1'000);
+
+    // Every partition, not just the first — a sweep that stopped early would
+    // leave later partitions growing forever.
+    for (int p = 0; p < 3; ++p) {
+        Log* log = manager.get(TopicPartition{"orders", p});
+        REQUIRE(log != nullptr);
+        CHECK(log->logStartOffset() > Offset(0));
+        CHECK(log->logEndOffset() == Offset(40));
+    }
+}
+
+TEST_CASE("The sweep drains the segment graveyard") {
+    TempDir dir("mgr-sweep-graveyard");
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes            = 400;
+    // Small enough that the FIRST sweep ages out every sealed segment. With a
+    // larger window, advancing the clock to reach the delete delay would age out
+    // more segments on the way and bury them fresh — so the graveyard would never
+    // be observed empty, and the test would be measuring the wrong thing.
+    config.retention.retentionMs           = 1;
+    config.retention.segmentDeleteDelayMs  = 60'000;
+
+    LogManager manager(dir.file("data"), config);
+    Log& log = manager.createPartition(TopicPartition{"orders", 0}, config);
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(100'000 + i * 1'000, 48);
+        log.append(bytes);
+    }
+
+    const int64_t now = 200'000;
+    manager.runMaintenance(now);
+    const size_t buried = log.graveyardSize();
+    REQUIRE(buried > 0);           // deleted, descriptors still open
+    REQUIRE(log.logStartOffset() > Offset(0));
+
+    // Nothing is freed until the delay elapses — that window is what keeps an
+    // already-issued FileRange sendable.
+    manager.runMaintenance(now + 59'000);
+    CHECK(log.graveyardSize() == buried);
+
+    manager.runMaintenance(now + 60'000);
+    CHECK(log.graveyardSize() == 0);
+}
+
+TEST_CASE("The sweep drains removed partitions") {
+    TempDir dir("mgr-sweep-removed");
+    const filesystem::path dataDir = dir.file("data");
+    LogConfig config = testConfig();
+    config.retention.segmentDeleteDelayMs = 60'000;
+
+    LogManager manager(dataDir, config);
+    manager.createPartition(TopicPartition{"orders", 0});
+    manager.createPartition(TopicPartition{"orders", 1});
+    manager.removePartition(TopicPartition{"orders", 0}, 1'000);
+    REQUIRE(manager.removedPartitionCount() == 1);
+
+    manager.runMaintenance(1'000 + 59'000);
+    CHECK(manager.removedPartitionCount() == 1);
+
+    manager.runMaintenance(1'000 + 60'000);
+    CHECK(manager.removedPartitionCount() == 0);
+    CHECK(manager.partitionCount() == 1);
+    CHECK(deletedDirCount(dataDir) == 0);
+}
+
+TEST_CASE("A sweep over no partitions is harmless") {
+    TempDir dir("mgr-sweep-empty");
+    LogManager manager(dir.file("data"), testConfig());
+
+    CHECK_NOTHROW(manager.runMaintenance(1'000));
+    CHECK_NOTHROW(manager.runMaintenance(1'000'000'000));
+    CHECK(manager.partitionCount() == 0);
+}
+
+TEST_CASE("Repeated sweeps on a quiet broker change nothing") {
+    TempDir dir("mgr-sweep-repeat");
+    const filesystem::path dataDir = dir.file("data");
+    LogConfig config = testConfig();
+    config.roll.maxSegmentAgeMs  = 1'000;
+    config.retention.retentionMs = 1'000'000'000;
+
+    LogManager manager(dataDir, config);
+    manager.createPartition(TopicPartition{"orders", 0}, config);
+
+    // A partition that has never been written to must not accumulate segments,
+    // however often it is swept — otherwise a quiet topic grows a file per pass.
+    for (int i = 1; i <= 10; ++i) manager.runMaintenance(1'000'000 * i);
+
+    Log* log = manager.get(TopicPartition{"orders", 0});
+    REQUIRE(log != nullptr);
+    CHECK(log->segmentCount() == 1);
+    CHECK(log->logEndOffset() == Offset(0));
+}
+
+TEST_CASE("A sweep running against a live appender is safe") {
+    TempDir dir("mgr-sweep-concurrent");
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes            = 400;
+    config.roll.maxSegmentAgeMs            = 1;
+    config.retention.retentionMs           = 5'000;
+    config.retention.segmentDeleteDelayMs  = 0;
+
+    LogManager manager(dir.file("data"), config);
+    Log& log = manager.createPartition(TopicPartition{"orders", 0}, config);
+
+    constexpr int kBatches = 1500;
+    atomic<bool> done{false};
+    atomic<int>  sweeps{0};
+
+    // Both threads now roll: the appender through append, this one through the
+    // sweep. Before step 13 they raced — shouldRoll was read outside the lock, so
+    // both could pass it and both try to create the same segment.
+    thread sweeper([&] {
+        while (!done.load(memory_order_acquire) || sweeps.load(memory_order_relaxed) == 0) {
+            manager.runMaintenance(100'000 + sweeps.load(memory_order_relaxed) * 10);
+            sweeps.fetch_add(1, memory_order_relaxed);
+        }
+    });
+
+    for (int i = 0; i < kBatches; ++i) {
+        auto bytes = makeUnstampedBatch(100'000 + i, 48);
+        log.append(bytes);
+    }
+    done.store(true, memory_order_release);
+    sweeper.join();
+
+    CHECK(sweeps.load() > 0);
+    CHECK(log.logEndOffset() == Offset(kBatches));
+
+    // Whatever the sweep deleted, what remains must still be a contiguous,
+    // readable run ending at the log end.
+    for (int64_t offset = log.logStartOffset().value(); offset < kBatches; ++offset)
+        CHECK(log.read(Offset(offset), kBigFetch).ok());
+}

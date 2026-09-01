@@ -128,6 +128,22 @@ public:
     // on. Nothing above this layer may cache one.
     void removePartition(const TopicPartition& tp, std::int64_t nowMs);
 
+    // One pass of housekeeping over every partition on the broker.
+    //
+    // Four jobs, and the FIRST is the one that is easy to forget: a partition
+    // receiving no writes never calls append, so nothing re-evaluates its age.
+    // Its active segment would never seal, and retention only ever deletes sealed
+    // segments — so an idle topic would keep its data forever. Age-based rolling
+    // has to be driven by the sweeper as well as by the write path
+    // (DESIGN.md decision 11).
+    //
+    // The other three are retention itself, and draining the two graveyards:
+    // segments retention deleted, and partitions an administrator deleted.
+    //
+    // Approximate by design. A partition may sit over its byte limit, or a
+    // segment outlive its window, until the next pass.
+    void runMaintenance(std::int64_t nowMs);
+
     // Frees partitions whose deletion delay has elapsed, and removes their
     // renamed directories.
     void sweepDeletedPartitions(std::int64_t nowMs);
