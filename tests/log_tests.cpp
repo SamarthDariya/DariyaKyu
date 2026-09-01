@@ -3765,3 +3765,217 @@ TEST_CASE("The permitted topic name characters are accepted") {
     CHECK_NOTHROW(manager.createPartition(TopicPartition{"__offsets", 12}));
     CHECK(manager.partitionCount() == 6);
 }
+
+// ===========================================================================
+// LogManager: directory names
+// ===========================================================================
+
+TEST_CASE("A partition directory name round-trips") {
+    const auto tp = topicPartitionFromDirName("orders-3");
+    CHECK(tp.topic == "orders");
+    CHECK(tp.partition == 3);
+    CHECK(tp.toString() == "orders-3");
+
+    CHECK(topicPartitionFromDirName("__offsets-12").topic == "__offsets");
+    CHECK(topicPartitionFromDirName("__offsets-12").partition == 12);
+    CHECK(topicPartitionFromDirName("a-0").partition == 0);
+}
+
+TEST_CASE("A topic name containing dashes splits at the last one") {
+    // The ambiguity types.hpp warns about: "my-topic-5" could split three ways.
+    const auto tp = topicPartitionFromDirName("my-topic-5");
+    CHECK(tp.topic == "my-topic");
+    CHECK(tp.partition == 5);
+    CHECK(tp.toString() == "my-topic-5");
+
+    const auto deeper = topicPartitionFromDirName("a-b-c-d-11");
+    CHECK(deeper.topic == "a-b-c-d");
+    CHECK(deeper.partition == 11);
+}
+
+TEST_CASE("A non-canonical directory name is refused") {
+    // "orders-03" parses as partition 3, but re-encoding gives "orders-3" — so
+    // the same partition would have two valid directory names, and whichever the
+    // scan met first would win while the other sat holding unreadable records.
+    CHECK_THROWS_AS(topicPartitionFromDirName("orders-03"), CorruptData);
+    CHECK_THROWS_AS(topicPartitionFromDirName("orders-000"), CorruptData);
+    CHECK_NOTHROW(topicPartitionFromDirName("orders-0"));
+}
+
+TEST_CASE("A directory name that is not a partition is refused") {
+    CHECK_THROWS_AS(topicPartitionFromDirName("orders"), CorruptData);      // no dash
+    CHECK_THROWS_AS(topicPartitionFromDirName("-3"), CorruptData);          // no topic
+    CHECK_THROWS_AS(topicPartitionFromDirName("orders-"), CorruptData);     // no number
+    CHECK_THROWS_AS(topicPartitionFromDirName("orders-abc"), CorruptData);  // not a number
+    CHECK_THROWS_AS(topicPartitionFromDirName("orders-99999999999"), CorruptData);  // > int32
+    CHECK_THROWS_AS(topicPartitionFromDirName(""), CorruptData);
+}
+
+TEST_CASE("A negative partition number cannot be expressed as a directory name") {
+    // "orders--1" looks like partition -1, and is not. Splitting at the last dash
+    // makes it topic "orders-" with partition 1 — and since a hyphen is a legal
+    // topic character, that is a genuine canonical name which round-trips.
+    const auto tp = topicPartitionFromDirName("orders--1");
+    CHECK(tp.topic == "orders-");
+    CHECK(tp.partition == 1);
+    CHECK(tp.toString() == "orders--1");
+
+    // So a negative partition has no directory name at all: toString() would
+    // produce something that parses back as a different, positive partition. The
+    // two validators cover each other — createPartition refuses negatives before
+    // one can ever reach the disk, and this parser could not represent one if it
+    // did.
+    CHECK(TopicPartition{"orders", -1}.toString() == "orders--1");
+    CHECK(topicPartitionFromDirName(TopicPartition{"orders", -1}.toString()).partition == 1);
+}
+
+// ===========================================================================
+// LogManager: startup scan
+// ===========================================================================
+
+TEST_CASE("Scanning an empty data directory finds nothing") {
+    TempDir dir("mgr-load-empty");
+    LogManager manager(dir.file("data"), testConfig());
+
+    manager.loadAll();
+    CHECK(manager.partitionCount() == 0);
+}
+
+TEST_CASE("Every partition on disk comes back with its data") {
+    TempDir dir("mgr-load-all");
+    const filesystem::path dataDir = dir.file("data");
+
+    {
+        LogManager manager(dataDir, testConfig());
+        for (int p = 0; p < 3; ++p) {
+            Log& log = manager.createPartition(TopicPartition{"orders", p});
+            for (int i = 0; i <= p; ++i) {   // partition p gets p+1 records
+                auto bytes = makeUnstampedBatch(1000 + i, 48);
+                log.append(bytes);
+            }
+        }
+        manager.createPartition(TopicPartition{"payments", 7});
+    }
+
+    LogManager reopened(dataDir, testConfig());
+    reopened.loadAll();
+
+    CHECK(reopened.partitionCount() == 4);
+    for (int p = 0; p < 3; ++p) {
+        Log* log = reopened.get(TopicPartition{"orders", p});
+        REQUIRE(log != nullptr);
+        CHECK(log->logEndOffset() == Offset(p + 1));
+        CHECK(log->read(Offset(0), kBigFetch).ok());
+    }
+    CHECK(reopened.get(TopicPartition{"payments", 7})->logEndOffset() == Offset(0));
+    CHECK(reopened.get(TopicPartition{"orders", 9}) == nullptr);
+}
+
+TEST_CASE("Each partition comes back with its own config, not the defaults") {
+    TempDir dir("mgr-load-configs");
+    const filesystem::path dataDir = dir.file("data");
+
+    {
+        LogManager manager(dataDir, testConfig());
+        LogConfig tight = testConfig();
+        tight.retention.retentionMs = 60'000;
+        manager.createPartition(TopicPartition{"orders", 0}, tight);
+
+        LogConfig loose = testConfig();
+        loose.retention.retentionMs = 900'000;
+        manager.createPartition(TopicPartition{"orders", 1}, loose);
+    }
+
+    // Reopened by a broker whose defaults match neither.
+    LogConfig otherDefaults = testConfig();
+    otherDefaults.retention.retentionMs = 1;
+    LogManager reopened(dataDir, otherDefaults);
+    reopened.loadAll();
+
+    CHECK(reopened.get(TopicPartition{"orders", 0})->config().retention.retentionMs == 60'000);
+    CHECK(reopened.get(TopicPartition{"orders", 1})->config().retention.retentionMs == 900'000);
+}
+
+TEST_CASE("The scan steps over files and the reserved meta directory") {
+    TempDir dir("mgr-load-other");
+    const filesystem::path dataDir = dir.file("data");
+    {
+        LogManager manager(dataDir, testConfig());
+        manager.createPartition(TopicPartition{"orders", 0});
+    }
+
+    // The controller's own state, and the debris a real data directory collects.
+    filesystem::create_directories(dataDir / kMetaDirName);
+    writeFile(dataDir / kMetaDirName / "cluster.meta", vector<uint8_t>{1, 2, 3});
+    writeFile(dataDir / ".DS_Store", vector<uint8_t>{4});
+    writeFile(dataDir / "notes.txt", vector<uint8_t>{5});
+
+    LogManager manager(dataDir, testConfig());
+    manager.loadAll();
+    CHECK(manager.partitionCount() == 1);
+}
+
+TEST_CASE("A directory that should be a partition but is not aborts the scan") {
+    TempDir dir("mgr-load-bad-dir");
+    const filesystem::path dataDir = dir.file("data");
+    {
+        LogManager manager(dataDir, testConfig());
+        manager.createPartition(TopicPartition{"orders", 0});
+    }
+    filesystem::create_directories(dataDir / "orders-not-a-number");
+
+    // Skipping it would leave its records on disk, invisible, while consumers got
+    // "not hosted here" forever with nothing to explain it. Loud is better.
+    LogManager manager(dataDir, testConfig());
+    CHECK_THROWS_AS(manager.loadAll(), CorruptData);
+}
+
+TEST_CASE("Scanning twice is refused") {
+    TempDir dir("mgr-load-twice");
+    const filesystem::path dataDir = dir.file("data");
+    {
+        LogManager manager(dataDir, testConfig());
+        manager.createPartition(TopicPartition{"orders", 0});
+    }
+
+    LogManager manager(dataDir, testConfig());
+    manager.loadAll();
+
+    // A second scan would open partitions that are already open, putting two
+    // writable handles on one active segment.
+    CHECK_THROWS_AS(manager.loadAll(), Error);
+    CHECK(manager.partitionCount() == 1);
+}
+
+TEST_CASE("A reopened partition can be written to and rolls as before") {
+    TempDir dir("mgr-load-writable");
+    const filesystem::path dataDir = dir.file("data");
+    LogConfig config = testConfig();
+    config.roll.maxSegmentBytes = 400;
+
+    Offset end{0};
+    {
+        LogManager manager(dataDir, config);
+        Log& log = manager.createPartition(TopicPartition{"orders", 0}, config);
+        for (int i = 0; i < 20; ++i) {
+            auto bytes = makeUnstampedBatch(1000 + i, 48);
+            log.append(bytes);
+        }
+        end = log.logEndOffset();
+    }
+
+    LogManager manager(dataDir, config);
+    manager.loadAll();
+    Log* log = manager.get(TopicPartition{"orders", 0});
+    REQUIRE(log != nullptr);
+    REQUIRE(log->logEndOffset() == end);
+
+    // A broker has to restart into service, not into read-only mode.
+    const size_t segmentsBefore = log->segmentCount();
+    for (int i = 0; i < 20; ++i) {
+        auto bytes = makeUnstampedBatch(2000 + i, 48);
+        log->append(bytes);
+    }
+    CHECK(log->logEndOffset() == end + 20);
+    CHECK(log->segmentCount() > segmentsBefore);
+}

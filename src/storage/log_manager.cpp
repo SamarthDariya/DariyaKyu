@@ -1,6 +1,7 @@
 #include "storage/log_manager.hpp"
 
 #include <cctype>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -23,6 +24,41 @@ LogManager::LogManager(filesystem::path dataDir, LogConfig defaults)
     error_code ec;
     filesystem::create_directories(dataDir_, ec);
     if (ec) throw IoError("create_directories", dataDir_, ec.value());
+}
+
+TopicPartition topicPartitionFromDirName(const string& name) {
+    // The LAST dash, because a topic name may contain dashes of its own.
+    const size_t dash = name.rfind('-');
+    if (dash == string::npos)
+        throw CorruptData("data directory: '" + name + "' has no partition number");
+    if (dash == 0)
+        throw CorruptData("data directory: '" + name + "' has an empty topic name");
+    if (dash + 1 == name.size())
+        throw CorruptData("data directory: '" + name + "' ends with its separator");
+
+    for (size_t i = dash + 1; i < name.size(); ++i)
+        if (isdigit(static_cast<unsigned char>(name[i])) == 0)
+            throw CorruptData("data directory: '" + name +
+                              "' has a non-digit in its partition number");
+
+    TopicPartition tp;
+    tp.topic = name.substr(0, dash);
+    try {
+        tp.partition = stoi(name.substr(dash + 1));
+    } catch (const out_of_range&) {
+        throw CorruptData("data directory: '" + name +
+                          "' has a partition number too large for int32");
+    }
+
+    // The round trip must be exact. "orders-03" parses as partition 3, but
+    // re-encoding gives "orders-3" — so the same partition would have two valid
+    // directory names, and whichever the scan met first would win while the other
+    // sat there holding records nothing would ever read.
+    if (tp.toString() != name)
+        throw CorruptData("data directory: '" + name + "' is not the canonical name for " +
+                          tp.toString());
+
+    return tp;
 }
 
 namespace {
@@ -54,6 +90,29 @@ void requireUsableName(const TopicPartition& tp) {
 }
 
 }  // namespace
+
+void LogManager::loadAll() {
+    unique_lock lock(logsMutex_);
+
+    if (!logs_.empty())
+        throw Error("LogManager::loadAll is a startup operation, but " +
+                    to_string(logs_.size()) + " partition(s) are already open");
+
+    for (const auto& entry : filesystem::directory_iterator(dataDir_)) {
+        // Stray files at the top level are not partitions. Only directories are
+        // considered, so a leftover archive or an editor's temp file is harmless.
+        if (!entry.is_directory()) continue;
+
+        const string name = entry.path().filename().string();
+        if (name == kMetaDirName) continue;   // the controller's own state
+
+        const TopicPartition tp = topicPartitionFromDirName(name);
+
+        // Log::open reads this partition's own partition.meta, so `defaults_` is a
+        // fallback and not an imposition.
+        logs_.emplace(tp, Log::open(tp, entry.path(), defaults_));
+    }
+}
 
 Log& LogManager::createPartition(const TopicPartition& tp, const LogConfig& config) {
     requireUsableName(tp);
