@@ -3626,3 +3626,142 @@ TEST_CASE("Topic and partition are both part of a partition's identity") {
     CHECK(std::hash<TopicPartition>{}(a) == std::hash<TopicPartition>{}(b));
     CHECK(std::hash<TopicPartition>{}(a) != std::hash<TopicPartition>{}(TopicPartition{"orders", 4}));
 }
+
+// ===========================================================================
+// LogManager: creating partitions
+// ===========================================================================
+
+TEST_CASE("Creating a partition registers it and lays it out on disk") {
+    TempDir dir("mgr-create-partition");
+    const filesystem::path dataDir = dir.file("data");
+    LogManager manager(dataDir, testConfig());
+
+    Log& log = manager.createPartition(TopicPartition{"orders", 3});
+
+    CHECK(manager.partitionCount() == 1);
+    CHECK(manager.get(TopicPartition{"orders", 3}) == &log);
+    CHECK(log.logEndOffset() == Offset(0));
+
+    // The directory name IS the partition identity, so this doubles as the
+    // on-disk layout rather than being a debug convenience.
+    const filesystem::path partition = dataDir / "orders-3";
+    CHECK(filesystem::is_directory(partition));
+    CHECK(filesystem::exists(segmentLogPath(partition, Offset(0))));
+    CHECK(filesystem::exists(segmentIndexPath(partition, Offset(0))));
+    CHECK(filesystem::exists(partition / PartitionMeta::kFileName));
+}
+
+TEST_CASE("A created partition is immediately usable") {
+    TempDir dir("mgr-create-usable");
+    LogManager manager(dir.file("data"), testConfig());
+
+    Log& log = manager.createPartition(TopicPartition{"orders", 0});
+    auto bytes = makeUnstampedBatch(1000, 48);
+
+    CHECK(log.append(bytes) == Offset(0));
+    CHECK(log.read(Offset(0), kBigFetch).ok());
+    CHECK(manager.get(TopicPartition{"orders", 0})->logEndOffset() == Offset(1));
+}
+
+TEST_CASE("Partitions of the same topic are separate logs") {
+    TempDir dir("mgr-many-partitions");
+    const filesystem::path dataDir = dir.file("data");
+    LogManager manager(dataDir, testConfig());
+
+    for (int p = 0; p < 4; ++p) manager.createPartition(TopicPartition{"orders", p});
+    manager.createPartition(TopicPartition{"payments", 0});
+
+    CHECK(manager.partitionCount() == 5);
+
+    // Ordering is guaranteed within a partition and nowhere else, which is only
+    // true because each is a physically separate log.
+    Log* a = manager.get(TopicPartition{"orders", 0});
+    Log* b = manager.get(TopicPartition{"orders", 1});
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK(a != b);
+
+    auto bytes = makeUnstampedBatch(1000, 48);
+    a->append(bytes);
+    CHECK(a->logEndOffset() == Offset(1));
+    CHECK(b->logEndOffset() == Offset(0));   // untouched
+
+    CHECK(filesystem::is_directory(dataDir / "orders-3"));
+    CHECK(filesystem::is_directory(dataDir / "payments-0"));
+}
+
+TEST_CASE("Creating a partition twice is refused") {
+    TempDir dir("mgr-create-twice");
+    LogManager manager(dir.file("data"), testConfig());
+    manager.createPartition(TopicPartition{"orders", 0});
+
+    // The controller decides where partitions live, so asking twice means its
+    // view and the broker's have diverged. Quietly returning the existing log
+    // would hide that.
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{"orders", 0}), Error);
+    CHECK(manager.partitionCount() == 1);
+}
+
+TEST_CASE("A partition takes the manager's defaults unless given its own config") {
+    TempDir dir("mgr-create-config");
+    LogConfig defaults = testConfig();
+    defaults.retention.retentionMs = 111'000;
+    LogManager manager(dir.file("data"), defaults);
+
+    Log& fromDefaults = manager.createPartition(TopicPartition{"orders", 0});
+    CHECK(fromDefaults.config().retention.retentionMs == 111'000);
+
+    LogConfig explicitConfig = testConfig();
+    explicitConfig.retention.retentionMs = 222'000;
+    Log& fromExplicit = manager.createPartition(TopicPartition{"orders", 1}, explicitConfig);
+    CHECK(fromExplicit.config().retention.retentionMs == 222'000);
+
+    // And each partition's own config is what lands in its partition.meta.
+    CHECK(readPartitionMeta(dir.file("data") / "orders-0", TopicPartition{"orders", 0})
+              .config.retention.retentionMs == 111'000);
+    CHECK(readPartitionMeta(dir.file("data") / "orders-1", TopicPartition{"orders", 1})
+              .config.retention.retentionMs == 222'000);
+}
+
+TEST_CASE("A topic name that cannot be a directory name is refused") {
+    TempDir dir("mgr-bad-names");
+    const filesystem::path dataDir = dir.file("data");
+    LogManager manager(dataDir, testConfig());
+
+    // This is the boundary where a string chosen by a client becomes a
+    // filesystem path. '/' would place the partition outside the data directory
+    // entirely and ".." would climb out of it — a path-traversal bug waiting for
+    // the first CreateTopic request M4 serves.
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{"../escape", 0}), Error);
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{"a/b", 0}), Error);
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{"..", 0}), Error);
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{".", 0}), Error);
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{"", 0}), Error);
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{"has space", 0}), Error);
+    // An embedded NUL needs an explicit length. Written as a bare literal,
+    // TopicPartition{"orders\0hidden", 0} goes through std::string's const char*
+    // constructor, which stops at the NUL — so the topic would just be "orders",
+    // which is perfectly valid, and the test would pass while checking nothing.
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{string("orders\0hidden", 13), 0}),
+                    Error);
+    CHECK_THROWS_AS(manager.createPartition(TopicPartition{"orders", -1}), Error);
+
+    CHECK(manager.partitionCount() == 0);
+
+    // Nothing was created anywhere, including outside the data directory.
+    CHECK_FALSE(filesystem::exists(dir.file("escape-0")));
+    CHECK(filesystem::is_empty(dataDir));
+}
+
+TEST_CASE("The permitted topic name characters are accepted") {
+    TempDir dir("mgr-good-names");
+    LogManager manager(dir.file("data"), testConfig());
+
+    CHECK_NOTHROW(manager.createPartition(TopicPartition{"orders", 0}));
+    CHECK_NOTHROW(manager.createPartition(TopicPartition{"my-topic", 0}));
+    CHECK_NOTHROW(manager.createPartition(TopicPartition{"my_topic", 0}));
+    CHECK_NOTHROW(manager.createPartition(TopicPartition{"my.topic", 0}));
+    CHECK_NOTHROW(manager.createPartition(TopicPartition{"Topic123", 0}));
+    CHECK_NOTHROW(manager.createPartition(TopicPartition{"__offsets", 12}));
+    CHECK(manager.partitionCount() == 6);
+}
