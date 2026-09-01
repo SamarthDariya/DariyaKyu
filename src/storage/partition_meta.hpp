@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <vector>
 
 #include "common/types.hpp"
@@ -58,6 +59,27 @@ struct PartitionMeta {
 };
 
 std::vector<std::uint8_t> encodePartitionMeta(const PartitionMeta& meta);
+
+// Throws CorruptData on anything it cannot interpret: a wrong magic, an
+// unrecognised version, a length that runs off the end, or bytes left over at
+// the end.
+//
+// A version this build does not know is REFUSED rather than partially read. A
+// newer broker may have written fields in a different order or with different
+// meanings, and a config file read wrongly is worse than one not read at all —
+// misinterpreting a retention limit silently deletes data or silently keeps it
+// forever.
+PartitionMeta decodePartitionMeta(std::span<const std::uint8_t> bytes);
+
+// Reads `dir/partition.meta` and checks it describes the partition it was found
+// in.
+//
+// `expected` comes from the directory name. A mismatch means a partition
+// directory was copied or renamed by hand, which is worth refusing: the two
+// disagree about which partition these records belong to, and picking either
+// answer risks serving one topic's data under another topic's name.
+PartitionMeta readPartitionMeta(const std::filesystem::path& dir,
+                                const TopicPartition&        expected);
 
 // Writes `dir/partition.meta`, replacing any existing one atomically.
 //
