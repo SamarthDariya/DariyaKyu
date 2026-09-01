@@ -887,29 +887,129 @@ public:
 
     void loadAll();                                       // startup scan
     Log* get(const TopicPartition&) const;                // nullptr if not hosted here
-    Log& createPartition(const TopicPartition&, const TopicConfig&);
-    void removePartition(const TopicPartition&);
+    Log& createPartition(const TopicPartition&, const LogConfig&);
+    void removePartition(const TopicPartition&, int64_t nowMs);
 
-    void runMaintenance();                                // background sweep
+    void runMaintenance(int64_t nowMs);                   // one sweep
+    void startMaintenance(int64_t intervalMs);            // and the thread that drives it
+    void stopMaintenance();
 private:
     fs::path                                        dataDir_;
     unordered_map<TopicPartition, unique_ptr<Log>>  logs_;
+    vector<RemovedPartition>                        removed_;     // see deferred deletion
     mutable shared_mutex                            logsMutex_;   // topic create/delete only
 };
 ```
+
+**Amended at M3 — three signature changes and one new member.**
+
+`TopicConfig` became `LogConfig`: the thing a partition needs is its roll policy plus its
+retention policy, and nothing else. Topic-level configuration that is *not* a log concern —
+partition count, replication factor — belongs to the controller at M8 and would have no business
+in `partition.meta`.
+
+**Time is a parameter, everywhere.** `removePartition` and `runMaintenance` both take `nowMs`
+rather than reading the clock. Tests can then advance time without sleeping, and the sweep reads
+the clock once and measures every partition on the broker against the same instant instead of
+against slightly different ones.
+
+There is a wart in that, and it is worth writing down rather than discovering twice: `nowMs` is
+compared against `firstAppendMs_`, which `Log::append` captures from the wall clock *internally*.
+The two are implicitly required to be on the same clock, and nothing enforces it — pass synthetic
+times and age-based rolling silently never fires. Fixing it properly means threading a clock
+through `append` as well.
 
 `get()` returns a raw `Log*` deliberately — a **non-owning observer**. `LogManager` owns every
 `Log` for the broker's lifetime and callers borrow; a `shared_ptr` would imply a lifetime
 question that doesn't exist.
 
+#### Deferred deletion: why a `FileRange` outlives its segment
+
+**Added at M3.** This is the decision the ownership diagram above does not survive contact with.
+
+`Log::read` returns a `FileRange` — a raw descriptor and a byte range — which the caller may not
+use until later, on an I/O thread. Retention runs on a *third* thread. Destroying a
+`SealedSegment` closes its descriptor, so retention deleting a segment while a range is in flight
+would fail the send, or worse: the descriptor number gets reused by another file and a consumer is
+sent someone else's bytes. Silent, and attributable to anything but retention.
+
+Unlinking is not the problem — POSIX keeps an inode alive while any descriptor is open. So the
+fix delays **destruction**, not unlinking:
+
+```cpp
+struct BuriedSegment { unique_ptr<SealedSegment> segment; int64_t unlinkedAtMs; };
+vector<BuriedSegment> graveyard_;               // in Log
+
+struct RemovedPartition { unique_ptr<Log> log; fs::path directory; int64_t removedAtMs; };
+vector<RemovedPartition> removed_;              // in LogManager
+```
+
+The directory entry goes immediately, so a restart never finds it; the object lingers for
+`segmentDeleteDelayMs` and then goes, which is when the disk space actually comes back. Two
+graveyards, because the same hazard exists at two scales: segments retention deleted, and whole
+partitions an administrator deleted.
+
+The alternative — handing out `shared_ptr<SealedSegment>` from every read — was rejected. It
+contradicts the ownership rule at the top of this chunk and puts an atomic refcount on the hot
+read path to solve something that happens once per segment.
+
+Two consequences worth stating, because both look like bugs from the outside:
+
+- **Disk space comes back at sweep time, not at delete time.** With a one-minute delay, a
+  partition holds up to a minute of already-deleted segments.
+- **The graveyard is rarely empty on a busy partition.** Each sweep buries what has just aged out
+  while freeing what was buried a delay ago.
+
+`removePartition` gets one extra step for the same reason plus a second: the directory is
+**renamed** to `<name>.<timestamp>.delete` before anything is dropped. One atomic step takes the
+partition out of the startup scan's sight, so an interrupted deletion cannot leave a directory
+that still looks like a partition but has a hole in its offset sequence — which `Log::open`
+refuses, turning a topic deletion into a broker that will not start. The timestamp keeps a
+partition deleted, recreated and deleted again from colliding with its own earlier corpse. The
+startup scan skips those names and finishes the job, since a restart means there are no in-flight
+reads left to protect.
+
+#### `partition.meta`, concretely
+
+**Added at M3.** The layout above says this file exists; the format is binary, big-endian, and
+versioned:
+
+```
+magic uint32 "DKPM" | version int16 | topic int16-length + bytes | partition int32
+maxSegmentBytes int64 | maxSegmentAgeMs int64 | indexIntervalBytes int64 | maxIndexBytes int64
+retentionMs int64 | retentionBytes int64 (-1 unlimited) | segmentDeleteDelayMs int64
+```
+
+Three decisions in that:
+
+**No checksum.** Every other file here is checksummed; this one is replaced atomically instead —
+write a temporary, `fsync` it, `rename` over the target, `fsync` the directory. A torn mixture of
+old and new bytes is therefore not an observable state, so a checksum would guard against
+something that cannot happen. Both `fsync`s are load-bearing: `rename` makes the *name* change
+atomically and says nothing about the bytes reaching disk, and the rename is itself a directory
+change that needs flushing. This is one of the few places worth paying for durability, because
+unlike an index this file cannot be rebuilt — the configuration is not derivable from the log.
+
+**An unknown version is refused, in both directions.** A config file read *wrongly* is worse than
+one not read at all: a misinterpreted retention limit silently deletes data or silently keeps it
+forever, and neither reports an error.
+
+**`-1` for unlimited lives only here.** `RetentionPolicy` holds an `optional`, so "unlimited" and
+"keep almost nothing" cannot be confused in memory. The sentinel translation happens at this
+boundary and nowhere else.
+
 #### Maintenance does two jobs
 
 ```cpp
-void LogManager::runMaintenance() {
+void LogManager::runMaintenance(int64_t nowMs) {
+    shared_lock lock(logsMutex_);
     for (auto& [tp, log] : logs_) {
-        log->maybeRollByTime(policy);   // ← easy to forget
-        log->applyRetention(policy);
+        log->maybeRoll(nowMs);          // ← easy to forget
+        log->applyRetention(nowMs);
+        log->sweepGraveyard(nowMs);     // added at M3
     }
+    lock.unlock();
+    sweepDeletedPartitions(nowMs);      // added at M3
 }
 ```
 
@@ -917,6 +1017,35 @@ The second line is obvious; the first is the trap from decision 11. If segments 
 `append`, an **idle partition never rolls**, so its active segment never seals, so retention
 never fires and its data lives forever. Age-based rolling must be driven by the sweeper as well
 as by the write path.
+
+**Amended at M3 — four jobs, not two**, the extra pair being the graveyard drains above. Note the
+order: rolling comes first because retention can only delete *sealed* segments, so on an idle
+partition the roll is what produces something to delete.
+
+**And a race this created.** M2 justified taking no lock in `Log::append` on the grounds that
+"a roll happens on this same thread, so the appender cannot race with itself". The sweep calls
+`maybeRoll` too, from its own thread, and that ended the argument: two callers could both pass the
+`shouldRoll` check and both try to create a segment at the same base offset. `maybeRoll` now holds
+the exclusive lock across the decision as well as the swap, and `append` holds a *shared* lock
+while using `active_` — shared, despite mutating, because there is exactly one appender and what
+the lock excludes is the roll, not other writers. Readers hold the same shared lock and still run
+alongside the appender, which is the point.
+
+#### The thread that drives it
+
+**Added at M3.** The sweep waits on a condition variable rather than sleeping, so stopping is
+immediate. With a plain sleep, a broker configured to sweep every five minutes takes up to five
+minutes to shut down — long enough that whatever supervises it sends `SIGKILL`, and every clean
+shutdown becomes a crash-recovery path on the next boot.
+
+A sweep that throws is **counted, not fatal and not swallowed**. Letting it propagate kills the
+thread, so one unreadable file stops every partition being maintained, permanently. Swallowing it
+silently leaves retention dead with nothing to show for it, which is how a disk fills with nobody
+knowing. So `sweepFailures()` is a number an operator can look at.
+
+The destructor stops the thread, in the destructor *body* — which runs before any member is
+destroyed, so the join happens while `logs_` is still alive rather than while it is being freed
+underneath a sweep in progress.
 
 #### The write path, socket to disk
 
