@@ -149,27 +149,32 @@ Offset Log::append(span<uint8_t> batchBytes) {
     // Assigning it here is what makes offsets a single global sequence per
     // partition rather than something clients negotiate.
     //
-    // relaxed is enough for the load: only the appender writes this, so it is
-    // reading its own last value.
-    const Offset base = logEndOffset_.load(memory_order_relaxed);
-
     // Checked BEFORE the append, not after, so the decision is "is this segment
     // already full enough" rather than "did that last batch overflow it". A
     // segment therefore overshoots maxSegmentBytes by at most one batch, which
     // is why it is a threshold and not a hard cap.
+    //
+    // Takes and releases the exclusive lock itself, so it must happen before the
+    // shared lock below rather than inside it — shared_mutex is not reentrant and
+    // there is no upgrade.
     maybeRoll(wallClockMillis());
+
+    // relaxed is enough for the load: only the appender writes this, so it is
+    // reading its own last value.
+    const Offset base = logEndOffset_.load(memory_order_relaxed);
 
     RecordBatch::stampBaseOffset(batchBytes, base);
     // partitionLeaderEpoch is left at -1 until M8, where the same in-place trick
     // stamps the current leader epoch beside the offset.
 
-    // No lock. This is deliberate, and it is the reason the write path is fast.
+    // SHARED, not exclusive, even though this mutates the active segment.
     //
-    // active_ is only ever REASSIGNED by a roll, and a roll happens inside this
-    // same function on this same thread — so the appender cannot race with
-    // itself. Readers take a shared lock and rolling takes an exclusive one, so
-    // a reader can never observe the pointer mid-swap. The appender needs no
-    // lock because it is the only writer.
+    // That is safe only because there is exactly one appender per partition — the
+    // contract this whole class is built on. What the lock is for is excluding a
+    // ROLL: without it, maybeRoll on the maintenance thread could swap active_
+    // out from under this dereference. Readers hold the same shared lock, so they
+    // still proceed alongside the appender, which is the point.
+    shared_lock lock(segmentsMutex_);
     active_->append(base, batchBytes);
 
     const Offset next = active_->nextOffset();
@@ -229,33 +234,36 @@ ReadResult Log::read(Offset offset, size_t maxBytes) const {
 }
 
 void Log::maybeRoll(int64_t nowMs) {
-    // Read outside the lock. Only the appender reassigns active_, and only from
-    // this function, so this cannot be racing with a swap.
+    // Exclusive for the DECISION as well as the swap, and that matters as of the
+    // maintenance sweep.
+    //
+    // This used to read shouldRoll() outside the lock, on the reasoning that only
+    // the appender ever rolls and it cannot race with itself. LogManager's sweep
+    // broke that: it calls this too, on its own thread. Two callers could both
+    // pass the check and both try to create a segment at the same base offset —
+    // one would throw from CreateNew, out of either a produce or the sweep, and
+    // for a reason neither could explain.
+    unique_lock lock(segmentsMutex_);
+
     if (!active_->shouldRoll(nowMs)) return;
 
     // The new segment starts exactly where the old one ended — which is what
     // makes the directory listing a contiguous sequence of base offsets.
     const Offset base = active_->nextOffset();
 
-    // Created BEFORE the swap, and before the lock, for exception safety: if the
-    // file already exists, or the disk is full, this throws while active_ is
-    // still a perfectly good segment and the partition carries on.
+    // Created before anything is moved from, so a failure here — the file exists,
+    // the disk is full — leaves active_ a perfectly good segment and the
+    // partition carrying on. It costs two syscalls under the exclusive lock, once
+    // per segment.
     //
     // A crash in the gap leaves an empty segment for an offset the log has not
-    // reached. Startup takes the highest base offset as the active segment, so
-    // it adopts the empty one and treats the previous one as sealed — untrimmed
-    // index and all, which OffsetIndex::openSealed already handles. Survivable,
-    // which is the most that can be asked of a crash window.
+    // reached. Startup takes the highest base offset as the active segment, so it
+    // adopts the empty one and treats the previous as sealed — untrimmed index and
+    // all, which OffsetIndex::openSealed already handles.
     auto next = ActiveSegment::create(dir_, base, config_.roll);
 
-    // Exclusive, and this is the only place in the write path that takes a lock.
-    // Readers hold a shared lock across a whole read, so this waits for them —
-    // and in exchange no reader can ever observe active_ mid-swap or hold a
-    // pointer into a segment being closed.
-    unique_lock lock(segmentsMutex_);
-
-    // seal() consumes active_, leaving it null for the moment between these two
-    // lines. The lock is what makes that moment unobservable.
+    // seal() consumes active_, leaving it null between these two lines. The lock
+    // is what makes that moment unobservable.
     auto sealed = ActiveSegment::seal(std::move(active_));
     sealed_.emplace(sealed->baseOffset(), std::move(sealed));
     active_ = std::move(next);

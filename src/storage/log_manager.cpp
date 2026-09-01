@@ -175,6 +175,31 @@ void LogManager::removePartition(const TopicPartition& tp, int64_t nowMs) {
     logs_.erase(it);
 }
 
+void LogManager::runMaintenance(int64_t nowMs) {
+    {
+        // Shared, held across the whole loop. It blocks topic creation and
+        // deletion for the duration but not lookups, so producing and consuming
+        // carry on. Holding it is what keeps a Log* from being retired while this
+        // is standing on it.
+        //
+        // Lock order is manager then partition, and nothing anywhere takes them
+        // the other way round.
+        shared_lock lock(logsMutex_);
+
+        for (const auto& [tp, log] : logs_) {
+            // Age-based rolling first: retention below can only delete SEALED
+            // segments, so on an idle partition this is what produces something
+            // for it to delete.
+            log->maybeRoll(nowMs);
+            log->applyRetention(nowMs);
+            log->sweepGraveyard(nowMs);
+        }
+    }
+
+    // Outside the loop and outside that lock, because it takes the exclusive one.
+    sweepDeletedPartitions(nowMs);
+}
+
 void LogManager::sweepDeletedPartitions(int64_t nowMs) {
     unique_lock lock(logsMutex_);
 
