@@ -21,6 +21,7 @@
 #include "storage/offset_index.hpp"
 #include "storage/record_batch.hpp"
 #include "storage/log.hpp"
+#include "storage/log_manager.hpp"
 #include "storage/partition_meta.hpp"
 #include "storage/segment.hpp"
 
@@ -3546,4 +3547,82 @@ TEST_CASE("A meta from another partition is refused") {
                     CorruptData);
     CHECK_THROWS_AS(Log::open(TopicPartition{"payments", 0}, partition, testConfig()),
                     CorruptData);
+}
+
+// ===========================================================================
+// LogManager: registry
+// ===========================================================================
+
+static_assert(!is_copy_constructible_v<LogManager>,
+              "a LogManager owns every partition on the broker; copying one would mean two "
+              "owners of the same files");
+
+TEST_CASE("A new manager creates its data directory") {
+    TempDir dir("mgr-create-dir");
+    const filesystem::path dataDir = dir.file("data/broker-1");
+    REQUIRE_FALSE(filesystem::exists(dataDir));
+
+    // First boot creates it rather than refusing to start: an empty data
+    // directory and a missing one describe the same situation.
+    LogManager manager(dataDir, testConfig());
+
+    CHECK(filesystem::is_directory(dataDir));
+    CHECK(manager.dataDir() == dataDir);
+    CHECK(manager.partitionCount() == 0);
+}
+
+TEST_CASE("An existing data directory is adopted, not replaced") {
+    TempDir dir("mgr-existing-dir");
+    const filesystem::path dataDir = dir.file("data");
+    filesystem::create_directories(dataDir / "orders-0");
+
+    LogManager manager(dataDir, testConfig());
+
+    // Nothing is scanned yet — that is loadAll — but nothing is destroyed either.
+    CHECK(filesystem::is_directory(dataDir / "orders-0"));
+    CHECK(manager.partitionCount() == 0);
+}
+
+TEST_CASE("A partition this broker does not host resolves to nullptr") {
+    TempDir dir("mgr-get-missing");
+    LogManager manager(dir.file("data"), testConfig());
+
+    // Not an exception: "I do not host that" is a routine answer a broker gives
+    // constantly, and M4 maps it to a NOT_LEADER error code rather than a failure.
+    CHECK(manager.get(TopicPartition{"orders", 0}) == nullptr);
+    CHECK(manager.get(TopicPartition{"", 0}) == nullptr);
+    CHECK(manager.get(TopicPartition{"orders", -1}) == nullptr);
+}
+
+TEST_CASE("A manager keeps the defaults it was given") {
+    TempDir dir("mgr-defaults");
+    LogConfig defaults = testConfig();
+    defaults.retention.retentionMs    = 3600'000;
+    defaults.retention.retentionBytes = 65536;
+
+    LogManager manager(dir.file("data"), defaults);
+
+    // These apply to partitions created from here on, and to one found on disk
+    // with no partition.meta of its own — never to one that has its own.
+    CHECK(manager.defaults().retention.retentionMs == 3600'000);
+    CHECK(manager.defaults().retention.retentionBytes == 65536u);
+}
+
+TEST_CASE("Topic and partition are both part of a partition's identity") {
+    TempDir dir("mgr-identity");
+    LogManager manager(dir.file("data"), testConfig());
+
+    // Same topic different partition, and same partition different topic, are
+    // different partitions. hash<TopicPartition> mixes both, because a broker's
+    // keys are dominated by one topic with many partitions — without mixing they
+    // would all land in adjacent buckets.
+    CHECK(manager.get(TopicPartition{"orders", 0}) == nullptr);
+    CHECK(manager.get(TopicPartition{"orders", 1}) == nullptr);
+    CHECK(manager.get(TopicPartition{"payments", 0}) == nullptr);
+
+    const TopicPartition a{"orders", 3};
+    const TopicPartition b{"orders", 3};
+    CHECK(a == b);
+    CHECK(std::hash<TopicPartition>{}(a) == std::hash<TopicPartition>{}(b));
+    CHECK(std::hash<TopicPartition>{}(a) != std::hash<TopicPartition>{}(TopicPartition{"orders", 4}));
 }
