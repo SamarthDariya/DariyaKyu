@@ -134,8 +134,8 @@ struct LogConfig {
 // (DESIGN.md decision 20).
 class Log {
 public:
-    // A brand-new, empty partition: creates the directory and one active segment
-    // based at offset 0.
+    // A brand-new, empty partition: creates the directory, one active segment
+    // based at offset 0, and the partition.meta recording `config`.
     static std::unique_ptr<Log> create(TopicPartition tp, std::filesystem::path dir,
                                        LogConfig config);
 
@@ -149,8 +149,23 @@ public:
     //
     // A directory with no segments in it yet is treated as a new partition, so
     // this is safe to call on a half-created one.
+    //
+    // `fallback` is a FALLBACK, not an override. The configuration stored in
+    // partition.meta wins, because that is the entire reason the file exists: a
+    // partition told to keep one hour of data must not silently start keeping
+    // seven days because whoever reopened it passed the defaults.
+    //
+    // `fallback` is used in exactly one situation — partition.meta is absent AND
+    // the partition holds no records. That is what a crash between creating the
+    // directory and writing the file leaves behind, and there is no stored
+    // configuration to contradict. The file is then written, so the next open
+    // finds it.
+    //
+    // An absent partition.meta on a partition that DOES hold records is refused.
+    // The original configuration is not derivable from the log, so adopting the
+    // caller's and writing it down would make a guess permanent.
     static std::unique_ptr<Log> open(TopicPartition tp, std::filesystem::path dir,
-                                     LogConfig config);
+                                     LogConfig fallback);
 
     // Appends one batch and returns the offset assigned to its first record.
     //

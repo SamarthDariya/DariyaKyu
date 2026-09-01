@@ -5,11 +5,42 @@
 #include <utility>
 
 #include "common/errors.hpp"
+#include "storage/partition_meta.hpp"
 #include "storage/record_batch.hpp"
 
 using namespace std;
 
 namespace dariyakyu::storage {
+
+namespace {
+
+// Which configuration a reopened partition should run with.
+LogConfig resolveConfig(const filesystem::path& dir, const TopicPartition& tp,
+                        const LogConfig& fallback, bool hasRecords) {
+    try {
+        // The stored configuration wins. This is the whole point of the file.
+        return readPartitionMeta(dir, tp).config;
+    } catch (const IoError& error) {
+        // Only a MISSING file is a candidate for the fallback. A permissions
+        // failure or a bad descriptor is a real problem and should not be
+        // mistaken for "this partition predates the file".
+        if (error.errnoValue() != ENOENT) throw;
+
+        if (hasRecords)
+            throw CorruptData("log " + dir.string() +
+                              ": partition.meta is missing but the partition holds records — "
+                              "its configuration is not derivable from the log, and adopting "
+                              "the caller's would make a guess permanent");
+
+        // An empty partition has no stored configuration to contradict: this is
+        // what a crash between mkdir and the first write leaves behind. Record
+        // the fallback so the next open finds it.
+        writePartitionMeta(dir, PartitionMeta{tp, fallback});
+        return fallback;
+    }
+}
+
+}  // namespace
 
 Log::Log(TopicPartition tp, filesystem::path dir, LogConfig config,
          map<Offset, unique_ptr<SealedSegment>> sealed, unique_ptr<ActiveSegment> active)
@@ -34,11 +65,16 @@ unique_ptr<Log> Log::create(TopicPartition tp, filesystem::path dir, LogConfig c
     // there, so this cannot quietly adopt an existing partition.
     auto active = ActiveSegment::create(dir, Offset(0), config.roll);
 
+    // After the segment, so a create that fails on an existing segment does not
+    // leave a meta file for a partition it refused to make. If this throws, the
+    // partition is left empty and the next open heals it.
+    writePartitionMeta(dir, PartitionMeta{tp, config});
+
     return unique_ptr<Log>(
         new Log(std::move(tp), std::move(dir), config, {}, std::move(active)));
 }
 
-unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, LogConfig config) {
+unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, LogConfig fallback) {
     if (!filesystem::is_directory(dir)) throw IoError("open", dir, ENOENT);
 
     // Only .log files. A partition directory also holds .index files and, from
@@ -61,6 +97,7 @@ unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, LogConfig con
     // creating the segment in the process's working directory instead of the
     // partition. Exactly the hazard Log::create documents, in a second place.
     if (logs.empty()) {
+        const LogConfig config = resolveConfig(dir, tp, fallback, false);
         auto active = ActiveSegment::create(dir, Offset(0), config.roll);
         return unique_ptr<Log>(
             new Log(std::move(tp), std::move(dir), config, {}, std::move(active)));
@@ -89,6 +126,16 @@ unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, LogConfig con
                               it->second->nextOffset().toString() + " but the next begins at " +
                               expected.toString() + " — a segment file is missing");
     }
+
+    // Resolved before recovery, because recovery needs the roll policy — and the
+    // stored one may differ from the caller's.
+    //
+    // "Holds records" is judged from the sealed segments plus the fact that a
+    // newest segment exists: a partition with a segment file that has any bytes in
+    // it has been written to, whether or not those bytes survive recovery.
+    const bool hasRecords =
+        !sealed.empty() || filesystem::file_size(newest->second) > 0;
+    const LogConfig config = resolveConfig(dir, tp, fallback, hasRecords);
 
     auto active = ActiveSegment::recover(newest->second, config.roll);
 
