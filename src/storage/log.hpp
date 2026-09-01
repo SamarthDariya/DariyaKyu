@@ -9,6 +9,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <vector>
 #include <type_traits>
 
 #include "common/types.hpp"
@@ -90,6 +91,12 @@ struct RetentionPolicy {
     // "no limit" case cannot be confused with a very small one; the wire and
     // config encoding maps -1 to nullopt at the boundary.
     std::optional<std::uint64_t> retentionBytes = std::nullopt;
+
+    // How long a deleted segment's object is kept alive after its files are
+    // unlinked. See Log's graveyard below — this is a correctness setting, not a
+    // tuning knob: it is the window in which an already-issued FileRange can
+    // still be sent.
+    std::int64_t segmentDeleteDelayMs = 60'000;   // 1 minute, as Kafka defaults
 
     bool bytesLimited() const { return retentionBytes.has_value(); }
 };
@@ -208,6 +215,19 @@ public:
     // nothing.
     void truncateTo(Offset offset);
 
+    // Deletes sealed segments the retention policy no longer wants.
+    //
+    // The active segment is never deleted, so a partition can never shrink below
+    // one segment. Called by the maintenance sweep, which is why both limits are
+    // approximate by design.
+    void applyRetention(std::int64_t nowMs);
+
+    // Frees segments whose deletion delay has elapsed. Also called by the sweep.
+    void sweepGraveyard(std::int64_t nowMs);
+
+    // How many deleted-but-not-yet-freed segments are being held.
+    std::size_t graveyardSize() const;
+
     // Bytes this partition occupies across every segment it still owns.
     //
     // Summed on demand rather than tracked incrementally. A running counter
@@ -235,6 +255,33 @@ private:
     // taking it twice on one thread can deadlock against a waiting writer.
     std::uint64_t totalSizeBytesLocked() const;
 
+    // A segment whose files are gone but whose descriptor is still open.
+    //
+    // This exists because Log::read hands out a FileRange — a raw fd and a byte
+    // range — which the caller may not use until later, on another thread, via
+    // sendfile. Destroying the SealedSegment closes that fd. If retention did
+    // that while a range was in flight, the send would fail, or worse: the fd
+    // number gets reused by another file and a consumer is sent someone else's
+    // bytes.
+    //
+    // Unlinking is safe on its own — POSIX keeps the inode alive while any
+    // descriptor is open — so the fix is to delay DESTRUCTION, not unlinking.
+    // The directory entry goes immediately; the object lingers for
+    // segmentDeleteDelayMs and then goes, which is when the disk space actually
+    // comes back.
+    //
+    // The alternative was handing out shared_ptr<SealedSegment> from every read,
+    // which contradicts the ownership rule in DESIGN.md and puts an atomic
+    // refcount on the hot read path to solve a problem that happens once per
+    // segment.
+    struct BuriedSegment {
+        std::unique_ptr<SealedSegment> segment;
+        std::int64_t                   unlinkedAtMs = 0;
+    };
+
+    // Assumes segmentsMutex_ is held exclusively.
+    void burySegmentLocked(std::unique_ptr<SealedSegment> segment, std::int64_t nowMs);
+
     Log(TopicPartition tp, std::filesystem::path dir, LogConfig config,
         std::map<Offset, std::unique_ptr<SealedSegment>> sealed,
         std::unique_ptr<ActiveSegment> active);
@@ -245,6 +292,7 @@ private:
 
     std::map<Offset, std::unique_ptr<SealedSegment>> sealed_;
     std::unique_ptr<ActiveSegment>                   active_;
+    std::vector<BuriedSegment>                       graveyard_;
 
     std::atomic<Offset> logEndOffset_{Offset{0}};
     std::atomic<Offset> highWatermark_{Offset{0}};

@@ -1,5 +1,6 @@
 #include "storage/log.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <utility>
 
@@ -279,6 +280,65 @@ Offset Log::logStartOffset() const {
     // segment is the whole log.
     if (!sealed_.empty()) return sealed_.begin()->first;
     return active_->baseOffset();
+}
+
+void Log::applyRetention(int64_t nowMs) {
+    unique_lock lock(segmentsMutex_);
+
+    const int64_t retentionMs = config_.retention.retentionMs;
+
+    // Oldest first, stopping at the first segment worth keeping.
+    //
+    // Segments are ordered by base offset, which is write order — and write order
+    // is only USUALLY timestamp order, because timestamps come from producers. So
+    // one segment carrying a future timestamp blocks retention of everything
+    // behind it. That is the same behaviour Kafka has, and the byte limit is what
+    // keeps it from being unbounded.
+    while (!sealed_.empty()) {
+        const auto    oldest  = sealed_.begin();
+        const int64_t largest = oldest->second->largestTimestamp();
+
+        if (oldest->second->isEmpty()) {
+            // No records, so nothing to lose. An empty sealed segment is pure
+            // overhead and should not survive a sweep.
+        } else if (largest < 0) {
+            // Records, but no usable timestamp on any of them — the v2 format
+            // permits -1 for "no timestamp". There is no honest way to age this
+            // out, and keeping data is the safer error, so stop here and let the
+            // byte limit bound it instead.
+            break;
+        } else if (nowMs - largest < retentionMs) {
+            break;   // young enough
+        }
+
+        burySegmentLocked(std::move(oldest->second), nowMs);
+        sealed_.erase(oldest);
+    }
+}
+
+void Log::burySegmentLocked(unique_ptr<SealedSegment> segment, int64_t nowMs) {
+    // The directory entry goes now, so the partition stops listing it and a
+    // restart will not find it. The descriptor stays open, so any FileRange
+    // already handed out keeps working.
+    segment->unlinkFiles();
+    graveyard_.push_back({std::move(segment), nowMs});
+}
+
+void Log::sweepGraveyard(int64_t nowMs) {
+    unique_lock lock(segmentsMutex_);
+
+    const int64_t delay = config_.retention.segmentDeleteDelayMs;
+
+    // Destroying the unique_ptr closes the descriptor, which is the moment the
+    // inode's last reference goes and the disk space is actually reclaimed.
+    erase_if(graveyard_, [&](const BuriedSegment& buried) {
+        return nowMs - buried.unlinkedAtMs >= delay;
+    });
+}
+
+size_t Log::graveyardSize() const {
+    shared_lock lock(segmentsMutex_);
+    return graveyard_.size();
 }
 
 uint64_t Log::totalSizeBytes() const {
