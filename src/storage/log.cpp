@@ -281,6 +281,18 @@ Offset Log::logStartOffset() const {
     return active_->baseOffset();
 }
 
+uint64_t Log::totalSizeBytes() const {
+    shared_lock lock(segmentsMutex_);
+    return totalSizeBytesLocked();
+}
+
+uint64_t Log::totalSizeBytesLocked() const {
+    // There is always exactly one active segment, so it needs no emptiness check.
+    uint64_t total = active_->sizeBytes();
+    for (const auto& [base, segment] : sealed_) total += segment->sizeBytes();
+    return total;
+}
+
 size_t Log::segmentCount() const {
     shared_lock lock(segmentsMutex_);
     return sealed_.size() + 1;   // there is always exactly one active segment

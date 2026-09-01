@@ -2743,3 +2743,99 @@ TEST_CASE("A byte limit below one segment cannot be honoured") {
     CHECK(config.retention.retentionBytes < config.roll.maxSegmentBytes);
     CHECK(config.retention.bytesLimited());
 }
+
+// ===========================================================================
+// Log: size accounting
+// ===========================================================================
+
+namespace {
+
+// Adds up the .log files in a partition directory. Deliberately independent of
+// Log's own view, so the two can be compared.
+uint64_t logBytesOnDisk(const filesystem::path& partition) {
+    uint64_t total = 0;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log") total += filesystem::file_size(entry.path());
+    return total;
+}
+
+}  // namespace
+
+TEST_CASE("An empty log occupies no bytes") {
+    TempDir dir("log-size-empty");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
+
+    // The .log file exists but holds nothing, and the .index is preallocated —
+    // which this deliberately does not count. Retention-by-bytes is a statement
+    // about record data, and index files are derived, rebuildable, and bounded.
+    CHECK(log->totalSizeBytes() == 0);
+}
+
+TEST_CASE("Total size matches the bytes actually on disk") {
+    TempDir dir("log-size-disk");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, testConfig());
+
+    for (int i = 0; i < 12; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 64);
+        log->append(bytes);
+        CHECK(log->totalSizeBytes() == logBytesOnDisk(partition));
+    }
+}
+
+TEST_CASE("Total size spans every segment, sealed and active") {
+    TempDir dir("log-size-segments");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
+
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+    REQUIRE(log->segmentCount() > 3);
+
+    // Summed over segments, so a roll must not lose or double-count anything.
+    CHECK(log->totalSizeBytes() == logBytesOnDisk(partition));
+}
+
+TEST_CASE("Total size shrinks when the log is truncated") {
+    TempDir dir("log-size-truncate");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    auto    log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
+
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+    const uint64_t before = log->totalSizeBytes();
+
+    log->truncateTo(Offset(10));
+
+    // Computed rather than tracked, so it needs no help from truncateTo to stay
+    // right — which is the reason it is computed.
+    CHECK(log->totalSizeBytes() < before);
+    CHECK(log->totalSizeBytes() == logBytesOnDisk(partition));
+}
+
+TEST_CASE("Total size survives a restart") {
+    TempDir dir("log-size-reopen");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 400;
+    uint64_t before = 0;
+    {
+        auto log = Log::create(TopicPartition{"orders", 0}, partition, configWith(policy));
+        for (int i = 0; i < 25; ++i) {
+            auto bytes = makeUnstampedBatch(1000 + i, 48);
+            log->append(bytes);
+        }
+        before = log->totalSizeBytes();
+    }
+
+    auto reopened = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
+    CHECK(reopened->totalSizeBytes() == before);
+}

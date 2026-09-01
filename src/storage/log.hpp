@@ -208,6 +208,18 @@ public:
     // nothing.
     void truncateTo(Offset offset);
 
+    // Bytes this partition occupies across every segment it still owns.
+    //
+    // Summed on demand rather than tracked incrementally. A running counter
+    // would be a second source of truth that could drift from the files after a
+    // roll, a truncation, or a retention pass — and the sum is over segments, of
+    // which there are tens, not records, of which there are billions.
+    //
+    // This is what retention-by-bytes measures. It counts the active segment
+    // too, even though retention will never delete it: the limit is a statement
+    // about disk used by the partition, and the active segment is using disk.
+    std::uint64_t totalSizeBytes() const;
+
     std::size_t segmentCount() const;
 
     const TopicPartition&        topicPartition() const { return tp_; }
@@ -218,6 +230,11 @@ public:
     Log& operator=(const Log&) = delete;
 
 private:
+    // Assumes segmentsMutex_ is already held. Exists because retention needs the
+    // total while holding the exclusive lock, and shared_mutex is not reentrant —
+    // taking it twice on one thread can deadlock against a waiting writer.
+    std::uint64_t totalSizeBytesLocked() const;
+
     Log(TopicPartition tp, std::filesystem::path dir, LogConfig config,
         std::map<Offset, std::unique_ptr<SealedSegment>> sealed,
         std::unique_ptr<ActiveSegment> active);
