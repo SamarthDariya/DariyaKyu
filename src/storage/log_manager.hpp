@@ -51,6 +51,21 @@ public:
     // request handler will look up per request rather than caching.
     Log* get(const TopicPartition& tp) const;
 
+    // Creates a partition, registers it, and returns it.
+    //
+    // A reference rather than a pointer: on success it always exists, and a
+    // pointer would invite a null check that can never fire. Non-owning either
+    // way — the manager keeps the unique_ptr.
+    //
+    // Throws if the partition is already hosted here. That is a caller bug rather
+    // than a race: the controller decides where partitions live, so asking twice
+    // means its view and the broker's have diverged, and quietly returning the
+    // existing one would hide that. M4 maps it to TOPIC_ALREADY_EXISTS.
+    Log& createPartition(const TopicPartition& tp, const LogConfig& config);
+
+    // Same, with the manager's defaults.
+    Log& createPartition(const TopicPartition& tp);
+
     std::size_t partitionCount() const;
 
     const std::filesystem::path& dataDir() const { return dataDir_; }
