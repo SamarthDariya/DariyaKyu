@@ -314,6 +314,34 @@ void Log::applyRetention(int64_t nowMs) {
         burySegmentLocked(std::move(oldest->second), nowMs);
         sealed_.erase(oldest);
     }
+
+    if (!config_.retention.bytesLimited()) return;
+
+    // The byte limit, applied after the age pass — which may already have freed
+    // enough — and oldest-first for the same reason.
+    //
+    // Unconditional, unlike the age pass: it does not care about timestamps at
+    // all. That is exactly what makes it the backstop. Age retention stops at the
+    // first segment it cannot age out, so one batch carrying a future timestamp,
+    // or records with no timestamp, would otherwise let a partition grow without
+    // bound. This is the limit that always eventually bites.
+    const uint64_t limit = *config_.retention.retentionBytes;
+
+    // Decremented as segments go rather than recomputed each round, so this stays
+    // linear in the number of segments deleted instead of quadratic.
+    uint64_t total = totalSizeBytesLocked();
+
+    // Terminates on either condition, and the second one matters: the active
+    // segment is never deleted, so a partition cannot shrink below one segment.
+    // A limit smaller than maxSegmentBytes therefore leaves the partition
+    // permanently over it, having deleted everything it was allowed to — see the
+    // note on RetentionPolicy.
+    while (total > limit && !sealed_.empty()) {
+        const auto oldest = sealed_.begin();
+        total -= oldest->second->sizeBytes();
+        burySegmentLocked(std::move(oldest->second), nowMs);
+        sealed_.erase(oldest);
+    }
 }
 
 void Log::burySegmentLocked(unique_ptr<SealedSegment> segment, int64_t nowMs) {
