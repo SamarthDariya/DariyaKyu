@@ -120,7 +120,13 @@ target_link_libraries(codec_tests PRIVATE dariyakyu_storage doctest::doctest)
 target_compile_options(codec_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME codec_tests COMMAND codec_tests)
 
-add_executable(log_tests tests/log_tests.cpp)
-target_link_libraries(log_tests PRIVATE dariyakyu_storage doctest::doctest)
-target_compile_options(log_tests PRIVATE -Wall -Wextra -Wpedantic)
-add_test(NAME log_tests COMMAND log_tests)
+# The storage suites share tests/test_support.hpp, so each needs tests/ on its
+# include path. Split by layer rather than kept as one file: a single 4,000-line
+# suite meant every change rebuilt and reran all of it.
+foreach(suite index_tests segment_tests log_tests manager_tests)
+  add_executable(${suite} tests/${suite}.cpp)
+  target_link_libraries(${suite} PRIVATE dariyakyu_storage doctest::doctest)
+  target_include_directories(${suite} PRIVATE tests)
+  target_compile_options(${suite} PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME ${suite} COMMAND ${suite})
+endforeach()
