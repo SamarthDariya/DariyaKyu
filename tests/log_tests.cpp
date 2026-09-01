@@ -3274,3 +3274,136 @@ TEST_CASE("A leftover temporary from an interrupted write is not appended to") {
           encodePartitionMeta(sampleMeta()));
     CHECK_FALSE(filesystem::exists(partition / "partition.meta.tmp"));
 }
+
+// ===========================================================================
+// partition.meta — decoding and validation
+// ===========================================================================
+
+namespace {
+
+void checkMetaEqual(const PartitionMeta& got, const PartitionMeta& want) {
+    CHECK(got.tp.topic == want.tp.topic);
+    CHECK(got.tp.partition == want.tp.partition);
+    CHECK(got.config.roll.maxSegmentBytes == want.config.roll.maxSegmentBytes);
+    CHECK(got.config.roll.maxSegmentAgeMs == want.config.roll.maxSegmentAgeMs);
+    CHECK(got.config.roll.indexIntervalBytes == want.config.roll.indexIntervalBytes);
+    CHECK(got.config.roll.maxIndexBytes == want.config.roll.maxIndexBytes);
+    CHECK(got.config.retention.retentionMs == want.config.retention.retentionMs);
+    CHECK(got.config.retention.retentionBytes == want.config.retention.retentionBytes);
+    CHECK(got.config.retention.segmentDeleteDelayMs ==
+          want.config.retention.segmentDeleteDelayMs);
+}
+
+}  // namespace
+
+TEST_CASE("The meta round-trips through encode and decode") {
+    const auto meta = sampleMeta();
+    checkMetaEqual(decodePartitionMeta(encodePartitionMeta(meta)), meta);
+}
+
+TEST_CASE("Unlimited and zero retention bytes survive the round trip distinctly") {
+    PartitionMeta unlimited = sampleMeta();
+    unlimited.config.retention.retentionBytes = nullopt;
+    const auto decodedUnlimited = decodePartitionMeta(encodePartitionMeta(unlimited));
+    CHECK_FALSE(decodedUnlimited.config.retention.bytesLimited());
+
+    PartitionMeta zero = sampleMeta();
+    zero.config.retention.retentionBytes = 0;
+    const auto decodedZero = decodePartitionMeta(encodePartitionMeta(zero));
+    CHECK(decodedZero.config.retention.bytesLimited());
+    CHECK(decodedZero.config.retention.retentionBytes == 0u);
+}
+
+TEST_CASE("A file that is not a partition.meta is refused by its magic") {
+    auto bytes = encodePartitionMeta(sampleMeta());
+    bytes[1] ^= 0xFF;
+
+    // Without the magic, a wrong file would be decoded as lengths and offsets out
+    // of unrelated bytes.
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
+    CHECK_THROWS_AS(decodePartitionMeta(vector<uint8_t>(80, 0x00)), CorruptData);
+}
+
+TEST_CASE("A version this build does not know is refused, not guessed at") {
+    auto bytes = encodePartitionMeta(sampleMeta());
+    bytes[5] = PartitionMeta::kVersion + 1;   // written by a newer broker
+
+    // Reading a config file wrongly is worse than not reading it: a
+    // misinterpreted retention limit silently deletes data or silently keeps it
+    // forever.
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
+
+    bytes[5] = 0;
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
+}
+
+TEST_CASE("A truncated meta is refused") {
+    const auto full = encodePartitionMeta(sampleMeta());
+
+    // Every prefix short of the whole thing. BufferReader throws the moment a
+    // read runs past the end, so no length arithmetic is needed for this.
+    for (size_t length = 0; length < full.size(); ++length) {
+        const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
+        CHECK_THROWS_AS(decodePartitionMeta(partial), CorruptData);
+    }
+    CHECK_NOTHROW(decodePartitionMeta(full));
+}
+
+TEST_CASE("Trailing bytes are refused") {
+    auto bytes = encodePartitionMeta(sampleMeta());
+    bytes.push_back(0x00);
+
+    // The version matched, so there is no forward-compatibility story that
+    // explains a longer file. The likely cause is a write that appended instead
+    // of replacing.
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
+}
+
+TEST_CASE("An impossible topic length is refused") {
+    auto bytes = encodePartitionMeta(sampleMeta());
+
+    // The length field sits after the 4-byte magic and 2-byte version.
+    bytes[6] = 0xFF;
+    bytes[7] = 0xFF;   // -1
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
+
+    bytes[6] = 0x00;
+    bytes[7] = 0x00;   // empty topic name
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
+}
+
+TEST_CASE("The meta round-trips through the filesystem") {
+    TempDir dir("meta-read");
+    const filesystem::path partition = dir.file("orders-3");
+    filesystem::create_directories(partition);
+
+    const auto meta = sampleMeta();
+    writePartitionMeta(partition, meta);
+
+    checkMetaEqual(readPartitionMeta(partition, TopicPartition{"orders", 3}), meta);
+}
+
+TEST_CASE("A meta describing a different partition is refused") {
+    TempDir dir("meta-mismatch");
+    const filesystem::path partition = dir.file("orders-3");
+    filesystem::create_directories(partition);
+    writePartitionMeta(partition, sampleMeta());   // says orders-3
+
+    // What a hand-copied partition directory looks like. The file and the
+    // directory disagree about which partition these records belong to, and
+    // picking either answer risks serving one topic's data under another's name.
+    CHECK_THROWS_AS(readPartitionMeta(partition, TopicPartition{"orders", 4}), CorruptData);
+    CHECK_THROWS_AS(readPartitionMeta(partition, TopicPartition{"payments", 3}), CorruptData);
+    CHECK_NOTHROW(readPartitionMeta(partition, TopicPartition{"orders", 3}));
+}
+
+TEST_CASE("A missing meta file is an I/O error, not corruption") {
+    TempDir dir("meta-missing");
+    const filesystem::path partition = dir.file("orders-3");
+    filesystem::create_directories(partition);
+
+    // The distinction matters to the caller: absent means "this partition
+    // predates the file, or was interrupted before writing it", which is
+    // recoverable. Present-but-unreadable is not.
+    CHECK_THROWS_AS(readPartitionMeta(partition, TopicPartition{"orders", 3}), IoError);
+}
