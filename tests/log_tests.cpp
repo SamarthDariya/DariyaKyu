@@ -2839,3 +2839,185 @@ TEST_CASE("Total size survives a restart") {
     auto reopened = Log::open(TopicPartition{"orders", 0}, partition, configWith(policy));
     CHECK(reopened->totalSizeBytes() == before);
 }
+
+// ===========================================================================
+// Log: retention by age
+// ===========================================================================
+
+namespace {
+
+// A log with several sealed segments, each carrying timestamps `stepMs` apart, so
+// tests can age individual segments out.
+unique_ptr<Log> logWithAgedSegments(const filesystem::path& partition, LogConfig config,
+                                    int batches, int64_t firstTimestamp, int64_t stepMs) {
+    config.roll.maxSegmentBytes = 400;
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+    for (int i = 0; i < batches; ++i) {
+        auto bytes = makeUnstampedBatch(firstTimestamp + i * stepMs, 48);
+        log->append(bytes);
+    }
+    return log;
+}
+
+}  // namespace
+
+TEST_CASE("Retention deletes sealed segments older than the window") {
+    TempDir dir("ret-age");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs = 10'000;
+
+    // Timestamps 1000 ms apart, so the oldest segments are well past the window
+    // and the newest are inside it.
+    auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+    const size_t before = log->segmentCount();
+    REQUIRE(before > 4);
+
+    // "Now" is just after the last record, so records older than 10 s go.
+    log->applyRetention(100'000 + 39 * 1'000);
+
+    CHECK(log->segmentCount() < before);
+    CHECK(log->logStartOffset() > Offset(0));
+    CHECK(log->graveyardSize() == before - log->segmentCount());
+}
+
+TEST_CASE("Retention never deletes the active segment") {
+    TempDir dir("ret-active");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs = 1;
+
+    auto log = logWithAgedSegments(partition, config, 30, 1'000, 1'000);
+
+    // Everything is ancient, so retention would take the lot if it could.
+    log->applyRetention(1'000'000'000);
+
+    CHECK(log->segmentCount() == 1);        // exactly the active one
+    CHECK(log->logEndOffset() == Offset(30));
+    CHECK(log->totalSizeBytes() > 0);       // the active segment's data survives
+}
+
+TEST_CASE("Retention leaves segments inside the window alone") {
+    TempDir dir("ret-young");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs = 1'000'000;
+
+    auto log = logWithAgedSegments(partition, config, 30, 100'000, 1'000);
+    const size_t before = log->segmentCount();
+
+    log->applyRetention(100'000 + 29 * 1'000);
+
+    CHECK(log->segmentCount() == before);
+    CHECK(log->graveyardSize() == 0);
+    CHECK(log->logStartOffset() == Offset(0));
+}
+
+TEST_CASE("A deleted segment's files are gone from the directory") {
+    TempDir dir("ret-unlinked");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs = 10'000;
+
+    auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+    const Offset oldest = log->logStartOffset();
+    REQUIRE(filesystem::exists(segmentLogPath(partition, oldest)));
+
+    log->applyRetention(100'000 + 39 * 1'000);
+    REQUIRE(log->logStartOffset() > oldest);
+
+    CHECK_FALSE(filesystem::exists(segmentLogPath(partition, oldest)));
+    CHECK_FALSE(filesystem::exists(segmentIndexPath(partition, oldest)));
+}
+
+TEST_CASE("A range handed out before retention is still readable after it") {
+    TempDir dir("ret-inflight");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs = 10'000;
+
+    auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+
+    // A fetch resolved but not yet sent — the network layer would hand this to
+    // sendfile on an I/O thread some time later.
+    const auto inflight = log->read(Offset(0), kBigFetch);
+    REQUIRE(inflight.ok());
+    REQUIRE_FALSE(inflight.range.empty());
+
+    log->applyRetention(100'000 + 39 * 1'000);
+    REQUIRE(log->logStartOffset() > Offset(0));
+    REQUIRE(log->graveyardSize() > 0);
+
+    // The whole reason the graveyard exists. Without it the descriptor would be
+    // closed, and its number possibly reused by another file — so this pread
+    // would fail, or silently return another file's bytes.
+    const auto bytes = pullRange(inflight.range);
+    CHECK(RecordBatch::verifyCrc(bytes));
+    CHECK(RecordBatch::parseHeader(bytes).baseOffset == Offset(0));
+}
+
+TEST_CASE("A buried segment is freed once its delay elapses") {
+    TempDir dir("ret-sweep");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs         = 10'000;
+    config.retention.segmentDeleteDelayMs = 60'000;
+
+    auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+    const int64_t now = 100'000 + 39 * 1'000;
+
+    log->applyRetention(now);
+    const size_t buried = log->graveyardSize();
+    REQUIRE(buried > 0);
+
+    // Too early: the delay is the window in which an already-issued FileRange
+    // can still be sent, so sweeping sooner would defeat it.
+    log->sweepGraveyard(now + 59'000);
+    CHECK(log->graveyardSize() == buried);
+
+    log->sweepGraveyard(now + 60'000);
+    CHECK(log->graveyardSize() == 0);
+}
+
+TEST_CASE("Reads below the new log start report BelowLogStart") {
+    TempDir dir("ret-below-start");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs = 10'000;
+
+    auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+    log->applyRetention(100'000 + 39 * 1'000);
+
+    const Offset start = log->logStartOffset();
+    REQUIRE(start > Offset(0));
+
+    // What a lagging consumer actually gets. Distinct from AboveLogEnd, because
+    // the client's reset policy treats them differently: this one means "you were
+    // too slow, jump to the earliest offset available".
+    CHECK(log->read(Offset(0), kBigFetch).error == ReadError::BelowLogStart);
+    CHECK(log->read(start - 1, kBigFetch).error == ReadError::BelowLogStart);
+    CHECK(log->read(start, kBigFetch).ok());
+    CHECK_FALSE(log->read(start, kBigFetch).range.empty());
+}
+
+TEST_CASE("Retention survives a restart") {
+    TempDir dir("ret-reopen");
+    const filesystem::path partition = dir.file("orders-0");
+    LogConfig config;
+    config.retention.retentionMs = 10'000;
+    Offset start{0};
+    Offset end{0};
+    {
+        auto log = logWithAgedSegments(partition, config, 40, 100'000, 1'000);
+        log->applyRetention(100'000 + 39 * 1'000);
+        start = log->logStartOffset();
+        end   = log->logEndOffset();
+    }
+
+    // The deletion was to the files, so a reopen must agree — and the contiguity
+    // check must accept a log whose earliest segment is not offset zero.
+    auto reopened = Log::open(TopicPartition{"orders", 0}, partition, config);
+    CHECK(reopened->logStartOffset() == start);
+    CHECK(reopened->logEndOffset() == end);
+    CHECK(reopened->read(Offset(0), kBigFetch).error == ReadError::BelowLogStart);
+}
