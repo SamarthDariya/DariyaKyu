@@ -1196,3 +1196,290 @@ throws `CorruptData` and recovery catches it to decide where to truncate.
 - **Control batches** (transaction markers) — only if transactions ever land.
 - **Buffer pooling** — decode allocates nothing, but encode allocates per batch. Wait for M9
   numbers.
+
+### 4. The protocol and the server
+
+The first chunk where dariyakyu becomes a program you talk to rather than a library you link.
+Everything below sits *above* the storage layer and knows nothing about segments — a handler asks
+`LogManager` for a `Log`, gets a `FileRange` back, and turns it into bytes on a socket.
+
+The protocol is **our own, shaped like Kafka's** (decision 19). Wire compatibility is weeks of
+serialisation work for very little learning, so it is scoped out — but the shape is kept close
+enough that a translation shim could be added later rather than a redesign. One consequence
+worth stating up front: `BufferReader::readArrayLength` already exists, written at M1 with a
+comment saying it is for this layer. Nearly every request here is an array of topics containing
+an array of partitions.
+
+#### The wire: length-prefixed frames
+
+```
+┌─────────────────────────────────────────────┐
+│ frameLength   int32   bytes that follow     │
+├─────────────────────────────────────────────┤
+│ apiKey        int16                         │
+│ apiVersion    int16                         │
+│ correlationId int32                         │
+│ clientId      int16 length + bytes          │
+├─────────────────────────────────────────────┤
+│ [ body, per apiKey ]                        │
+└─────────────────────────────────────────────┘
+```
+
+A length prefix rather than a delimiter, because record bytes are arbitrary and any delimiter
+would need escaping — which would mean touching the payload, which is the one thing this design
+refuses to do.
+
+`frameLength` is bounded by a configured maximum and a frame claiming more is refused before a
+single byte is buffered. Without that, one client sending `0x7FFFFFFF` makes the broker try to
+allocate two gigabytes.
+
+**`correlationId` is echoed, never interpreted.** It exists so a client can have several requests
+in flight on one connection and match responses to them. Note what that does *not* require of the
+broker at M4: one thread per connection reads a request, answers it, and reads the next, so
+responses come back in order. The id is what lets M9 reorder them without a protocol change.
+
+#### A response is a list of segments, not a buffer
+
+This is the decision the rest of the chunk hangs off, and it is forced by two requirements that
+pull in opposite directions.
+
+A `Fetch` response interleaves two kinds of bytes:
+
+```
+[ frameLength ][ correlationId ][ meta for orders-0 ][ 900 KB from a .log file ]
+                                [ meta for orders-1 ][  40 KB from another    ]
+```
+
+The metadata is computed in memory. The record bytes are already in a file, and decision 13 says
+they must never enter user space — that is what `sendfile` is for, and `Log::read` returning a
+`FileRange` is how the storage layer enforces it.
+
+But `sendfile` can only send *file* bytes. It cannot also send the metadata. So a response cannot
+be one buffer, and it cannot be one syscall: it has to be written as an alternating sequence.
+
+And the **frame length has to go out first**, before any of it, which means knowing the total —
+including bytes not yet sent — in advance.
+
+That is affordable precisely because `Log::read` resolves a *location*: every range's length is
+known without reading it. So:
+
+```cpp
+// One piece of a response: bytes we own, or a place in a file.
+struct ResponseSegment {
+    vector<uint8_t> buffer;   // used when range is empty
+    FileRange       range;
+};
+
+class Response {
+public:
+    void append(vector<uint8_t> buffer);
+    void append(FileRange range);
+    size_t totalBytes() const;            // the frame length, by arithmetic
+    span<const ResponseSegment> segments() const;
+};
+```
+
+and the connection walks it:
+
+```cpp
+writeFrameLength(socket, response.totalBytes());
+for (const auto& segment : response.segments())
+    if (segment.range.empty()) writeAll(socket, segment.buffer);
+    else                       sendFileAll(socket, segment.range);
+```
+
+Three things fall out of this shape, and each of them is why it is the right one:
+
+1. **Encoders never learn about sockets.** A handler builds a `Response`; something else decides
+   how it reaches the wire. The same `Response` is testable in memory by concatenating its
+   segments, which is how every codec test in Group B works.
+2. **A half-sent response has a small, obvious resumption state** — which segment, and how far
+   into it. At M4 with blocking sockets that is a loop; at M9 with non-blocking sockets it is
+   exactly the state a partially-written response needs to carry.
+3. **Every other API still works.** A `Produce` or `Metadata` response is a `Response` with one
+   buffer segment and no ranges. The abstraction costs them nothing.
+
+Kafka arrived at the same answer, and calls it `Send` — with a `MultiRecordsSend` for the
+multi-partition case.
+
+**This is what M3's deferred deletion was for.** A response is built on one thread and written
+later, possibly after retention has run. Without the graveyard, the descriptor in a `FileRange`
+could be closed — or its number reused by another file, sending a consumer someone else's bytes.
+M4 is the first milestone that needs that guarantee, and the first that would have discovered its
+absence the hard way.
+
+#### Error codes: numeric, and per partition
+
+Errors are `int16` codes, as Kafka does it, because a client has to branch on them and a string
+is not something to branch on.
+
+They are attached **per partition**, not per request. A fetch across twelve partitions where one
+has been reassigned must return eleven partitions' worth of data plus one error, not fail
+wholesale — otherwise a single moved partition stalls every consumer that happened to batch it
+with others.
+
+```cpp
+enum class ErrorCode : int16_t {
+    None                    = 0,
+    Unknown                 = 1,
+    OffsetOutOfRange        = 2,   // from ReadError::BelowLogStart / AboveLogEnd
+    CorruptMessage          = 3,   // a produced batch failing its own CRC
+    NotLeaderForPartition   = 4,   // LogManager::get returned nullptr
+    UnknownTopicOrPartition = 5,
+    TopicAlreadyExists      = 6,
+    InvalidTopic            = 7,   // a name that cannot be a directory name
+    RequestTimedOut         = 8,
+    UnsupportedVersion      = 9,
+};
+```
+
+**This layer is where storage's vocabulary is translated, and the translation only happens here**
+(decision 12). Storage never learns what a wire code is:
+
+| Storage says | Wire says |
+|---|---|
+| `ReadError::BelowLogStart` | `OffsetOutOfRange` |
+| `ReadError::AboveLogEnd` | `OffsetOutOfRange` |
+| `LogManager::get` → `nullptr` | `NotLeaderForPartition` |
+| `OffsetInvariantViolated` thrown | `Unknown` — it is a broker bug, and saying so plainly beats inventing a client-facing story for it |
+| `IoError` thrown | `Unknown` |
+
+**Amended while implementing — `CorruptData` has no single answer, so it gets no
+mapping function.** The same exception type means different things depending on which direction
+the bytes came from:
+
+- thrown from a **`Produce`** → `CorruptMessage`. The client sent a batch that fails its own
+  checksum; that is its fault and it should be told precisely.
+- thrown from a **`Fetch`** → `Unknown`. Our files are damaged. Telling the client its *message*
+  was corrupt would send it chasing a bug it does not have.
+
+So only `errorCodeFor(ReadError)` exists as a function — the one translation that is unambiguous.
+Exceptions are mapped at each handler's catch site, where the direction is known. A universal
+`errorCodeFor(const Error&)` would have looked tidier and been wrong.
+
+Note the first two collapse. The distinction matters to the *client's reset policy*, which is why
+storage keeps them apart — but Kafka's shape has one code here, and the client learns which side
+it fell on by comparing against the log start and end offsets it is also given. Keeping our own
+codes distinct is banked below.
+
+#### The five APIs
+
+Enough to produce and consume, and nothing else.
+
+| API | Request | Response |
+|---|---|---|
+| `Metadata` | topics (empty = all) | per topic: partitions, and which broker leads each |
+| `CreateTopic` | name, partition count, config overrides | per topic error code |
+| `Produce` | acks, timeoutMs, `[(tp, batchBytes)]` | per partition: error, base offset assigned |
+| `Fetch` | maxWaitMs, minBytes, `[(tp, offset, maxBytes)]` | per partition: error, high watermark, log start, records |
+| `ListOffsets` | `[(tp, timestamp)]` — earliest / latest | per partition: error, offset |
+
+`Produce` carries **batch bytes the broker does not decode**. It validates the CRC and reads the
+header for a record count, then hands the bytes to `Log::append`, which stamps twelve of them.
+That is the whole write path, and it is why a compressed batch costs the broker nothing.
+
+`Fetch`'s `maxWaitMs` and `minBytes` are accepted and **ignored** at M4: a fetch returns whatever
+is available immediately. Long-polling — parking a fetch until enough data arrives — needs a
+request to outlive the thread that read it, which is M9's architecture. Ignoring them keeps the
+protocol stable across that change rather than adding fields later.
+
+`ListOffsets` is deliberately first to implement. It touches no record data, so it exercises
+framing, dispatch and error mapping with nothing else in the way.
+
+#### Dispatch: `ApiRegistry` and `BrokerContext`
+
+```cpp
+// Everything a handler is allowed to touch.
+struct BrokerContext {
+    LogManager& logs;
+    NodeId      nodeId;
+    // M8 adds the controller's view; M5 adds the group coordinator.
+};
+
+using Handler = function<Response(const RequestHeader&, BufferReader& body, BrokerContext&)>;
+
+class ApiRegistry {
+public:
+    void registerHandler(ApiKey key, int16_t version, Handler handler);
+    Response dispatch(const RequestHeader&, BufferReader& body, BrokerContext&) const;
+};
+```
+
+A registry rather than a `switch`, for one reason that matters later: `apiVersion` is in the
+header, and versioned APIs mean two handlers for one key. A `switch` on key with a nested `switch`
+on version is the shape that rots. An unknown key or version answers `UnsupportedVersion` rather
+than closing the connection — a client probing what a broker supports is normal behaviour, not an
+error.
+
+`BrokerContext` is a struct of references, passed by reference, holding no ownership. Handlers are
+stateless; everything they mutate lives in `LogManager`, which already has its own locking. There
+is no broker-wide lock in this design and no place for one to be added by accident.
+
+#### Threading: one thread per connection
+
+M4's server is the simplest thing that works:
+
+```
+acceptor thread   accept() → spawn a thread → back to accept()
+connection thread read frame → dispatch → write response → repeat until EOF
+```
+
+Chosen because it makes M4 about the *protocol*, not about an event loop. Every hard concurrency
+question — a request queue, an I/O pool, `sendfile` off the network thread, backpressure — is
+decision 20's territory and is M9's milestone, with benchmarks to say whether it was worth it. A
+thread per connection is fine for the tens of connections this will ever see, and it is
+comparable enough to measure M9 against.
+
+**Shutting it down is the part that needs designing.** A thread blocked in `accept()` or `read()`
+does not notice a flag. So:
+
+- the acceptor is unblocked by **closing the listening socket**, which makes `accept` fail
+- connection threads are unblocked by `shutdown()` on their sockets, then joined
+- a thread mid-`sendfile` finishes or fails; either is acceptable, because a client whose broker
+  is shutting down has to reconnect regardless
+
+This is the M4 counterpart of M3's condition-variable shutdown, and for the same reason: a
+shutdown slow enough to be `SIGKILL`ed turns every deploy into a crash-recovery path.
+
+#### The CLI
+
+`dariyakyu-cli` is a real client, not test scaffolding, and it links the same `protocol` library
+the broker does. That is deliberate: a field the encoder writes and the decoder ignores shows up
+the first time the CLI talks to the broker, rather than at M5 when a second implementation
+appears.
+
+```
+dariyakyu-cli produce  <topic> <partition>          records from stdin, one per line
+dariyakyu-cli consume  <topic> <partition> [--from earliest|latest|N]
+dariyakyu-cli describe <topic>                      Metadata, printed
+dariyakyu-cli dump-segment <partition-dir>          the existing dariyakyu-dump, folded in
+```
+
+`dump-segment` is the odd one out — it reads files directly and never opens a socket. It stays
+because that is exactly when it is wanted: when the broker will not start.
+
+#### Rejected alternatives
+
+| Alternative | Why not |
+|---|---|
+| A response as one `vector<uint8_t>` | Copies every payload byte twice and deletes decision 13 with it. The reason the segment list exists |
+| Kafka wire compatibility | Weeks of serialisation for little learning (decision 19). The shape is kept close so a shim stays possible |
+| Text or JSON framing | The payload is arbitrary bytes; any escaping means touching it |
+| A delimiter instead of a length | Same problem, plus no way to size a read up front |
+| One `switch` on `apiKey` | `apiVersion` makes it a nested switch, which is the shape that rots |
+| An event loop at M4 | Makes the milestone about the loop rather than the protocol. Decision 20 and M9's benchmarks |
+| Long-polling fetches at M4 | Needs a request to outlive the thread that read it — M9's architecture. The fields are accepted now so the protocol does not change later |
+| A broker-wide lock | Nothing needs one: handlers are stateless and `LogManager` locks its own registry |
+
+#### Banked for later
+
+- **`sf_hdtr`** — macOS's `sendfile` can send in-memory headers and file bytes in one syscall,
+  which maps exactly onto the segment list. Linux has no equivalent. M9, with numbers.
+- **Long-polling fetch** (`maxWaitMs`, `minBytes` honoured) — M9, when a parked request has
+  somewhere to live.
+- **Distinct codes for the two `OffsetOutOfRange` cases** — storage already separates them, and a
+  client's reset policy genuinely differs. Deferred only to keep the first version Kafka-shaped.
+- **`acks` beyond a single node** — the field is in `Produce` from M4 and means nothing until M7.
+- **Multi-broker `Metadata`** — one node, so every partition's leader is this one. M8 makes it a
+  real answer.
+- **TLS, SASL, quotas** — not in this project.

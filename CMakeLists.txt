@@ -69,6 +69,22 @@ target_link_libraries(dariyakyu_storage PUBLIC dariyakyu_common)
 target_compile_options(dariyakyu_storage PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
+# Library: protocol
+# ---------------------------------------------------------------------------
+#
+# The wire format and the request/response types. Depends on storage, because a
+# response carries a FileRange and an error code is translated from a ReadError.
+# Linked by both the broker and the CLI, so a field the encoder writes and the
+# decoder ignores shows up the first time they talk.
+
+add_library(dariyakyu_protocol
+  src/protocol/error_codes.cpp
+)
+
+target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)
+target_compile_options(dariyakyu_protocol PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 #
@@ -123,9 +139,9 @@ add_test(NAME codec_tests COMMAND codec_tests)
 # The storage suites share tests/test_support.hpp, so each needs tests/ on its
 # include path. Split by layer rather than kept as one file: a single 4,000-line
 # suite meant every change rebuilt and reran all of it.
-foreach(suite index_tests segment_tests log_tests manager_tests)
+foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests)
   add_executable(${suite} tests/${suite}.cpp)
-  target_link_libraries(${suite} PRIVATE dariyakyu_storage doctest::doctest)
+  target_link_libraries(${suite} PRIVATE dariyakyu_protocol doctest::doctest)
   target_include_directories(${suite} PRIVATE tests)
   target_compile_options(${suite} PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME ${suite} COMMAND ${suite})
