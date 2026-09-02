@@ -79,6 +79,7 @@ target_compile_options(dariyakyu_storage PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(dariyakyu_protocol
   src/protocol/error_codes.cpp
+  src/protocol/request_header.cpp
 )
 
 target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)

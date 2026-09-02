@@ -21,6 +21,18 @@ class BufferReader {
 public:
     explicit BufferReader(std::span<const std::uint8_t> bytes) : bytes_(bytes) {}
 
+    // Constructing from a temporary is a use-after-free waiting to happen: the
+    // reader borrows, and the vector dies at the end of the expression.
+    //
+    //     BufferReader in(encodeHeader(header));   // no
+    //     auto bytes = encodeHeader(header);       // yes
+    //     BufferReader in(bytes);
+    //
+    // A temporary would otherwise convert silently to a span, so the rvalue
+    // overload is deleted to turn it into a compile error. Same guard, and the
+    // same reasoning, as RecordBatch::decodeRecords(vector&&).
+    explicit BufferReader(std::vector<std::uint8_t>&&) = delete;
+
     std::int8_t   readInt8();
     std::int16_t  readInt16();
     std::int32_t  readInt32();
