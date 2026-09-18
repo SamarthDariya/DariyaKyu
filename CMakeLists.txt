@@ -83,6 +83,8 @@ add_library(dariyakyu_protocol
   src/protocol/request_header.cpp
   src/protocol/frame.cpp
   src/protocol/response.cpp
+  src/protocol/wire.cpp
+  src/protocol/list_offsets.cpp
 )
 
 target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)
@@ -143,7 +145,7 @@ add_test(NAME codec_tests COMMAND codec_tests)
 # The storage suites share tests/test_support.hpp, so each needs tests/ on its
 # include path. Split by layer rather than kept as one file: a single 4,000-line
 # suite meant every change rebuilt and reran all of it.
-foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests)
+foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests)
   add_executable(${suite} tests/${suite}.cpp)
   target_link_libraries(${suite} PRIVATE dariyakyu_protocol doctest::doctest)
   target_include_directories(${suite} PRIVATE tests)
