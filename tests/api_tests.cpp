@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "protocol/fetch.hpp"
 #include "protocol/list_offsets.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/metadata.hpp"
@@ -592,5 +593,218 @@ TEST_CASE("A truncated Produce request is refused at every length") {
         const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
         BufferReader          in(partial);
         CHECK_THROWS_AS(decodeProduceRequest(in), CorruptData);
+    }
+}
+
+// ===========================================================================
+// Fetch
+// ===========================================================================
+
+namespace {
+
+// A partition with real batches, so a fetch response can carry ranges that point
+// at bytes something actually wrote.
+struct FetchFixture {
+    TempDir                  dir;
+    unique_ptr<storage::Log> log;
+    explicit FetchFixture(const string& name, int records = 20) : dir(name) {
+        log = storage::Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"),
+                                   testConfig());
+        for (int i = 0; i < records; ++i) {
+            auto bytes = makeUnstampedBatch(1000 + i, 48);
+            log->append(bytes);
+        }
+    }
+};
+
+}  // namespace
+
+TEST_CASE("A Fetch request round-trips") {
+    FetchRequest request;
+    request.maxWaitMs = 500;
+    request.minBytes  = 1;
+    request.topics.push_back({"orders", {{0, Offset(100), 1 << 20}, {1, Offset(0), 4096}}});
+
+    const auto decoded =
+        roundTrip([&](BufferWriter& out) { encodeFetchRequest(out, request); },
+                  [](BufferReader& in) { return decodeFetchRequest(in); });
+
+    CHECK(decoded.maxWaitMs == 500);
+    CHECK(decoded.minBytes == 1);
+    REQUIRE(decoded.topics[0].partitions.size() == 2);
+    CHECK(decoded.topics[0].partitions[0].fetchOffset == Offset(100));
+    CHECK(decoded.topics[0].partitions[0].maxBytes == (1 << 20));
+    CHECK(decoded.topics[0].partitions[1].fetchOffset == Offset(0));
+}
+
+TEST_CASE("A negative fetch size is refused rather than clamped") {
+    BufferWriter out;
+    out.writeInt32(0);
+    out.writeInt32(0);
+    out.writeInt32(1);
+    writeString(out, "orders");
+    out.writeInt32(1);
+    out.writeInt32(0);
+    out.writeInt64(0);
+    out.writeInt32(-1);   // maxBytes
+    const auto   body = out.take();
+    BufferReader in(body);
+
+    // Not a conservative client, a broken one. Clamping would hide it.
+    CHECK_THROWS_AS(decodeFetchRequest(in), CorruptData);
+}
+
+TEST_CASE("A fetch response puts records in file segments, not buffers") {
+    FetchFixture fixture("fetch-segments");
+    const auto   result = fixture.log->read(Offset(0), kBigFetch);
+    REQUIRE(result.ok());
+    REQUIRE(result.range.length > 0);
+
+    FetchResponse response;
+    response.topics.push_back(
+        {"orders",
+         {{0, ErrorCode::None, fixture.log->logEndOffset(), Offset(0), result.range}}});
+
+    Response wire;
+    encodeFetchResponse(wire, response);
+
+    // Metadata in a buffer, records as a range. The records were never read.
+    REQUIRE(wire.segments().size() == 2);
+    CHECK_FALSE(wire.segments()[0].isFile());
+    CHECK(wire.segments()[1].isFile());
+    CHECK(wire.segments()[1].range.length == result.range.length);
+    CHECK(wire.segments()[1].buffer.empty());
+}
+
+TEST_CASE("A fetch response round-trips through the wire") {
+    FetchFixture fixture("fetch-roundtrip");
+    const auto   result = fixture.log->read(Offset(5), kBigFetch);
+    REQUIRE(result.ok());
+
+    FetchResponse response;
+    response.topics.push_back({"orders",
+                               {{0, ErrorCode::None, fixture.log->logEndOffset(),
+                                 fixture.log->logStartOffset(), result.range}}});
+
+    Response wire;
+    encodeFetchResponse(wire, response);
+
+    // What a client receives: the segments, flattened by the kernel on the way
+    // out and by the socket on the way in.
+    const auto   frame = wire.materialise();
+    BufferReader in(frame);
+    const auto   view = decodeFetchResponse(in);
+    CHECK(in.empty());
+
+    REQUIRE(view.topics.size() == 1);
+    REQUIRE(view.topics[0].partitions.size() == 1);
+    const auto& partition = view.topics[0].partitions[0];
+
+    CHECK(partition.error == ErrorCode::None);
+    CHECK(partition.highWatermark == fixture.log->logEndOffset());
+    CHECK(partition.records.size() == result.range.length);
+
+    // And the records are a real batch containing the offset asked for.
+    CHECK(storage::RecordBatch::verifyCrc(partition.records));
+    const auto header = storage::RecordBatch::parseHeader(partition.records);
+    CHECK(header.baseOffset <= Offset(5));
+    CHECK(header.lastOffset() >= Offset(5));
+}
+
+TEST_CASE("Several partitions interleave metadata and records") {
+    FetchFixture fixture("fetch-multi", 40);
+    const auto   first  = fixture.log->read(Offset(0), 300);
+    const auto   second = fixture.log->read(Offset(20), 300);
+    REQUIRE(first.ok());
+    REQUIRE(second.ok());
+
+    FetchResponse response;
+    response.topics.push_back({"orders",
+                               {{0, ErrorCode::None, Offset(40), Offset(0), first.range},
+                                {1, ErrorCode::None, Offset(40), Offset(0), second.range}}});
+
+    Response wire;
+    encodeFetchResponse(wire, response);
+
+    // buffer, records, buffer, records — the alternation the whole design exists
+    // to make possible.
+    REQUIRE(wire.segments().size() == 4);
+    CHECK_FALSE(wire.segments()[0].isFile());
+    CHECK(wire.segments()[1].isFile());
+    CHECK_FALSE(wire.segments()[2].isFile());
+    CHECK(wire.segments()[3].isFile());
+
+    const auto   frame = wire.materialise();
+    BufferReader in(frame);
+    const auto   view = decodeFetchResponse(in);
+    CHECK(view.topics[0].partitions[0].records.size() == first.range.length);
+    CHECK(view.topics[0].partitions[1].records.size() == second.range.length);
+}
+
+TEST_CASE("A fetch with nothing waiting is one buffer segment and no ranges") {
+    FetchFixture fixture("fetch-caught-up", 5);
+
+    FetchResponse response;
+    FetchResponse::Topic topic;
+    topic.name = "orders";
+    for (PartitionId p = 0; p < 12; ++p)
+        topic.partitions.push_back({p, ErrorCode::None, Offset(5), Offset(0), FileRange{}});
+    response.topics.push_back(topic);
+
+    Response wire;
+    encodeFetchResponse(wire, response);
+
+    // The most common fetch in the system, and it costs one segment rather than
+    // twelve — which is why metadata accumulates and only flushes when a range
+    // interrupts it.
+    CHECK(wire.segments().size() == 1);
+    CHECK_FALSE(wire.segments().front().isFile());
+
+    const auto   frame = wire.materialise();
+    BufferReader in(frame);
+    const auto   view = decodeFetchResponse(in);
+    REQUIRE(view.topics[0].partitions.size() == 12);
+    for (const auto& partition : view.topics[0].partitions) CHECK(partition.records.empty());
+}
+
+TEST_CASE("An errored partition carries the offsets a client needs to react") {
+    FetchResponse response;
+    response.topics.push_back({"orders",
+                               {{0, ErrorCode::OffsetOutOfRange, Offset(900), Offset(500),
+                                 FileRange{}}}});
+
+    Response wire;
+    encodeFetchResponse(wire, response);
+    const auto   frame = wire.materialise();
+    BufferReader in(frame);
+    const auto   view = decodeFetchResponse(in);
+
+    // The wire has one OffsetOutOfRange code, Kafka-shaped. These two numbers are
+    // how a client tells "you were too slow" from "the log was truncated under
+    // you" — the distinction storage keeps and the code collapses.
+    const auto& partition = view.topics[0].partitions[0];
+    CHECK(partition.error == ErrorCode::OffsetOutOfRange);
+    CHECK(partition.logStartOffset == Offset(500));
+    CHECK(partition.highWatermark == Offset(900));
+    CHECK(partition.records.empty());
+}
+
+TEST_CASE("A truncated fetch response is refused at every length") {
+    FetchFixture fixture("fetch-truncated", 8);
+    const auto   result = fixture.log->read(Offset(0), 200);
+    REQUIRE(result.ok());
+
+    FetchResponse response;
+    response.topics.push_back(
+        {"orders", {{0, ErrorCode::None, Offset(8), Offset(0), result.range}}});
+
+    Response wire;
+    encodeFetchResponse(wire, response);
+    const auto full = wire.materialise();
+
+    for (size_t length = 0; length < full.size(); ++length) {
+        const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
+        BufferReader          in(partial);
+        CHECK_THROWS_AS(decodeFetchResponse(in), CorruptData);
     }
 }

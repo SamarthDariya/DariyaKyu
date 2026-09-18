@@ -88,6 +88,7 @@ add_library(dariyakyu_protocol
   src/protocol/metadata.cpp
   src/protocol/create_topic.cpp
   src/protocol/produce.cpp
+  src/protocol/fetch.cpp
 )
 
 target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)
