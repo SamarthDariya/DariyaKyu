@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "protocol/list_offsets.hpp"
+#include "protocol/create_topic.hpp"
 #include "protocol/metadata.hpp"
 #include "protocol/wire.hpp"
 #include "test_support.hpp"
@@ -328,5 +329,108 @@ TEST_CASE("A truncated Metadata response is refused at every length") {
         const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
         BufferReader          in(partial);
         CHECK_THROWS_AS(decodeMetadataResponse(in), CorruptData);
+    }
+}
+
+// ===========================================================================
+// CreateTopic
+// ===========================================================================
+
+TEST_CASE("A CreateTopic request round-trips with and without overrides") {
+    CreateTopicRequest request;
+    request.timeoutMs = 5000;
+
+    CreateTopicRequest::Topic plain;
+    plain.name           = "orders";
+    plain.partitionCount = 4;
+
+    CreateTopicRequest::Topic configured;
+    configured.name            = "audit";
+    configured.partitionCount  = 1;
+    configured.retentionMs     = 3'600'000;
+    configured.maxSegmentBytes = 1u << 20;
+
+    request.topics = {plain, configured};
+
+    const auto decoded =
+        roundTrip([&](BufferWriter& out) { encodeCreateTopicRequest(out, request); },
+                  [](BufferReader& in) { return decodeCreateTopicRequest(in); });
+
+    REQUIRE(decoded.topics.size() == 2);
+    CHECK(decoded.timeoutMs == 5000);
+
+    CHECK(decoded.topics[0].name == "orders");
+    CHECK(decoded.topics[0].partitionCount == 4);
+    CHECK_FALSE(decoded.topics[0].retentionMs.has_value());
+    CHECK_FALSE(decoded.topics[0].retentionBytes.has_value());
+    CHECK_FALSE(decoded.topics[0].maxSegmentBytes.has_value());
+
+    CHECK(decoded.topics[1].name == "audit");
+    CHECK(decoded.topics[1].retentionMs == 3'600'000);
+    CHECK(decoded.topics[1].maxSegmentBytes == (1u << 20));
+    CHECK_FALSE(decoded.topics[1].retentionBytes.has_value());
+}
+
+TEST_CASE("A nonsensical override is read as no override at all") {
+    CreateTopicRequest request;
+    request.topics.push_back({"orders", 1, {}, {}, {}});
+
+    BufferWriter out;
+    encodeCreateTopicRequest(out, request);
+    auto bytes = out.take();
+
+    // Overwrite the retentionMs field with zero. A client sending 0 or a
+    // negative retention is not expressing a policy, it is failing to express
+    // one — and adopting it would make a topic that deletes everything
+    // immediately.
+    const size_t retentionAt = 4 + 2 + string("orders").size() + 4;
+    for (size_t i = 0; i < 8; ++i) bytes[retentionAt + i] = 0;
+
+    BufferReader in(bytes);
+    const auto   decoded = decodeCreateTopicRequest(in);
+    CHECK_FALSE(decoded.topics[0].retentionMs.has_value());
+}
+
+TEST_CASE("A CreateTopic response reports per topic") {
+    CreateTopicResponse response;
+    response.topics = {{"orders", ErrorCode::None},
+                       {"orders", ErrorCode::TopicAlreadyExists},
+                       {"../escape", ErrorCode::InvalidTopic}};
+
+    const auto decoded =
+        roundTrip([&](BufferWriter& out) { encodeCreateTopicResponse(out, response); },
+                  [](BufferReader& in) { return decodeCreateTopicResponse(in); });
+
+    REQUIRE(decoded.topics.size() == 3);
+    CHECK(decoded.topics[0].error == ErrorCode::None);
+    CHECK(decoded.topics[1].error == ErrorCode::TopicAlreadyExists);
+
+    // A topic name that cannot become a directory name is refused by the broker,
+    // not by the codec — the codec carries whatever was sent so the error can
+    // name it back.
+    CHECK(decoded.topics[2].name == "../escape");
+    CHECK(decoded.topics[2].error == ErrorCode::InvalidTopic);
+}
+
+TEST_CASE("An empty CreateTopic request round-trips") {
+    const auto decoded =
+        roundTrip([](BufferWriter& out) { encodeCreateTopicRequest(out, CreateTopicRequest{}); },
+                  [](BufferReader& in) { return decodeCreateTopicRequest(in); });
+    CHECK(decoded.topics.empty());
+    CHECK(decoded.timeoutMs == 0);
+}
+
+TEST_CASE("A truncated CreateTopic request is refused at every length") {
+    CreateTopicRequest request;
+    request.topics.push_back({"orders", 2, 1000, 2000, 3000});
+
+    BufferWriter out;
+    encodeCreateTopicRequest(out, request);
+    const auto full = out.take();
+
+    for (size_t length = 0; length < full.size(); ++length) {
+        const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
+        BufferReader          in(partial);
+        CHECK_THROWS_AS(decodeCreateTopicRequest(in), CorruptData);
     }
 }

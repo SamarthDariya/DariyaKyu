@@ -86,6 +86,7 @@ add_library(dariyakyu_protocol
   src/protocol/wire.cpp
   src/protocol/list_offsets.cpp
   src/protocol/metadata.cpp
+  src/protocol/create_topic.cpp
 )
 
 target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)
