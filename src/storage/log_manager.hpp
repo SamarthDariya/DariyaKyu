@@ -38,6 +38,14 @@ inline constexpr const char* kDeletedSuffix = ".delete";
 // a partition and the startup scan steps over it.
 inline constexpr const char* kMetaDirName = "meta";
 
+// Whether a topic name can become a directory name.
+//
+// Exposed because a handler needs to tell "you asked for an impossible name"
+// apart from "that topic already exists", and both come out of createPartition
+// as the same exception type. Checking first is cheaper than inventing a second
+// exception for the one caller that cares.
+bool isUsableTopicName(const std::string& topic);
+
 // Every partition this broker hosts.
 //
 // One level above Log, and the last purely-storage object: from M4 the request
@@ -179,6 +187,13 @@ public:
     void sweepDeletedPartitions(std::int64_t nowMs);
 
     std::size_t removedPartitionCount() const;
+
+    // Every partition hosted here, in topic then partition order.
+    //
+    // Sorted rather than in hash order, because Metadata's answer goes on the
+    // wire: an unsorted one would differ between two brokers holding identical
+    // state, and between two runs of the same one.
+    std::vector<TopicPartition> hostedPartitions() const;
 
     std::size_t partitionCount() const;
 

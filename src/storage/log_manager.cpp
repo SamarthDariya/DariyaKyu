@@ -63,6 +63,17 @@ TopicPartition topicPartitionFromDirName(const string& name) {
     return tp;
 }
 
+bool isUsableTopicName(const string& topic) {
+    if (topic.empty() || topic == "." || topic == "..") return false;
+
+    for (const char c : topic) {
+        const bool allowed = isalnum(static_cast<unsigned char>(c)) != 0 || c == '.' ||
+                             c == '_' || c == '-';
+        if (!allowed) return false;
+    }
+    return true;
+}
+
 namespace {
 
 // A topic name becomes a directory name, so this is the boundary where a string
@@ -74,18 +85,10 @@ namespace {
 // name is a path-traversal bug waiting for the first CreateTopic request M4
 // serves.
 void requireUsableName(const TopicPartition& tp) {
-    if (tp.topic.empty()) throw Error("partition: topic name is empty");
-
-    if (tp.topic == "." || tp.topic == "..")
-        throw Error("partition: topic name '" + tp.topic + "' is a directory reference");
-
-    for (const char c : tp.topic) {
-        const bool allowed = isalnum(static_cast<unsigned char>(c)) != 0 || c == '.' ||
-                             c == '_' || c == '-';
-        if (!allowed)
-            throw Error("partition: topic name '" + tp.topic +
-                        "' contains a character that cannot appear in a directory name");
-    }
+    if (!isUsableTopicName(tp.topic))
+        throw Error("partition: topic name '" + tp.topic +
+                    "' cannot be a directory name — it must be non-empty and made only of "
+                    "letters, digits, dot, underscore and hyphen");
 
     if (tp.partition < 0)
         throw Error("partition: negative partition number " + to_string(tp.partition));
@@ -303,6 +306,24 @@ Log* LogManager::get(const TopicPartition& tp) const {
     // does not move — rehashing an unordered_map relocates nodes, not the objects
     // a unique_ptr points at. Only removePartition invalidates it.
     return it->second.get();
+}
+
+vector<TopicPartition> LogManager::hostedPartitions() const {
+    shared_lock lock(logsMutex_);
+
+    vector<TopicPartition> all;
+    all.reserve(logs_.size());
+    for (const auto& [tp, log] : logs_) all.push_back(tp);
+
+    // logs_ is an unordered_map, so its iteration order is an implementation
+    // detail. Metadata's answer goes on the wire, and a wire format that differs
+    // between two runs of the same broker is a debugging trap.
+    sort(all.begin(), all.end(), [](const TopicPartition& a, const TopicPartition& b) {
+        if (a.topic != b.topic) return a.topic < b.topic;
+        return a.partition < b.partition;
+    });
+
+    return all;
 }
 
 size_t LogManager::partitionCount() const {
