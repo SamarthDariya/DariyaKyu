@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "protocol/list_offsets.hpp"
+#include "protocol/metadata.hpp"
 #include "protocol/wire.hpp"
 #include "test_support.hpp"
 
@@ -211,5 +212,121 @@ TEST_CASE("A truncated ListOffsets request is refused at every length") {
         const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
         BufferReader          in(partial);
         CHECK_THROWS_AS(decodeListOffsetsRequest(in), CorruptData);
+    }
+}
+
+// ===========================================================================
+// Metadata
+// ===========================================================================
+
+TEST_CASE("A Metadata request naming topics round-trips") {
+    MetadataRequest request;
+    request.topics = {"orders", "payments"};
+
+    const auto decoded =
+        roundTrip([&](BufferWriter& out) { encodeMetadataRequest(out, request); },
+                  [](BufferReader& in) { return decodeMetadataRequest(in); });
+
+    CHECK_FALSE(decoded.allTopics);
+    REQUIRE(decoded.topics.size() == 2);
+    CHECK(decoded.topics[0] == "orders");
+    CHECK(decoded.topics[1] == "payments");
+}
+
+TEST_CASE("Asking for everything and asking for nothing are different requests") {
+    MetadataRequest everything;
+    everything.allTopics = true;
+
+    const MetadataRequest nothing;   // no flag, no topics
+
+    const auto decodedEverything =
+        roundTrip([&](BufferWriter& out) { encodeMetadataRequest(out, everything); },
+                  [](BufferReader& in) { return decodeMetadataRequest(in); });
+    const auto decodedNothing =
+        roundTrip([&](BufferWriter& out) { encodeMetadataRequest(out, nothing); },
+                  [](BufferReader& in) { return decodeMetadataRequest(in); });
+
+    // An explicit flag rather than Kafka's null-array-means-all convention. Those
+    // two encodings differ by one byte and mean opposite things, and every other
+    // array in this protocol treats null and empty alike — so relying on the
+    // distinction here is how a client ends up subscribed to everything by
+    // accident.
+    CHECK(decodedEverything.allTopics);
+    CHECK(decodedEverything.topics.empty());
+    CHECK_FALSE(decodedNothing.allTopics);
+    CHECK(decodedNothing.topics.empty());
+}
+
+TEST_CASE("Any non-zero byte is a true flag") {
+    BufferWriter out;
+    out.writeInt8(static_cast<int8_t>(0xFF));
+    out.writeInt32(0);
+    const auto   bytes = out.take();
+    BufferReader in(bytes);
+
+    // A client writing 0xFF for a boolean is unusual but not wrong, and refusing
+    // it would be a compatibility trap for no gain.
+    CHECK(decodeMetadataRequest(in).allTopics);
+}
+
+TEST_CASE("A Metadata response round-trips") {
+    MetadataResponse response;
+    response.brokers.push_back({1, "127.0.0.1", 9092});
+    response.controllerId = 1;
+    response.topics.push_back({ErrorCode::None,
+                               "orders",
+                               {{ErrorCode::None, 0, 1}, {ErrorCode::None, 1, 1}}});
+    response.topics.push_back({ErrorCode::UnknownTopicOrPartition, "missing", {}});
+
+    const auto decoded =
+        roundTrip([&](BufferWriter& out) { encodeMetadataResponse(out, response); },
+                  [](BufferReader& in) { return decodeMetadataResponse(in); });
+
+    REQUIRE(decoded.brokers.size() == 1);
+    CHECK(decoded.brokers[0].nodeId == 1);
+    CHECK(decoded.brokers[0].host == "127.0.0.1");
+    CHECK(decoded.brokers[0].port == 9092);
+    CHECK(decoded.controllerId == 1);
+
+    REQUIRE(decoded.topics.size() == 2);
+    CHECK(decoded.topics[0].name == "orders");
+    CHECK(decoded.topics[0].error == ErrorCode::None);
+    REQUIRE(decoded.topics[0].partitions.size() == 2);
+    CHECK(decoded.topics[0].partitions[1].partition == 1);
+    CHECK(decoded.topics[0].partitions[1].leader == 1);
+
+    // A topic error sits beside the topic, so one unknown topic does not spoil
+    // the answer for the others.
+    CHECK(decoded.topics[1].error == ErrorCode::UnknownTopicOrPartition);
+    CHECK(decoded.topics[1].partitions.empty());
+}
+
+TEST_CASE("An unset controller round-trips as -1") {
+    MetadataResponse response;   // controllerId defaults to -1
+
+    const auto decoded =
+        roundTrip([&](BufferWriter& out) { encodeMetadataResponse(out, response); },
+                  [](BufferReader& in) { return decodeMetadataResponse(in); });
+
+    // There is no controller until M8. A client reads this rather than assuming
+    // any particular broker is one.
+    CHECK(decoded.controllerId == -1);
+    CHECK(decoded.brokers.empty());
+    CHECK(decoded.topics.empty());
+}
+
+TEST_CASE("A truncated Metadata response is refused at every length") {
+    MetadataResponse response;
+    response.brokers.push_back({1, "127.0.0.1", 9092});
+    response.topics.push_back({ErrorCode::None, "orders", {{ErrorCode::None, 0, 1}}});
+
+    BufferWriter out;
+    encodeMetadataResponse(out, response);
+    const auto full = out.take();
+
+    for (size_t length = 0; length < full.size(); ++length) {
+        const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
+        BufferReader          in(partial);
+        CHECK_THROWS_AS(decodeMetadataResponse(in), CorruptData);
     }
 }
