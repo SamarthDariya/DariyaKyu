@@ -16,6 +16,8 @@ namespace dariyakyu::server {
 void handleListOffsets(RequestContext& request, protocol::Response& out);
 void handleMetadata(RequestContext& request, protocol::Response& out);
 void handleCreateTopic(RequestContext& request, protocol::Response& out);
+void handleProduce(RequestContext& request, protocol::Response& out);
+void handleFetch(RequestContext& request, protocol::Response& out);
 
 // Registers every handler this build serves, at version 0.
 void registerAllHandlers(ApiRegistry& registry);

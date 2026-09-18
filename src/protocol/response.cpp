@@ -16,6 +16,22 @@ namespace dariyakyu::protocol {
 
 void Response::append(vector<uint8_t> buffer) {
     if (buffer.empty()) return;
+
+    // Coalesced into the previous segment when that is also a buffer.
+    //
+    // Adjacent buffers are adjacent bytes on the wire, so keeping them apart
+    // buys nothing and costs a write() each. Every response has at least two —
+    // the correlation id that dispatch writes, and the handler's first field —
+    // so without this the cheapest possible reply is two syscalls.
+    //
+    // The copy is bounded by design: only metadata is ever a buffer segment.
+    // Record bytes are file ranges and are never touched here.
+    if (!segments_.empty() && !segments_.back().isFile()) {
+        auto& previous = segments_.back().buffer;
+        previous.insert(previous.end(), buffer.begin(), buffer.end());
+        return;
+    }
+
     segments_.push_back(ResponseSegment{std::move(buffer), FileRange{}});
 }
 

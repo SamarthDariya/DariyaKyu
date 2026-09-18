@@ -4,8 +4,11 @@
 
 #include "common/errors.hpp"
 #include "protocol/create_topic.hpp"
+#include "protocol/fetch.hpp"
 #include "protocol/list_offsets.hpp"
 #include "protocol/metadata.hpp"
+#include "protocol/produce.hpp"
+#include "storage/record_batch.hpp"
 
 using namespace std;
 using namespace dariyakyu::protocol;
@@ -152,10 +155,125 @@ void handleCreateTopic(RequestContext& request, Response& out) {
     out.append(buffer.take());
 }
 
+void handleProduce(RequestContext& request, Response& out) {
+    const auto      decoded = decodeProduceRequest(request.body);
+    ProduceResponse response;
+
+    for (const auto& topic : decoded.topics) {
+        ProduceResponse::Topic answer;
+        answer.name = topic.name;
+
+        for (const auto& asked : topic.partitions) {
+            ProduceResponse::Partition result;
+            result.partition  = asked.partition;
+            result.baseOffset = kUnknownOffset;
+
+            storage::Log* log =
+                request.broker.logs.get(TopicPartition{topic.name, asked.partition});
+            if (log == nullptr) {
+                result.error = ErrorCode::NotLeaderForPartition;
+                answer.partitions.push_back(result);
+                continue;
+            }
+
+            try {
+                // A mutable view of bytes still sitting in the request frame.
+                // Log::append stamps the assigned offset into them, in place —
+                // the only write the broker ever makes to a producer's bytes,
+                // and the reason nothing here copies a batch.
+                auto batch = mutableBatch(asked, request.frame);
+
+                // Checked before appending, because a batch that fails its own
+                // checksum must not reach a segment: recovery would find it
+                // later and truncate everything after it.
+                if (!storage::RecordBatch::verifyCrc(batch)) {
+                    result.error = ErrorCode::CorruptMessage;
+                } else {
+                    result.baseOffset = log->append(batch);
+                }
+            } catch (const CorruptData&) {
+                // The CLIENT's bytes did not parse. Its fault, and it should be
+                // told precisely — which is why there is no general
+                // errorCodeFor(const Error&): the same exception from a Fetch
+                // means something else entirely.
+                result.error = ErrorCode::CorruptMessage;
+            } catch (const Error&) {
+                // A full disk, a broken invariant. Not the client's doing, and
+                // no code describes it honestly.
+                result.error = ErrorCode::Unknown;
+            }
+
+            answer.partitions.push_back(result);
+        }
+
+        response.topics.push_back(std::move(answer));
+    }
+
+    BufferWriter buffer;
+    encodeProduceResponse(buffer, response);
+    out.append(buffer.take());
+}
+
+void handleFetch(RequestContext& request, Response& out) {
+    const auto    decoded = decodeFetchRequest(request.body);
+    FetchResponse response;
+
+    for (const auto& topic : decoded.topics) {
+        FetchResponse::Topic answer;
+        answer.name = topic.name;
+
+        for (const auto& asked : topic.partitions) {
+            FetchResponse::Partition result;
+            result.partition = asked.partition;
+
+            storage::Log* log =
+                request.broker.logs.get(TopicPartition{topic.name, asked.partition});
+            if (log == nullptr) {
+                result.error = ErrorCode::NotLeaderForPartition;
+                answer.partitions.push_back(result);
+                continue;
+            }
+
+            // Sent whether or not the read succeeded. The wire has one
+            // OffsetOutOfRange code, and these two numbers are how a client tells
+            // "you were too slow" from "the log was truncated under you".
+            result.highWatermark  = log->highWatermark();
+            result.logStartOffset = log->logStartOffset();
+
+            try {
+                const storage::ReadResult read =
+                    log->read(asked.fetchOffset, static_cast<size_t>(asked.maxBytes));
+
+                result.error = errorCodeFor(read.error);
+
+                // A LOCATION, not bytes. These never enter this process: the
+                // response encoder appends them as a file segment and sendfile
+                // serves them from the kernel's page cache.
+                if (read.ok()) result.records = read.range;
+            } catch (const Error&) {
+                // Including CorruptData, and deliberately NOT CorruptMessage:
+                // our files are damaged, and telling the client its message was
+                // corrupt would send it chasing a bug it does not have.
+                result.error   = ErrorCode::Unknown;
+                result.records = FileRange{};
+            }
+
+            answer.partitions.push_back(result);
+        }
+
+        response.topics.push_back(std::move(answer));
+    }
+
+    // Straight into the Response, so record bytes stay where they are.
+    encodeFetchResponse(out, response);
+}
+
 void registerAllHandlers(ApiRegistry& registry) {
     registry.registerHandler(ApiKey::ListOffsets, 0, handleListOffsets);
     registry.registerHandler(ApiKey::Metadata, 0, handleMetadata);
     registry.registerHandler(ApiKey::CreateTopic, 0, handleCreateTopic);
+    registry.registerHandler(ApiKey::Produce, 0, handleProduce);
+    registry.registerHandler(ApiKey::Fetch, 0, handleFetch);
 }
 
 }  // namespace dariyakyu::server

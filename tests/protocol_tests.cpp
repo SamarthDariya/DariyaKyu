@@ -546,7 +546,9 @@ TEST_CASE("Buffer segments accumulate in order") {
     response.append(bytesOf({1, 2, 3}));
     response.append(bytesOf({4, 5}));
 
-    CHECK(response.segments().size() == 2);
+    // Coalesced: adjacent buffers are adjacent bytes on the wire, so keeping
+    // them apart would cost a write() each for nothing.
+    CHECK(response.segments().size() == 1);
     CHECK(response.totalBytes() == 5);
     CHECK(response.materialise() == bytesOf({1, 2, 3, 4, 5}));
 
@@ -575,7 +577,8 @@ TEST_CASE("Every stored segment has something in it") {
     response.append(bytesOf({2, 3}));
 
     for (const auto& segment : response.segments()) CHECK(segment.size() > 0);
-    CHECK(response.segments().size() == 2);
+    CHECK(response.segments().size() == 1);   // the empty range separated nothing
+    CHECK(response.totalBytes() == 3);
 }
 
 TEST_CASE("The total is known without reading a single file byte") {

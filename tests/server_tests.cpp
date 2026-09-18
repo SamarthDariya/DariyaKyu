@@ -7,7 +7,9 @@
 #include "protocol/error_codes.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/list_offsets.hpp"
+#include "protocol/fetch.hpp"
 #include "protocol/metadata.hpp"
+#include "protocol/produce.hpp"
 #include "server/api_registry.hpp"
 #include "server/handlers.hpp"
 #include "test_support.hpp"
@@ -495,4 +497,285 @@ TEST_CASE("A topic name that cannot be a directory name is refused") {
     for (const auto& topic : response.topics) CHECK(topic.error == ErrorCode::InvalidTopic);
     CHECK(broker.logs.partitionCount() == 0);
     CHECK(filesystem::is_empty(broker.logs.dataDir()));
+}
+
+// ===========================================================================
+// Handlers: Produce and Fetch
+// ===========================================================================
+
+namespace {
+
+vector<uint8_t> encoded(const ProduceRequest& request) {
+    BufferWriter out;
+    encodeProduceRequest(out, request);
+    return out.take();
+}
+vector<uint8_t> encoded(const FetchRequest& request) {
+    BufferWriter out;
+    encodeFetchRequest(out, request);
+    return out.take();
+}
+
+}  // namespace
+
+TEST_CASE("Produce appends and reports the offset assigned") {
+    ServingBroker broker("handler-produce");
+    broker.logs.createPartition(TopicPartition{"orders", 0});
+
+    const auto first  = makeUnstampedBatch(1000, 48);
+    const auto second = makeUnstampedBatch(2000, 48, 3);   // three records
+
+    ProduceRequest request;
+    request.topics.push_back({"orders",
+                              {{0, span<const uint8_t>(first), 0},
+                               {0, span<const uint8_t>(second), 0}}});
+
+    const auto   body = broker.call(ApiKey::Produce, encoded(request));
+    BufferReader in(body);
+    const auto   response = decodeProduceResponse(in);
+
+    REQUIRE(response.topics[0].partitions.size() == 2);
+    CHECK(response.topics[0].partitions[0].error == ErrorCode::None);
+    CHECK(response.topics[0].partitions[0].baseOffset == Offset(0));
+
+    // The second batch starts where the first ended, and it held three records.
+    CHECK(response.topics[0].partitions[1].baseOffset == Offset(1));
+    CHECK(broker.logs.get(TopicPartition{"orders", 0})->logEndOffset() == Offset(4));
+}
+
+TEST_CASE("A produced batch reaches disk stamped with its assigned offset") {
+    ServingBroker broker("handler-produce-stamped");
+    broker.logs.createPartition(TopicPartition{"orders", 0});
+
+    const auto batch = makeUnstampedBatch(1000, 48);
+    ProduceRequest request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+    broker.call(ApiKey::Produce, encoded(request));
+    broker.call(ApiKey::Produce, encoded(request));
+
+    // The client sent the same unstamped bytes twice; the broker's sequence is
+    // the only authority, so what landed says 0 and 1.
+    storage::Log* log = broker.logs.get(TopicPartition{"orders", 0});
+    const auto    bytes = readFile(storage::segmentLogPath(
+        broker.logs.dataDir() / "orders-0", Offset(0)));
+
+    CHECK(storage::RecordBatch::parseHeader(bytes).baseOffset == Offset(0));
+    const size_t firstSize = storage::RecordBatch::totalSizeOf(bytes);
+    CHECK(storage::RecordBatch::parseHeader(
+              span<const uint8_t>(bytes).subspan(firstSize)).baseOffset == Offset(1));
+    CHECK(log->logEndOffset() == Offset(2));
+}
+
+TEST_CASE("A produce to a partition this broker does not host is refused") {
+    ServingBroker broker("handler-produce-missing");
+
+    const auto     batch = makeUnstampedBatch(1000, 48);
+    ProduceRequest request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+
+    const auto   body = broker.call(ApiKey::Produce, encoded(request));
+    BufferReader in(body);
+    const auto   response = decodeProduceResponse(in);
+
+    CHECK(response.topics[0].partitions[0].error == ErrorCode::NotLeaderForPartition);
+    CHECK(response.topics[0].partitions[0].baseOffset == kUnknownOffset);
+}
+
+TEST_CASE("A batch that fails its own checksum never reaches a segment") {
+    ServingBroker broker("handler-produce-corrupt");
+    broker.logs.createPartition(TopicPartition{"orders", 0});
+
+    auto batch = makeUnstampedBatch(1000, 48);
+    batch[kBatchHeaderSize + 4] ^= 0xFF;   // flip a byte in the body
+
+    ProduceRequest request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+
+    const auto   body = broker.call(ApiKey::Produce, encoded(request));
+    BufferReader in(body);
+    const auto   response = decodeProduceResponse(in);
+
+    // The CLIENT's bytes are bad, and it is told precisely — CorruptMessage, not
+    // Unknown. The same exception from a Fetch means something else entirely,
+    // which is why there is no general exception-to-code mapping.
+    CHECK(response.topics[0].partitions[0].error == ErrorCode::CorruptMessage);
+
+    // And nothing was written: recovery would otherwise find it later and
+    // truncate everything after it.
+    CHECK(broker.logs.get(TopicPartition{"orders", 0})->logEndOffset() == Offset(0));
+    CHECK(broker.logs.get(TopicPartition{"orders", 0})->totalSizeBytes() == 0);
+}
+
+TEST_CASE("Unparseable bytes are refused as a corrupt message") {
+    ServingBroker broker("handler-produce-garbage");
+    broker.logs.createPartition(TopicPartition{"orders", 0});
+
+    const vector<uint8_t> garbage(120, 0x7F);   // no valid magic byte anywhere
+    ProduceRequest        request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(garbage), 0}}});
+
+    const auto   body = broker.call(ApiKey::Produce, encoded(request));
+    BufferReader in(body);
+    const auto   response = decodeProduceResponse(in);
+
+    CHECK(response.topics[0].partitions[0].error == ErrorCode::CorruptMessage);
+    CHECK(broker.logs.get(TopicPartition{"orders", 0})->logEndOffset() == Offset(0));
+}
+
+TEST_CASE("One bad partition does not spoil the others in a produce") {
+    ServingBroker broker("handler-produce-mixed");
+    broker.logs.createPartition(TopicPartition{"orders", 0});
+    broker.logs.createPartition(TopicPartition{"orders", 1});
+
+    const auto good = makeUnstampedBatch(1000, 48);
+    auto       bad  = makeUnstampedBatch(2000, 48);
+    bad[kBatchHeaderSize + 2] ^= 0xFF;
+
+    ProduceRequest request;
+    request.topics.push_back({"orders",
+                              {{0, span<const uint8_t>(good), 0},
+                               {1, span<const uint8_t>(bad), 0},
+                               {2, span<const uint8_t>(good), 0}}});
+
+    const auto   body = broker.call(ApiKey::Produce, encoded(request));
+    BufferReader in(body);
+    const auto   response = decodeProduceResponse(in);
+
+    CHECK(response.topics[0].partitions[0].error == ErrorCode::None);
+    CHECK(response.topics[0].partitions[1].error == ErrorCode::CorruptMessage);
+    CHECK(response.topics[0].partitions[2].error == ErrorCode::NotLeaderForPartition);
+    CHECK(broker.logs.get(TopicPartition{"orders", 0})->logEndOffset() == Offset(1));
+    CHECK(broker.logs.get(TopicPartition{"orders", 1})->logEndOffset() == Offset(0));
+}
+
+TEST_CASE("Fetch returns records as file segments") {
+    ServingBroker broker("handler-fetch");
+    storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0});
+    for (int i = 0; i < 10; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log.append(bytes);
+    }
+
+    FetchRequest request;
+    request.topics.push_back({"orders", {{0, Offset(0), 1 << 20}}});
+
+    const auto result = dispatch(broker.registry, broker.context,
+                                 headerFor(ApiKey::Fetch, 5), encoded(request));
+
+    // Metadata in a buffer, records as a range that was never read here. Two
+    // segments, not three: the correlation id dispatch wrote and the handler's
+    // metadata coalesce into one.
+    REQUIRE(result.response.segments().size() == 2);
+    CHECK_FALSE(result.response.segments()[0].isFile());
+    CHECK(result.response.segments()[1].isFile());
+
+    const auto   frame = result.response.materialise();
+    BufferReader in(frame);
+    CHECK(decodeResponseHeader(in) == 5);
+    const auto view = decodeFetchResponse(in);
+
+    const auto& partition = view.topics[0].partitions[0];
+    CHECK(partition.error == ErrorCode::None);
+    CHECK(partition.highWatermark == Offset(10));
+    CHECK(partition.logStartOffset == Offset(0));
+    CHECK(storage::RecordBatch::verifyCrc(partition.records));
+    CHECK(storage::RecordBatch::parseHeader(partition.records).baseOffset == Offset(0));
+}
+
+TEST_CASE("A caught-up fetch is a success with no records") {
+    ServingBroker broker("handler-fetch-caught-up");
+    storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0});
+    auto          bytes = makeUnstampedBatch(1000, 48);
+    log.append(bytes);
+
+    FetchRequest request;
+    request.topics.push_back({"orders", {{0, Offset(1), 1 << 20}}});
+
+    const auto   body = broker.call(ApiKey::Fetch, encoded(request));
+    BufferReader in(body);
+    const auto   view = decodeFetchResponse(in);
+
+    // The most common fetch in the system: no error, no bytes, poll again.
+    CHECK(view.topics[0].partitions[0].error == ErrorCode::None);
+    CHECK(view.topics[0].partitions[0].records.empty());
+    CHECK(view.topics[0].partitions[0].highWatermark == Offset(1));
+}
+
+TEST_CASE("An out-of-range fetch carries the offsets a client needs to recover") {
+    ServingBroker      broker("handler-fetch-out-of-range");
+    storage::LogConfig config = testConfig();
+    config.roll.maxSegmentBytes  = 400;
+    config.retention.retentionMs = 1;
+    storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0}, config);
+    for (int i = 0; i < 40; ++i) {
+        auto bytes = makeUnstampedBatch(100'000 + i, 48);
+        log.append(bytes);
+    }
+    log.applyRetention(1'000'000);
+    REQUIRE(log.logStartOffset() > Offset(0));
+
+    FetchRequest request;
+    request.topics.push_back({"orders", {{0, Offset(0), 1 << 20},          // too old
+                                         {0, Offset(9999), 1 << 20}}});     // too new
+
+    const auto   body = broker.call(ApiKey::Fetch, encoded(request));
+    BufferReader in(body);
+    const auto   view = decodeFetchResponse(in);
+
+    // One code for both, Kafka-shaped — and the two offsets are how a client
+    // works out which side it fell on.
+    for (const auto& partition : view.topics[0].partitions) {
+        CHECK(partition.error == ErrorCode::OffsetOutOfRange);
+        CHECK(partition.records.empty());
+        CHECK(partition.logStartOffset == log.logStartOffset());
+        CHECK(partition.highWatermark == log.logEndOffset());
+    }
+}
+
+TEST_CASE("A fetch across partitions answers what it can") {
+    ServingBroker broker("handler-fetch-mixed");
+    storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0});
+    for (int i = 0; i < 5; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log.append(bytes);
+    }
+
+    FetchRequest request;
+    request.topics.push_back({"orders", {{0, Offset(0), 1 << 20}, {7, Offset(0), 1 << 20}}});
+
+    const auto   body = broker.call(ApiKey::Fetch, encoded(request));
+    BufferReader in(body);
+    const auto   view = decodeFetchResponse(in);
+
+    CHECK(view.topics[0].partitions[0].error == ErrorCode::None);
+    CHECK_FALSE(view.topics[0].partitions[0].records.empty());
+    CHECK(view.topics[0].partitions[1].error == ErrorCode::NotLeaderForPartition);
+    CHECK(view.topics[0].partitions[1].records.empty());
+}
+
+TEST_CASE("What was produced is what is fetched back") {
+    ServingBroker broker("handler-roundtrip");
+    broker.logs.createPartition(TopicPartition{"orders", 0});
+
+    const auto     sent = makeUnstampedBatch(4242, 64, 2);
+    ProduceRequest produce;
+    produce.topics.push_back({"orders", {{0, span<const uint8_t>(sent), 0}}});
+    broker.call(ApiKey::Produce, encoded(produce));
+
+    FetchRequest fetch;
+    fetch.topics.push_back({"orders", {{0, Offset(0), 1 << 20}}});
+    const auto   body = broker.call(ApiKey::Fetch, encoded(fetch));
+    BufferReader in(body);
+    const auto   view = decodeFetchResponse(in);
+
+    // Produce and fetch through the real handlers, with the storage layer in
+    // between — the first time the two halves meet.
+    const auto& records = view.topics[0].partitions[0].records;
+    REQUIRE_FALSE(records.empty());
+    CHECK(storage::RecordBatch::verifyCrc(records));
+
+    const auto header = storage::RecordBatch::parseHeader(records);
+    CHECK(header.baseOffset == Offset(0));
+    CHECK(header.recordCount == 2);
+    CHECK(header.maxTimestamp == 4243);
 }
