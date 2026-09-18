@@ -42,6 +42,7 @@ add_library(dariyakyu_common
   src/common/varint.cpp
   src/common/crc32c.cpp
   src/common/buffer.cpp
+  src/common/platform.cpp
 )
 
 # Includes are rooted at src/, so every include reads "common/file_handle.hpp" —
@@ -80,6 +81,8 @@ target_compile_options(dariyakyu_storage PRIVATE -Wall -Wextra -Wpedantic)
 add_library(dariyakyu_protocol
   src/protocol/error_codes.cpp
   src/protocol/request_header.cpp
+  src/protocol/frame.cpp
+  src/protocol/response.cpp
 )
 
 target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)
