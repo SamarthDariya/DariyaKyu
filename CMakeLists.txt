@@ -95,6 +95,20 @@ target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)
 target_compile_options(dariyakyu_protocol PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
+# Library: server
+# ---------------------------------------------------------------------------
+#
+# Dispatch and the broker itself. Depends on protocol; nothing depends on it but
+# the broker binary, so a handler cannot be reached from the CLI by accident.
+
+add_library(dariyakyu_server
+  src/server/api_registry.cpp
+)
+
+target_link_libraries(dariyakyu_server PUBLIC dariyakyu_protocol)
+target_compile_options(dariyakyu_server PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 #
@@ -149,9 +163,9 @@ add_test(NAME codec_tests COMMAND codec_tests)
 # The storage suites share tests/test_support.hpp, so each needs tests/ on its
 # include path. Split by layer rather than kept as one file: a single 4,000-line
 # suite meant every change rebuilt and reran all of it.
-foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests)
+foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests server_tests)
   add_executable(${suite} tests/${suite}.cpp)
-  target_link_libraries(${suite} PRIVATE dariyakyu_protocol doctest::doctest)
+  target_link_libraries(${suite} PRIVATE dariyakyu_server doctest::doctest)
   target_include_directories(${suite} PRIVATE tests)
   target_compile_options(${suite} PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME ${suite} COMMAND ${suite})
