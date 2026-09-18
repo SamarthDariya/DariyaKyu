@@ -7,6 +7,7 @@
 #include "protocol/list_offsets.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/metadata.hpp"
+#include "protocol/produce.hpp"
 #include "protocol/wire.hpp"
 #include "test_support.hpp"
 
@@ -432,5 +433,164 @@ TEST_CASE("A truncated CreateTopic request is refused at every length") {
         const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
         BufferReader          in(partial);
         CHECK_THROWS_AS(decodeCreateTopicRequest(in), CorruptData);
+    }
+}
+
+// ===========================================================================
+// Produce
+// ===========================================================================
+
+TEST_CASE("A Produce request carries batches without copying them") {
+    const auto first  = makeUnstampedBatch(1000, 48);
+    const auto second = makeUnstampedBatch(2000, 48);
+
+    ProduceRequest request;
+    request.acks      = 1;
+    request.timeoutMs = 3000;
+    request.topics.push_back({"orders",
+                              {{0, span<const uint8_t>(first), 0},
+                               {1, span<const uint8_t>(second), 0}}});
+
+    BufferWriter out;
+    encodeProduceRequest(out, request);
+    const auto body = out.take();
+
+    BufferReader in(body);
+    const auto   decoded = decodeProduceRequest(in);
+    CHECK(in.empty());
+
+    CHECK(decoded.acks == 1);
+    CHECK(decoded.timeoutMs == 3000);
+    REQUIRE(decoded.topics.size() == 1);
+    REQUIRE(decoded.topics[0].partitions.size() == 2);
+
+    // Borrowed, not copied: the span points into the frame that was decoded. A
+    // produce of a megabyte must not become two because the decoder wanted to
+    // own its input.
+    const auto& partition = decoded.topics[0].partitions[0];
+    CHECK(partition.batch.size() == first.size());
+    CHECK(partition.batch.data() >= body.data());
+    CHECK(partition.batch.data() < body.data() + body.size());
+    CHECK(vector<uint8_t>(partition.batch.begin(), partition.batch.end()) == first);
+}
+
+TEST_CASE("A decoded batch can be stamped in place") {
+    const auto original = makeUnstampedBatch(1000, 48);
+
+    ProduceRequest request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(original), 0}}});
+
+    BufferWriter out;
+    encodeProduceRequest(out, request);
+    auto body = out.take();   // mutable, and owned here
+
+    BufferReader in(body);
+    const auto   decoded = decodeProduceRequest(in);
+
+    // The broker's actual write path: recover a mutable view of bytes the
+    // decoder handed out as const, and stamp the assigned offset into them.
+    auto writable = mutableBatch(decoded.topics[0].partitions[0], body);
+    CHECK(writable.size() == original.size());
+    storage::RecordBatch::stampBaseOffset(writable, Offset(4242));
+
+    // The stamp landed in the frame itself, and the checksum still holds —
+    // because baseOffset sits before the crc field in the v2 layout.
+    const auto stamped = decoded.topics[0].partitions[0].batch;
+    CHECK(storage::RecordBatch::parseHeader(stamped).baseOffset == Offset(4242));
+    CHECK(storage::RecordBatch::verifyCrc(stamped));
+    CHECK(storage::RecordBatch::parseHeader(original).baseOffset == Offset(0));
+}
+
+TEST_CASE("A batch recorded against the wrong buffer is refused") {
+    const auto batch = makeUnstampedBatch(1000, 48);
+
+    ProduceRequest request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+
+    BufferWriter out;
+    encodeProduceRequest(out, request);
+    auto body = out.take();
+
+    BufferReader in(body);
+    const auto   decoded = decodeProduceRequest(in);
+
+    // Passing a buffer the batch does not lie inside is a caller mistake, and
+    // the alternative to catching it is a stamp written through a wild pointer.
+    vector<uint8_t> tooSmall(4);
+    CHECK_THROWS_AS(mutableBatch(decoded.topics[0].partitions[0], tooSmall),
+                    OffsetInvariantViolated);
+}
+
+TEST_CASE("The broker never decompresses what it is given") {
+    // Arbitrary bytes standing in for a compressed body. The codec carries them
+    // through untouched, because nothing in the produce path looks inside a
+    // batch beyond its fixed header.
+    vector<uint8_t> opaque(200);
+    for (size_t i = 0; i < opaque.size(); ++i) opaque[i] = static_cast<uint8_t>(i * 7);
+
+    ProduceRequest request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(opaque), 0}}});
+
+    BufferWriter out;
+    encodeProduceRequest(out, request);
+    const auto body = out.take();
+
+    BufferReader in(body);
+    const auto   decoded = decodeProduceRequest(in);
+    const auto&  carried = decoded.topics[0].partitions[0].batch;
+    CHECK(vector<uint8_t>(carried.begin(), carried.end()) == opaque);
+}
+
+TEST_CASE("A negative batch length is refused") {
+    BufferWriter out;
+    out.writeInt16(1);        // acks
+    out.writeInt32(0);        // timeoutMs
+    out.writeInt32(1);        // one topic
+    writeString(out, "orders");
+    out.writeInt32(1);        // one partition
+    out.writeInt32(0);        // partition id
+    out.writeInt32(-5);       // batch length
+    const auto   body = out.take();
+    BufferReader in(body);
+
+    CHECK_THROWS_AS(decodeProduceRequest(in), CorruptData);
+}
+
+TEST_CASE("A Produce response reports an offset per partition") {
+    ProduceResponse response;
+    response.topics.push_back({"orders",
+                               {{0, ErrorCode::None, Offset(500)},
+                                {1, ErrorCode::NotLeaderForPartition, kUnknownOffset},
+                                {2, ErrorCode::CorruptMessage, kUnknownOffset}}});
+
+    const auto decoded =
+        roundTrip([&](BufferWriter& out) { encodeProduceResponse(out, response); },
+                  [](BufferReader& in) { return decodeProduceResponse(in); });
+
+    REQUIRE(decoded.topics[0].partitions.size() == 3);
+    CHECK(decoded.topics[0].partitions[0].baseOffset == Offset(500));
+    CHECK(decoded.topics[0].partitions[0].error == ErrorCode::None);
+
+    // A partition that failed carries no offset, and says why. One moved
+    // partition must not stop the other two being answered.
+    CHECK(decoded.topics[0].partitions[1].error == ErrorCode::NotLeaderForPartition);
+    CHECK(decoded.topics[0].partitions[1].baseOffset == kUnknownOffset);
+    CHECK(decoded.topics[0].partitions[2].error == ErrorCode::CorruptMessage);
+}
+
+TEST_CASE("A truncated Produce request is refused at every length") {
+    const auto batch = makeUnstampedBatch(1000, 32);
+
+    ProduceRequest request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+
+    BufferWriter out;
+    encodeProduceRequest(out, request);
+    const auto full = out.take();
+
+    for (size_t length = 0; length < full.size(); ++length) {
+        const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
+        BufferReader          in(partial);
+        CHECK_THROWS_AS(decodeProduceRequest(in), CorruptData);
     }
 }
