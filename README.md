@@ -30,13 +30,13 @@ The design is written up in full, with the reasoning and the rejected alternativ
 ## Status
 
 **Design: complete.** 23 conceptual decisions locked, structural design in progress.
-**Implementation: M4 — a broker you can produce to and consume from.**
+**Implementation: M5 — a broker with consumer groups.**
 
 | Phase | Status |
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
 | Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 5 of 6 chunks; chunks 1–2 amended in place by M2–M3 |
-| Implementation — M0…M9 | 🔸 M0–M4 complete, M5 next |
+| Implementation — M0…M9 | 🔸 M0–M5 complete, M6 next |
 
 ---
 
@@ -102,17 +102,18 @@ is merged by PR.
 - [x] `sendfile` on the read path — a response is a list of buffer and file segments
 - [x] `dariyakyu-cli` — create, produce, consume, describe, dump-segment
 - [x] **produce and consume from a terminal**
-- [x] suite green locally — 437 cases, 5462 assertions
+- [x] suite green locally — 519 cases, 6996 assertions
 - [x] green under ASan/UBSan and TSan
 
-### M5 — Consumer groups ⬜
-- [ ] `__offsets` internal topic
-- [ ] `GroupCoordinator` — leader of `hash(group) % N`
-- [ ] `FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`
-- [ ] `OffsetCommit` / `OffsetFetch`, commits storing *next* offset
-- [ ] range and round-robin assignors, computed client-side
-- [ ] generation-id fencing
-- [ ] eager rebalance on join, leave, and heartbeat expiry
+### M5 — Consumer groups ✅
+- [x] `__offsets` internal topic, compacted, hidden from `describe` unless named
+- [x] `GroupCoordinator` — leader of `hash(group) % N`, Empty → Preparing → Completing → Stable
+- [x] `FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`
+- [x] `OffsetCommit` / `OffsetFetch`, commits storing *next* offset
+- [x] range and round-robin assignors, computed client-side
+- [x] generation-id fencing — a zombie cannot move a position it no longer owns
+- [x] eager rebalance on join, leave, and heartbeat expiry
+- [x] `dariyakyu-cli consume --group` — **two consumers split a topic; one leaves, the other takes over**
 
 ### M6 — Compaction ⬜
 - [ ] `LogCleaner` — key → latest offset map
