@@ -107,6 +107,7 @@ add_library(dariyakyu_cli
   src/cli/client.cpp
   src/cli/dump.cpp
   src/cli/assignor.cpp
+  src/cli/group_consumer.cpp
 )
 
 target_link_libraries(dariyakyu_cli PUBLIC dariyakyu_protocol)

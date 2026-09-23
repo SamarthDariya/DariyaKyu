@@ -10,8 +10,10 @@
 
 #include "cli/assignor.hpp"
 #include "cli/client.hpp"
+#include "cli/group_consumer.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/fetch.hpp"
+#include "protocol/group_apis.hpp"
 #include "protocol/list_offsets.hpp"
 #include "protocol/metadata.hpp"
 #include "protocol/produce.hpp"
@@ -422,4 +424,258 @@ TEST_CASE("An assignment from a newer client is refused, not half-read") {
     auto bytes = encodeAssignment({{"orders", 0}});
     bytes[1]   = 99;
     CHECK_THROWS_AS(decodeAssignment(bytes), CorruptData);
+}
+
+// ===========================================================================
+// M5 end to end: a consumer group over a real socket
+// ===========================================================================
+
+namespace {
+
+// Total partitions across every member, and whether any is held twice.
+struct Coverage {
+    set<TopicPartition> distinct;
+    size_t              total = 0;
+
+    void add(const vector<TopicPartition>& assigned) {
+        for (const auto& tp : assigned) {
+            distinct.insert(tp);
+            ++total;
+        }
+    }
+    bool exclusive() const { return distinct.size() == total; }
+};
+
+}  // namespace
+
+TEST_CASE("One consumer in a group gets every partition") {
+    TempDir        dir("group-single");
+    server::Broker broker(optionsFor(dir.file("data")));
+    broker.start();
+    for (PartitionId p = 0; p < 4; ++p)
+        broker.logs().createPartition(TopicPartition{"orders", p});
+
+    cli::Client   client("127.0.0.1", broker.port());
+    GroupConsumer consumer(client, "g", {"orders"});
+
+    const auto assigned = consumer.join();
+    CHECK(assigned.size() == 4);
+    CHECK(consumer.isLeader());
+    CHECK(consumer.generation() > 0);
+    CHECK(consumer.heartbeat());
+
+    broker.stop();
+}
+
+TEST_CASE("Two consumers split a topic between them, exclusively") {
+    TempDir        dir("group-two");
+    server::Broker broker(optionsFor(dir.file("data")));
+    broker.start();
+    for (PartitionId p = 0; p < 4; ++p)
+        broker.logs().createPartition(TopicPartition{"orders", p});
+
+    cli::Client clientA("127.0.0.1", broker.port());
+    cli::Client clientB("127.0.0.1", broker.port());
+
+    GroupConsumer a(clientA, "g", {"orders"});
+    GroupConsumer b(clientB, "g", {"orders"});
+
+    // Both join; each retries through RebalanceInProgress until the group
+    // settles. Run on threads because each is blocked on the other.
+    vector<TopicPartition> assignedA;
+    vector<TopicPartition> assignedB;
+    thread joinA([&] { assignedA = a.join(); });
+    thread joinB([&] { assignedB = b.join(); });
+    joinA.join();
+    joinB.join();
+
+    Coverage coverage;
+    coverage.add(assignedA);
+    coverage.add(assignedB);
+
+    // The only guarantee a group makes: every partition to exactly one member.
+    // Twice would mean two consumers reading the same records; never would mean
+    // records nobody reads.
+    CHECK(coverage.distinct.size() == 4);
+    CHECK(coverage.exclusive());
+    CHECK(assignedA.size() == 2);
+    CHECK(assignedB.size() == 2);
+    CHECK(a.generation() == b.generation());
+
+    broker.stop();
+}
+
+TEST_CASE("When one consumer leaves, the other takes over its partitions") {
+    TempDir        dir("group-takeover");
+    server::Broker broker(optionsFor(dir.file("data")));
+    broker.start();
+    for (PartitionId p = 0; p < 4; ++p)
+        broker.logs().createPartition(TopicPartition{"orders", p});
+
+    cli::Client clientA("127.0.0.1", broker.port());
+    cli::Client clientB("127.0.0.1", broker.port());
+
+    GroupConsumer a(clientA, "g", {"orders"});
+    GroupConsumer b(clientB, "g", {"orders"});
+
+    vector<TopicPartition> assignedA;
+    thread joinA([&] { assignedA = a.join(); });
+    thread joinB([&] { b.join(); });
+    joinA.join();
+    joinB.join();
+    REQUIRE(assignedA.size() == 2);
+
+    const int32_t generationBefore = a.generation();
+
+    // b leaves politely, which lets the rest rebalance immediately rather than
+    // waiting out a session timeout.
+    b.leave();
+
+    // a finds out on the heartbeat it was making anyway — that is why heartbeats
+    // exist rather than the coordinator simply timing members out.
+    CHECK_FALSE(a.heartbeat());
+
+    const auto afterwards = a.join();
+    CHECK(afterwards.size() == 4);
+    CHECK(a.generation() > generationBefore);
+
+    broker.stop();
+}
+
+TEST_CASE("A group's position survives a restart") {
+    TempDir    dir("group-commit-restart");
+    const auto options = optionsFor(dir.file("data"));
+
+    {
+        server::Broker broker(options);
+        broker.start();
+        broker.logs().createPartition(TopicPartition{"orders", 0});
+
+        cli::Client   client("127.0.0.1", broker.port());
+        GroupConsumer consumer(client, "g", {"orders"});
+        consumer.join();
+
+        // Nothing committed yet — which is NOT offset zero, and a consumer that
+        // confused the two would replay an entire topic.
+        CHECK_FALSE(consumer.committed({"orders", 0}).has_value());
+
+        consumer.commit({"orders", 0}, Offset(510));
+        CHECK(consumer.committed({"orders", 0}) == Offset(510));
+        broker.stop();
+    }
+
+    // A whole new broker over the same directory. __offsets is an ordinary topic,
+    // so this is the log doing the durability — and the coordinator's map is
+    // rebuilt by replaying the partition, which is AOF replay by another name.
+    server::Broker restarted(options);
+    restarted.start();
+
+    cli::Client   client("127.0.0.1", restarted.port());
+    GroupConsumer consumer(client, "g", {"orders"});
+    consumer.join();
+
+    CHECK(consumer.committed({"orders", 0}) == Offset(510));
+    restarted.stop();
+}
+
+TEST_CASE("Two groups reading one topic keep separate positions") {
+    TempDir        dir("group-independent");
+    server::Broker broker(optionsFor(dir.file("data")));
+    broker.start();
+    broker.logs().createPartition(TopicPartition{"orders", 0});
+
+    cli::Client clientA("127.0.0.1", broker.port());
+    cli::Client clientB("127.0.0.1", broker.port());
+
+    GroupConsumer a(clientA, "analytics", {"orders"});
+    GroupConsumer b(clientB, "billing", {"orders"});
+    a.join();
+    b.join();
+
+    a.commit({"orders", 0}, Offset(100));
+    b.commit({"orders", 0}, Offset(200));
+
+    // Data is stored once and read by as many consumers as want it. Reading
+    // consumes nothing, so two groups are two positions over the same records.
+    CHECK(a.committed({"orders", 0}) == Offset(100));
+    CHECK(b.committed({"orders", 0}) == Offset(200));
+
+    broker.stop();
+}
+
+TEST_CASE("A stale member cannot commit over a live one") {
+    TempDir        dir("group-fencing");
+    server::Broker broker(optionsFor(dir.file("data")));
+    broker.start();
+    broker.logs().createPartition(TopicPartition{"orders", 0});
+
+    cli::Client clientA("127.0.0.1", broker.port());
+    cli::Client clientB("127.0.0.1", broker.port());
+
+    GroupConsumer a(clientA, "g", {"orders"});
+    a.join();
+    a.commit({"orders", 0}, Offset(100));
+    const int32_t staleGeneration = a.generation();
+
+    // b joins, which bumps the generation and leaves a stale.
+    GroupConsumer b(clientB, "g", {"orders"});
+    thread joinB([&] { b.join(); });
+    thread rejoinA([&] { a.join(); });
+    joinB.join();
+    rejoinA.join();
+
+    REQUIRE(a.generation() > staleGeneration);
+
+    // A zombie on the old generation. Without fencing it would move a position
+    // another member now owns — backwards, and silently.
+    OffsetCommitRequest zombie;
+    zombie.groupId    = "g";
+    zombie.generation = staleGeneration;
+    zombie.memberId   = a.memberId();
+    zombie.topics.push_back({"orders", {{0, Offset(5), ""}}});
+
+    const auto   responseBody = clientA.call(ApiKey::OffsetCommit,
+                                             body(zombie, encodeOffsetCommitRequest));
+    BufferReader in(responseBody);
+    const auto   response = decodeOffsetCommitResponse(in);
+
+    CHECK(response.topics.at(0).partitions.at(0).error == ErrorCode::IllegalGeneration);
+    CHECK(a.committed({"orders", 0}) == Offset(100));   // unmoved
+
+    broker.stop();
+}
+
+TEST_CASE("A group produces and consumes what it was assigned") {
+    TempDir        dir("group-consume");
+    server::Broker broker(optionsFor(dir.file("data")));
+    broker.start();
+    for (PartitionId p = 0; p < 2; ++p)
+        broker.logs().createPartition(TopicPartition{"orders", p});
+
+    cli::Client producer("127.0.0.1", broker.port());
+    for (int i = 0; i < 6; ++i) {
+        produceLine(producer, "orders", 0, "p0 line " + to_string(i));
+        produceLine(producer, "orders", 1, "p1 line " + to_string(i));
+    }
+
+    cli::Client   client("127.0.0.1", broker.port());
+    GroupConsumer consumer(client, "g", {"orders"});
+    const auto    assigned = consumer.join();
+    REQUIRE(assigned.size() == 2);
+
+    // Read each assigned partition from where the group left off — nowhere, so
+    // from the beginning — then commit where it got to.
+    size_t read = 0;
+    for (const auto& tp : assigned) {
+        const Offset from = consumer.committed(tp).value_or(Offset(0));
+        const auto   values = consumeFrom(client, tp.topic, tp.partition, from);
+        read += values.size();
+        consumer.commit(tp, from + static_cast<int64_t>(values.size()));
+    }
+
+    CHECK(read == 12);
+    CHECK(consumer.committed({"orders", 0}) == Offset(6));
+    CHECK(consumer.committed({"orders", 1}) == Offset(6));
+
+    broker.stop();
 }

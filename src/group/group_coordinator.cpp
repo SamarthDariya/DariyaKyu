@@ -124,13 +124,29 @@ JoinResult GroupCoordinator::join(const string& groupId, const string& memberId,
     //
     // A member told RebalanceInProgress has to ask again to learn the outcome. If
     // that second ask started another rebalance — which it would, since the group
-    // has by then reached CompletingRebalance — every member would restart the
-    // cycle the moment the previous one finished it, and a two-member group would
-    // never settle. So a member that is already in the group and has already
-    // rejoined for the rebalance in flight simply collects the result.
-    const auto existing = group.members.find(id);
-    const bool isRetry  = group.state == GroupState::CompletingRebalance &&
-                         existing != group.members.end() && existing->second.rejoined;
+    // has by then moved on — every member would restart the cycle the moment the
+    // previous one finished it, and a two-member group would never settle. So a
+    // member that is already in the group and has already rejoined for the
+    // rebalance in flight simply collects the result.
+    //
+    // Stable counts, not just CompletingRebalance, and that is the whole of the
+    // rule rather than a widening of it. A member is told to retry, sleeps, and
+    // asks again — and the leader may well have synced in the meantime, which puts
+    // the group in Stable before the retry lands. Recognising the retry only in
+    // CompletingRebalance makes settling a race the retrying member loses: it
+    // starts a rebalance nobody else rejoins for, and waits for it forever.
+    //
+    // What distinguishes a retry from a real rejoin is that nothing it is asking
+    // for has changed. A member that comes back with a different subscription is
+    // a genuine event — it wants partitions it does not have — and must rebalance
+    // however settled the group looks.
+    const auto existing  = group.members.find(id);
+    const bool settled   = group.state == GroupState::CompletingRebalance ||
+                         group.state == GroupState::Stable;
+    const bool unchanged = existing != group.members.end() &&
+                           existing->second.subscription == subscription &&
+                           existing->second.protocols == protocols;
+    const bool isRetry = settled && unchanged && existing->second.rejoined;
 
     if (!isRetry && (group.state == GroupState::Stable || group.state == GroupState::Empty ||
                      group.state == GroupState::CompletingRebalance))
