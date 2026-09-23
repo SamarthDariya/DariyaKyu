@@ -35,7 +35,7 @@ The design is written up in full, with the reasoning and the rejected alternativ
 | Phase | Status |
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
-| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 4 of 6 chunks; chunks 1–2 amended in place by M2–M3. **Chunk 5 blocks M5.** |
+| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 5 of 6 chunks; chunks 1–2 amended in place by M2–M3 |
 | Implementation — M0…M9 | 🔸 M0–M4 complete, M5 next |
 
 ---
