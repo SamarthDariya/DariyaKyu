@@ -10,7 +10,12 @@
 #include "protocol/fetch.hpp"
 #include "protocol/metadata.hpp"
 #include "protocol/produce.hpp"
+#include <thread>
+
+#include "protocol/frame.hpp"
 #include "server/api_registry.hpp"
+#include "server/connection.hpp"
+#include "server/socket.hpp"
 #include "server/handlers.hpp"
 #include "test_support.hpp"
 
@@ -778,4 +783,229 @@ TEST_CASE("What was produced is what is fetched back") {
     CHECK(header.baseOffset == Offset(0));
     CHECK(header.recordCount == 2);
     CHECK(header.maxTimestamp == 4243);
+}
+
+// ===========================================================================
+// Sockets and connections
+// ===========================================================================
+
+namespace {
+
+// A listening socket on a free port, plus a client connected to it and the
+// server's end of that connection.
+struct ConnectedPair {
+    Socket listening;
+    Socket client;
+    Socket server;
+
+    ConnectedPair()
+        : listening(Socket::listenOn("127.0.0.1", 0)),
+          client(Socket::connectTo("127.0.0.1", listening.localPort())),
+          server(listening.accept()) {}
+};
+
+// Sends one request and reads one response, as a client would.
+vector<uint8_t> roundTripOverSocket(int fd, ApiKey key, int32_t correlationId,
+                                    const vector<uint8_t>& body) {
+    BufferWriter out;
+    encodeRequestHeader(out, headerFor(key, correlationId));
+    out.writeBytes(body);
+    const auto request = out.take();
+
+    writeFrame(fd, request);
+    const auto frame = readFrame(fd, kMaxFrameBytes);
+    REQUIRE(frame.has_value());
+    return *frame;
+}
+
+}  // namespace
+
+TEST_CASE("A listening socket reports the port the OS gave it") {
+    const Socket listening = Socket::listenOn("127.0.0.1", 0);
+
+    // Asking for 0 and reading back what was bound is what keeps the suite safe
+    // to run on a machine already using 9092, and safe to run twice at once.
+    CHECK(listening.isOpen());
+    CHECK(listening.localPort() > 0);
+}
+
+TEST_CASE("A socket is move-only and closes itself") {
+    static_assert(!is_copy_constructible_v<Socket>,
+                  "a descriptor has one owner; a double close hits whatever file took the number");
+    static_assert(is_move_constructible_v<Socket>);
+
+    int borrowed = -1;
+    {
+        Socket listening = Socket::listenOn("127.0.0.1", 0);
+        borrowed         = listening.fd();
+        Socket moved     = std::move(listening);
+        CHECK_FALSE(listening.isOpen());
+        CHECK(moved.fd() == borrowed);
+    }
+    // Closed by the destructor: connecting to a port nothing listens on fails.
+    CHECK(borrowed >= 0);
+}
+
+TEST_CASE("Connecting to nothing fails rather than hanging") {
+    const Socket listening = Socket::listenOn("127.0.0.1", 0);
+    const int32_t port     = listening.localPort();
+    const_cast<Socket&>(listening).close();
+
+    CHECK_THROWS_AS(Socket::connectTo("127.0.0.1", port), IoError);
+}
+
+TEST_CASE("A connection serves requests until the client goes away") {
+    ServingBroker broker("conn-serve");
+    broker.logs.createPartition(TopicPartition{"orders", 0});
+
+    ConnectedPair pair;
+    Connection    connection(std::move(pair.server), broker.registry, broker.context);
+    thread        server([&] { connection.serve(); });
+
+    // Three requests on one connection, answered in order.
+    for (int32_t i = 1; i <= 3; ++i) {
+        MetadataRequest request;
+        request.allTopics = true;
+        BufferWriter body;
+        encodeMetadataRequest(body, request);
+
+        const auto   frame = roundTripOverSocket(pair.client.fd(), ApiKey::Metadata, i,
+                                                 body.take());
+        BufferReader in(frame);
+        CHECK(decodeResponseHeader(in) == i);
+        const auto response = decodeMetadataResponse(in);
+        CHECK(response.topics.size() == 1);
+    }
+
+    // Closing the client is how a connection normally ends; serve() returns.
+    pair.client.close();
+    server.join();
+}
+
+TEST_CASE("A produce and a fetch over one socket round-trip") {
+    ServingBroker broker("conn-produce-fetch");
+    broker.logs.createPartition(TopicPartition{"orders", 0});
+
+    ConnectedPair pair;
+    Connection    connection(std::move(pair.server), broker.registry, broker.context);
+    thread        server([&] { connection.serve(); });
+
+    const auto     batch = makeUnstampedBatch(7777, 64, 2);
+    ProduceRequest produce;
+    produce.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+    BufferWriter produceBody;
+    encodeProduceRequest(produceBody, produce);
+
+    {
+        const auto   frame = roundTripOverSocket(pair.client.fd(), ApiKey::Produce, 1,
+                                                 produceBody.take());
+        BufferReader in(frame);
+        decodeResponseHeader(in);
+        const auto response = decodeProduceResponse(in);
+        CHECK(response.topics[0].partitions[0].error == ErrorCode::None);
+        CHECK(response.topics[0].partitions[0].baseOffset == Offset(0));
+    }
+
+    FetchRequest fetch;
+    fetch.topics.push_back({"orders", {{0, Offset(0), 1 << 20}}});
+    BufferWriter fetchBody;
+    encodeFetchRequest(fetchBody, fetch);
+
+    {
+        const auto   frame = roundTripOverSocket(pair.client.fd(), ApiKey::Fetch, 2,
+                                                 fetchBody.take());
+        BufferReader in(frame);
+        decodeResponseHeader(in);
+        const auto view = decodeFetchResponse(in);
+
+        // Produced over a socket and fetched back over the same one — the record
+        // bytes went out by sendfile and never entered the broker's memory.
+        const auto& records = view.topics[0].partitions[0].records;
+        REQUIRE_FALSE(records.empty());
+        CHECK(storage::RecordBatch::verifyCrc(records));
+        CHECK(storage::RecordBatch::parseHeader(records).recordCount == 2);
+    }
+
+    pair.client.close();
+    server.join();
+}
+
+TEST_CASE("An unparseable body is answered and the connection survives") {
+    ServingBroker broker("conn-bad-body");
+    ConnectedPair pair;
+    Connection    connection(std::move(pair.server), broker.registry, broker.context);
+    thread        server([&] { connection.serve(); });
+
+    // A well-framed request whose body is nonsense for its api key.
+    const auto frame = roundTripOverSocket(pair.client.fd(), ApiKey::Fetch, 1,
+                                           vector<uint8_t>{0xFF, 0xFF, 0xFF});
+    BufferReader in(frame);
+    CHECK(decodeResponseHeader(in) == 1);
+    CHECK(static_cast<ErrorCode>(in.readInt16()) == ErrorCode::CorruptMessage);
+
+    // And the next request still works. That is a property of length-prefixed
+    // framing: a whole frame was consumed, so the next one begins where it
+    // should. A delimiter-based protocol would have to hang up, not knowing
+    // where the damage ended.
+    MetadataRequest request;
+    request.allTopics = true;
+    BufferWriter body;
+    encodeMetadataRequest(body, request);
+    const auto   second = roundTripOverSocket(pair.client.fd(), ApiKey::Metadata, 2,
+                                              body.take());
+    BufferReader secondIn(second);
+    CHECK(decodeResponseHeader(secondIn) == 2);
+
+    pair.client.close();
+    server.join();
+}
+
+TEST_CASE("An unknown api is answered and the connection survives") {
+    ServingBroker broker("conn-unknown-api");
+    ConnectedPair pair;
+    Connection    connection(std::move(pair.server), broker.registry, broker.context);
+    thread        server([&] { connection.serve(); });
+
+    const auto   frame = roundTripOverSocket(pair.client.fd(), static_cast<ApiKey>(777), 9, {});
+    BufferReader in(frame);
+    CHECK(decodeResponseHeader(in) == 9);
+    CHECK(static_cast<ErrorCode>(in.readInt16()) == ErrorCode::UnsupportedVersion);
+
+    pair.client.close();
+    server.join();
+}
+
+TEST_CASE("An oversized frame ends the connection rather than allocating") {
+    ServingBroker broker("conn-oversized");
+    ConnectedPair pair;
+    Connection    connection(std::move(pair.server), broker.registry, broker.context, 1024);
+    thread        server([&] { connection.serve(); });
+
+    // A prefix claiming two gigabytes, and nothing after it. Where the next
+    // frame begins is now unknowable, so hanging up is the only honest answer.
+    const vector<uint8_t> hostile{0x7F, 0xFF, 0xFF, 0xFF};
+    writeAll(pair.client.fd(), hostile);
+
+    // Returning at all is the assertion: two gigabytes were never allocated.
+    server.join();
+
+    // And serve() returning does not itself close the socket — the Connection
+    // owns it until destroyed. Without this the client would wait forever for a
+    // hangup that never comes, which is exactly what the Acceptor has to get
+    // right when a connection ends.
+    connection.stop();
+    CHECK_FALSE(readFrame(pair.client.fd(), kMaxFrameBytes).has_value());
+}
+
+TEST_CASE("A connection can be stopped from another thread") {
+    ServingBroker broker("conn-stop");
+    ConnectedPair pair;
+    Connection    connection(std::move(pair.server), broker.registry, broker.context);
+    thread        server([&] { connection.serve(); });
+
+    // serve() is blocked in read(), which no flag would interrupt. shutdown()
+    // makes the kernel report end of stream instead.
+    connection.stop();
+    server.join();
+    CHECK(true);
 }

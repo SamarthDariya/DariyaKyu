@@ -104,6 +104,8 @@ target_compile_options(dariyakyu_protocol PRIVATE -Wall -Wextra -Wpedantic)
 add_library(dariyakyu_server
   src/server/api_registry.cpp
   src/server/handlers.cpp
+  src/server/socket.cpp
+  src/server/connection.cpp
 )
 
 target_link_libraries(dariyakyu_server PUBLIC dariyakyu_protocol)
