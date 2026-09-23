@@ -31,7 +31,7 @@ protocol::Response errorResponse(int32_t correlationId, protocol::ErrorCode erro
 
 }  // namespace
 
-Connection::Connection(Socket socket, const ApiRegistry& registry, BrokerContext& broker,
+Connection::Connection(protocol::Socket socket, const ApiRegistry& registry, BrokerContext& broker,
                        size_t maxFrameBytes)
     : socket_(std::move(socket)),
       registry_(registry),

@@ -26,7 +26,7 @@ void Broker::start() {
     // rather than the defaults.
     logs_.loadAll();
 
-    Socket listening = Socket::listenOn(options_.host, options_.port);
+    protocol::Socket listening = protocol::Socket::listenOn(options_.host, options_.port);
 
     // Told to clients, so it has to be the port actually bound rather than the
     // one asked for — those differ whenever the request was 0.

@@ -89,10 +89,26 @@ add_library(dariyakyu_protocol
   src/protocol/create_topic.cpp
   src/protocol/produce.cpp
   src/protocol/fetch.cpp
+  src/protocol/socket.cpp
 )
 
 target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)
 target_compile_options(dariyakyu_protocol PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
+# Library: cli
+# ---------------------------------------------------------------------------
+#
+# Links dariyakyu_protocol and NOT dariyakyu_server, which is the point: a client
+# that could reach a request handler would stop being a client.
+
+add_library(dariyakyu_cli
+  src/cli/client.cpp
+  src/cli/dump.cpp
+)
+
+target_link_libraries(dariyakyu_cli PUBLIC dariyakyu_protocol)
+target_compile_options(dariyakyu_cli PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
 # Library: server
@@ -104,7 +120,6 @@ target_compile_options(dariyakyu_protocol PRIVATE -Wall -Wextra -Wpedantic)
 add_library(dariyakyu_server
   src/server/api_registry.cpp
   src/server/handlers.cpp
-  src/server/socket.cpp
   src/server/connection.cpp
   src/server/acceptor.cpp
   src/server/broker.cpp
@@ -122,8 +137,12 @@ target_compile_options(dariyakyu_server PRIVATE -Wall -Wextra -Wpedantic)
 # a dariyakyu-cli subcommand at M4.
 
 add_executable(dariyakyu-dump apps/dariyakyu_dump.cpp)
-target_link_libraries(dariyakyu-dump PRIVATE dariyakyu_storage)
+target_link_libraries(dariyakyu-dump PRIVATE dariyakyu_cli)
 target_compile_options(dariyakyu-dump PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(dariyakyu-cli apps/dariyakyu_cli.cpp)
+target_link_libraries(dariyakyu-cli PRIVATE dariyakyu_cli)
+target_compile_options(dariyakyu-cli PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(dariyakyu-broker apps/dariyakyu_broker.cpp)
 target_link_libraries(dariyakyu-broker PRIVATE dariyakyu_server)
@@ -172,9 +191,9 @@ add_test(NAME codec_tests COMMAND codec_tests)
 # The storage suites share tests/test_support.hpp, so each needs tests/ on its
 # include path. Split by layer rather than kept as one file: a single 4,000-line
 # suite meant every change rebuilt and reran all of it.
-foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests server_tests)
+foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests server_tests cli_tests)
   add_executable(${suite} tests/${suite}.cpp)
-  target_link_libraries(${suite} PRIVATE dariyakyu_server doctest::doctest)
+  target_link_libraries(${suite} PRIVATE dariyakyu_server dariyakyu_cli doctest::doctest)
   target_include_directories(${suite} PRIVATE tests)
   target_compile_options(${suite} PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME ${suite} COMMAND ${suite})

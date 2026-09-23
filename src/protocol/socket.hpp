@@ -3,9 +3,13 @@
 #include <cstdint>
 #include <string>
 
-namespace dariyakyu::server {
+namespace dariyakyu::protocol {
 
 // RAII around a socket descriptor.
+//
+// In protocol/ rather than server/ because both sides need one: the broker
+// accepts them and the CLI connects with them. Keeping it here means the CLI
+// links only the wire format and cannot reach a request handler by accident.
 //
 // Move-only, like FileHandle and for the same reason: a descriptor has exactly
 // one owner, and closing one twice is a bug this makes unrepresentable. The
@@ -56,4 +60,4 @@ private:
     int fd_ = -1;
 };
 
-}  // namespace dariyakyu::server
+}  // namespace dariyakyu::protocol

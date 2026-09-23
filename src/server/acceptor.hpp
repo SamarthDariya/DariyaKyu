@@ -23,7 +23,7 @@ namespace dariyakyu::server {
 // comparable enough to measure M9 against.
 class Acceptor {
 public:
-    Acceptor(Socket listening, const ApiRegistry& registry, BrokerContext& broker);
+    Acceptor(protocol::Socket listening, const ApiRegistry& registry, BrokerContext& broker);
     ~Acceptor();
 
     Acceptor(const Acceptor&)            = delete;
@@ -69,7 +69,7 @@ private:
         std::shared_ptr<std::atomic<bool>> finished;
     };
 
-    Socket             listening_;
+    protocol::Socket             listening_;
     const ApiRegistry& registry_;
     BrokerContext&     broker_;
 

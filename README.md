@@ -30,13 +30,13 @@ The design is written up in full, with the reasoning and the rejected alternativ
 ## Status
 
 **Design: complete.** 23 conceptual decisions locked, structural design in progress.
-**Implementation: M3 — partitions, retention and a maintenance thread.**
+**Implementation: M4 — a broker you can produce to and consume from.**
 
 | Phase | Status |
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
-| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 4 of 6 chunks; chunks 1–2 amended in place by M2–M3 |
-| Implementation — M0…M9 | 🔸 M0–M3 complete, M4 next |
+| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 4 of 6 chunks; chunks 1–2 amended in place by M2–M3. **Chunk 5 blocks M5.** |
+| Implementation — M0…M9 | 🔸 M0–M4 complete, M5 next |
 
 ---
 
@@ -93,15 +93,17 @@ is merged by PR.
 - [x] suite green locally — 4 storage suites, 232 cases, 3621 assertions
 - [x] green under ASan/UBSan and TSan
 
-### M4 — First real broker ⬜
-- [ ] wire framing, request header, `correlationId` pipelining
-- [ ] `ApiRegistry` dispatch, `BrokerContext`
-- [ ] `Metadata`, `CreateTopic`, `Produce`, `Fetch`, `ListOffsets`
-- [ ] per-partition error codes
-- [ ] thread-per-connection server
-- [ ] `sendfile` on the read path
-- [ ] `dariyakyu-cli` — produce, consume, describe, dump-segment
-- [ ] **produce and consume from a terminal**
+### M4 — First real broker ✅
+- [x] wire framing, request header, `correlationId` echoed and checked
+- [x] `ApiRegistry` dispatch, `BrokerContext`
+- [x] `Metadata`, `CreateTopic`, `Produce`, `Fetch`, `ListOffsets`
+- [x] per-partition error codes
+- [x] thread-per-connection server, with a shutdown that actually unblocks
+- [x] `sendfile` on the read path — a response is a list of buffer and file segments
+- [x] `dariyakyu-cli` — create, produce, consume, describe, dump-segment
+- [x] **produce and consume from a terminal**
+- [x] suite green locally — 437 cases, 5462 assertions
+- [x] green under ASan/UBSan and TSan
 
 ### M5 — Consumer groups ⬜
 - [ ] `__offsets` internal topic

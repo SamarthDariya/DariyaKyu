@@ -4,7 +4,7 @@
 
 #include "protocol/frame.hpp"
 #include "server/api_registry.hpp"
-#include "server/socket.hpp"
+#include "protocol/socket.hpp"
 
 namespace dariyakyu::server {
 
@@ -16,7 +16,7 @@ namespace dariyakyu::server {
 // decision 20's territory and M9's milestone.
 class Connection {
 public:
-    Connection(Socket socket, const ApiRegistry& registry, BrokerContext& broker,
+    Connection(protocol::Socket socket, const ApiRegistry& registry, BrokerContext& broker,
                std::size_t maxFrameBytes = protocol::kMaxFrameBytes);
 
     // Blocks until the connection ends. Never throws: a connection failing is
@@ -36,7 +36,7 @@ public:
     int fd() const { return socket_.fd(); }
 
 private:
-    Socket             socket_;
+    protocol::Socket             socket_;
     const ApiRegistry& registry_;
     BrokerContext&     broker_;
     std::size_t        maxFrameBytes_;

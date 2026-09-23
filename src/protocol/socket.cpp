@@ -1,4 +1,4 @@
-#include "server/socket.hpp"
+#include "protocol/socket.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -13,7 +13,7 @@
 
 using namespace std;
 
-namespace dariyakyu::server {
+namespace dariyakyu::protocol {
 
 namespace {
 
@@ -119,4 +119,4 @@ void Socket::close() {
     if (::close(fd) < 0) throw IoError("close", "socket", errno);
 }
 
-}  // namespace dariyakyu::server
+}  // namespace dariyakyu::protocol

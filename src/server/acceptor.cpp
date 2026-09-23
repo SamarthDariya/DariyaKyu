@@ -9,7 +9,7 @@ using namespace std;
 
 namespace dariyakyu::server {
 
-Acceptor::Acceptor(Socket listening, const ApiRegistry& registry, BrokerContext& broker)
+Acceptor::Acceptor(protocol::Socket listening, const ApiRegistry& registry, BrokerContext& broker)
     : listening_(std::move(listening)), registry_(registry), broker_(broker) {}
 
 Acceptor::~Acceptor() {
@@ -24,7 +24,7 @@ void Acceptor::start() {
 
 void Acceptor::acceptLoop() {
     while (true) {
-        Socket accepted = listening_.accept();
+        protocol::Socket accepted = listening_.accept();
 
         // Checked AFTER accept returns, because that is where this thread spends
         // its life. stop() wakes it with a connection of its own, which arrives
@@ -81,7 +81,7 @@ void Acceptor::stop() {
     //    its own.
     if (acceptThread_.joinable()) {
         try {
-            Socket waker = Socket::connectTo("127.0.0.1", listening_.localPort());
+            protocol::Socket waker = protocol::Socket::connectTo("127.0.0.1", listening_.localPort());
         } catch (const Error&) {
         }
         acceptThread_.join();

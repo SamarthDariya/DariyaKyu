@@ -18,7 +18,7 @@
 #include "server/api_registry.hpp"
 #include "server/broker.hpp"
 #include "server/connection.hpp"
-#include "server/socket.hpp"
+#include "protocol/socket.hpp"
 #include "server/handlers.hpp"
 #include "test_support.hpp"
 
