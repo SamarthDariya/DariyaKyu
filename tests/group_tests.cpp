@@ -8,6 +8,7 @@
 
 #include "common/buffer.hpp"
 #include "group/commit_record.hpp"
+#include "group/group_coordinator.hpp"
 #include "group/offset_store.hpp"
 #include "group/offsets_topic.hpp"
 #include "test_support.hpp"
@@ -15,6 +16,7 @@
 using namespace std;
 using namespace dariyakyu;
 using namespace dariyakyu::group;
+using namespace dariyakyu::protocol;
 using namespace dariyakyu::test;
 
 // ===========================================================================
@@ -433,4 +435,312 @@ TEST_CASE("Many commits across many partitions all come back") {
         for (int p = 0; p < 6; ++p)
             CHECK(fixture.store.fetch({"group-" + to_string(g), "orders", p})->nextOffset ==
                   Offset(g * 100 + p));
+}
+
+// ===========================================================================
+// The group coordinator
+// ===========================================================================
+
+namespace {
+
+const vector<string> kTopics    = {"orders"};
+const vector<string> kProtocols = {"range", "roundrobin"};
+
+JoinResult joinAs(GroupCoordinator& coordinator, const string& group, const string& memberId,
+                  const string& clientId, int64_t nowMs = 1000) {
+    return coordinator.join(group, memberId, clientId, kTopics, kProtocols, 10'000, nowMs);
+}
+
+// Brings a whole group to a settled generation.
+//
+// A single member cannot do this alone once the group has more than one: every
+// member must rejoin before the membership settles, which is exactly what makes a
+// rebalance stop-the-world. So this drives them all, in rounds, the way a set of
+// real consumers retrying their own JoinGroup would.
+vector<JoinResult> settle(GroupCoordinator& coordinator, const string& group,
+                          vector<pair<string, string>>& members, int64_t nowMs = 1000) {
+    vector<JoinResult> results(members.size());
+
+    for (int round = 0; round < 5; ++round) {
+        bool allSettled = true;
+        for (size_t i = 0; i < members.size(); ++i) {
+            results[i] = coordinator.join(group, members[i].first, members[i].second, kTopics,
+                                          kProtocols, 10'000, nowMs);
+            members[i].first = results[i].memberId;   // keep the issued id
+            if (results[i].error == ErrorCode::RebalanceInProgress) allSettled = false;
+        }
+        if (allSettled) return results;
+    }
+    FAIL("group never settled");
+    return results;
+}
+
+}  // namespace
+
+TEST_CASE("A new group starts empty") {
+    GroupCoordinator coordinator;
+    CHECK(coordinator.groupCount() == 0);
+    CHECK(coordinator.stateOf("g") == GroupState::Empty);
+    CHECK(coordinator.memberCount("g") == 0);
+}
+
+TEST_CASE("The first member to join becomes the leader") {
+    GroupCoordinator coordinator;
+
+    const auto joined = joinAs(coordinator, "g", "", "consumer-a");
+
+    CHECK(joined.error == ErrorCode::None);
+    CHECK_FALSE(joined.memberId.empty());
+    CHECK(joined.generation == 1);
+    CHECK(joined.leaderId == joined.memberId);
+    CHECK(joined.isLeader());
+    CHECK(joined.members.size() == 1);
+    CHECK(coordinator.stateOf("g") == GroupState::CompletingRebalance);
+}
+
+TEST_CASE("A member id is issued by the coordinator, not chosen by the client") {
+    GroupCoordinator coordinator;
+
+    vector<pair<string, string>> members{{"", "consumer"}, {"", "consumer"}};
+    const auto                   results = settle(coordinator, "g", members);
+
+    // Same client id, two members. Two consumers that picked their own and
+    // collided would be indistinguishable, and one could commit for partitions
+    // the other owns.
+    CHECK(results[0].memberId != results[1].memberId);
+    CHECK(coordinator.memberCount("g") == 2);
+}
+
+TEST_CASE("An id the group never issued is refused") {
+    GroupCoordinator coordinator;
+    joinAs(coordinator, "g", "", "consumer-a");
+
+    const auto imposter = joinAs(coordinator, "g", "made-up-id", "consumer-b");
+    CHECK(imposter.error == ErrorCode::UnknownMemberId);
+}
+
+TEST_CASE("An empty group id is refused") {
+    GroupCoordinator coordinator;
+    CHECK(joinAs(coordinator, "", "", "consumer").error == ErrorCode::InvalidGroupId);
+}
+
+TEST_CASE("Only the leader receives the member list") {
+    GroupCoordinator coordinator;
+
+    vector<pair<string, string>> members{{"", "consumer-a"}, {"", "consumer-b"}};
+    const auto                   results = settle(coordinator, "g", members);
+
+    REQUIRE(results[0].error == ErrorCode::None);
+    REQUIRE(results[1].error == ErrorCode::None);
+
+    // Exactly one leader, and only it is told who the others are. Everyone else
+    // has nothing to compute with the list, and sending it would tell every
+    // consumer who its peers are for no reason.
+    const int leaders = (results[0].isLeader() ? 1 : 0) + (results[1].isLeader() ? 1 : 0);
+    CHECK(leaders == 1);
+
+    const auto& leader   = results[0].isLeader() ? results[0] : results[1];
+    const auto& follower = results[0].isLeader() ? results[1] : results[0];
+    CHECK(leader.members.size() == 2);
+    CHECK(follower.members.empty());
+    CHECK(follower.leaderId == leader.memberId);
+    CHECK(leader.leaderId == leader.memberId);
+}
+
+TEST_CASE("A second member joining rebalances the group") {
+    GroupCoordinator coordinator;
+
+    const auto a = joinAs(coordinator, "g", "", "consumer-a");
+    CHECK(a.generation == 1);
+
+    // Both members must rejoin before the group settles, which is what makes
+    // this stop-the-world.
+    const auto b = joinAs(coordinator, "g", "", "consumer-b");
+    CHECK(b.error == ErrorCode::RebalanceInProgress);
+    CHECK(coordinator.stateOf("g") == GroupState::PreparingRebalance);
+
+    const auto aRejoined = joinAs(coordinator, "g", a.memberId, "consumer-a");
+    CHECK(aRejoined.error == ErrorCode::None);
+    CHECK(aRejoined.generation == 2);   // bumped when the membership settled
+    CHECK(coordinator.memberCount("g") == 2);
+}
+
+TEST_CASE("A heartbeat is how a member learns of a rebalance") {
+    GroupCoordinator coordinator;
+
+    const auto a = joinAs(coordinator, "g", "", "consumer-a");
+    coordinator.sync("g", a.memberId, a.generation, {{a.memberId, {1, 2, 3}}}, 1000);
+    REQUIRE(coordinator.stateOf("g") == GroupState::Stable);
+    CHECK(coordinator.heartbeat("g", a.memberId, a.generation, 1100) == ErrorCode::None);
+
+    // Somebody else arrives.
+    joinAs(coordinator, "g", "", "consumer-b");
+
+    // Not a failure — the signal, delivered on the heartbeat this member was
+    // making anyway. That is why heartbeats exist rather than the coordinator
+    // simply timing members out.
+    CHECK(coordinator.heartbeat("g", a.memberId, a.generation, 1200) ==
+          ErrorCode::RebalanceInProgress);
+}
+
+TEST_CASE("A stale generation is fenced out") {
+    GroupCoordinator coordinator;
+
+    const auto a = joinAs(coordinator, "g", "", "consumer-a");
+    coordinator.sync("g", a.memberId, a.generation, {{a.memberId, {}}}, 1000);
+
+    // Force a new generation.
+    joinAs(coordinator, "g", "", "consumer-b");
+    joinAs(coordinator, "g", a.memberId, "consumer-a");
+
+    // A zombie from generation 1 waking up. Without fencing it would supply an
+    // assignment, or commit, for partitions it no longer owns.
+    CHECK(coordinator.heartbeat("g", a.memberId, 1, 1300) == ErrorCode::IllegalGeneration);
+    CHECK(coordinator.sync("g", a.memberId, 1, {}, 1300).error == ErrorCode::IllegalGeneration);
+}
+
+TEST_CASE("The leader's assignment reaches each member and nobody else's") {
+    GroupCoordinator coordinator;
+
+    vector<pair<string, string>> members{{"", "consumer-a"}, {"", "consumer-b"}};
+    const auto                   results = settle(coordinator, "g", members);
+
+    const auto& leader = results[0].isLeader() ? results[0] : results[1];
+    const auto& other  = results[0].isLeader() ? results[1] : results[0];
+
+    map<string, vector<uint8_t>> assignments;
+    assignments[leader.memberId] = {0xAA};
+    assignments[other.memberId]  = {0xBB};
+
+    const auto leaderSync = coordinator.sync("g", leader.memberId, leader.generation,
+                                             assignments, 2000);
+    CHECK(leaderSync.error == ErrorCode::None);
+    CHECK(leaderSync.assignment == vector<uint8_t>{0xAA});
+    CHECK(coordinator.stateOf("g") == GroupState::Stable);
+
+    const auto otherSync = coordinator.sync("g", other.memberId, other.generation, {}, 2000);
+    CHECK(otherSync.error == ErrorCode::None);
+    CHECK(otherSync.assignment == vector<uint8_t>{0xBB});
+}
+
+TEST_CASE("A follower syncing before the leader is told to retry") {
+    GroupCoordinator coordinator;
+
+    vector<pair<string, string>> members{{"", "consumer-a"}, {"", "consumer-b"}};
+    const auto                   results  = settle(coordinator, "g", members);
+    const auto&                  follower = results[0].isLeader() ? results[1] : results[0];
+    CHECK(coordinator.sync("g", follower.memberId, follower.generation, {}, 2000).error ==
+          ErrorCode::RebalanceInProgress);
+}
+
+TEST_CASE("A protocol every member supports is chosen") {
+    GroupCoordinator coordinator;
+
+    // One member supports both strategies, the other only round-robin.
+    string aId;
+    string bId;
+    for (int round = 0; round < 4; ++round) {
+        const auto a = coordinator.join("g", aId, "a", kTopics, {"range", "roundrobin"},
+                                        10'000, 1000);
+        aId          = a.memberId;
+        const auto b = coordinator.join("g", bId, "b", kTopics, {"roundrobin"}, 10'000, 1000);
+        bId          = b.memberId;
+        if (a.error == ErrorCode::None && b.error == ErrorCode::None) {
+            // Not the leader's first choice — the one everyone can actually do.
+            CHECK(a.protocolName == "roundrobin");
+            CHECK(b.protocolName == "roundrobin");
+            return;
+        }
+    }
+    FAIL("group never settled");
+}
+
+TEST_CASE("A member leaving rebalances the rest") {
+    GroupCoordinator coordinator;
+
+    const auto a = joinAs(coordinator, "g", "", "consumer-a");
+    const auto b = joinAs(coordinator, "g", "", "consumer-b");
+    joinAs(coordinator, "g", a.memberId, "consumer-a");
+    REQUIRE(coordinator.memberCount("g") == 2);
+
+    CHECK(coordinator.leave("g", b.memberId, 3000) == ErrorCode::None);
+    CHECK(coordinator.memberCount("g") == 1);
+
+    // A departure changes the assignment, so what is left has to REJOIN — the
+    // same stop-the-world path a join takes, not a quiet fix-up.
+    CHECK(coordinator.stateOf("g") == GroupState::PreparingRebalance);
+}
+
+TEST_CASE("The last member leaving removes the group") {
+    GroupCoordinator coordinator;
+
+    const auto a = joinAs(coordinator, "g", "", "consumer-a");
+    CHECK(coordinator.groupCount() == 1);
+
+    CHECK(coordinator.leave("g", a.memberId, 2000) == ErrorCode::None);
+    CHECK(coordinator.groupCount() == 0);
+}
+
+TEST_CASE("Leaving a group you are not in is refused") {
+    GroupCoordinator coordinator;
+    CHECK(coordinator.leave("g", "nobody", 1000) == ErrorCode::UnknownMemberId);
+
+    joinAs(coordinator, "g", "", "consumer-a");
+    CHECK(coordinator.leave("g", "nobody", 1000) == ErrorCode::UnknownMemberId);
+}
+
+TEST_CASE("A member that stops heartbeating is expired") {
+    GroupCoordinator coordinator;
+
+    const auto a = coordinator.join("g", "", "a", kTopics, kProtocols, 5'000, 1000);
+    const auto b = coordinator.join("g", "", "b", kTopics, kProtocols, 5'000, 1000);
+    coordinator.join("g", a.memberId, "a", kTopics, kProtocols, 5'000, 1000);
+    REQUIRE(coordinator.memberCount("g") == 2);
+
+    // a keeps heartbeating; b does not. b's last sign of life was at 1000 and its
+    // session timeout is 5000, so 6500 is the first sweep that should notice.
+    coordinator.heartbeat("g", a.memberId, 2, 4000);
+
+    CHECK(coordinator.expire(6500) == 1);
+    CHECK(coordinator.memberCount("g") == 1);
+
+    // The survivor has to rejoin, exactly as it would after a member left
+    // politely — an expiry is a departure the member did not announce.
+    CHECK(coordinator.stateOf("g") == GroupState::PreparingRebalance);
+}
+
+TEST_CASE("A group whose members all vanish is removed") {
+    GroupCoordinator coordinator;
+    coordinator.join("g", "", "a", kTopics, kProtocols, 5'000, 1000);
+    REQUIRE(coordinator.groupCount() == 1);
+
+    // The reason expiry runs on a thread at all: nothing else would ever notice,
+    // and the group's partitions would stay assigned to nobody forever.
+    CHECK(coordinator.expire(10'000) == 1);
+    CHECK(coordinator.groupCount() == 0);
+}
+
+TEST_CASE("A live group is not expired") {
+    GroupCoordinator coordinator;
+    const auto a = coordinator.join("g", "", "a", kTopics, kProtocols, 5'000, 1000);
+    coordinator.sync("g", a.memberId, a.generation, {{a.memberId, {}}}, 1000);
+
+    coordinator.heartbeat("g", a.memberId, a.generation, 4000);
+    CHECK(coordinator.expire(5000) == 0);
+    CHECK(coordinator.memberCount("g") == 1);
+}
+
+TEST_CASE("Groups are independent of each other") {
+    GroupCoordinator coordinator;
+
+    const auto a = joinAs(coordinator, "group-a", "", "consumer");
+    const auto b = joinAs(coordinator, "group-b", "", "consumer");
+
+    CHECK(coordinator.groupCount() == 2);
+    CHECK(coordinator.memberCount("group-a") == 1);
+    CHECK(coordinator.memberCount("group-b") == 1);
+
+    coordinator.leave("group-a", a.memberId, 2000);
+    CHECK(coordinator.groupCount() == 1);
+    CHECK(coordinator.memberCount("group-b") == 1);
 }
