@@ -90,6 +90,7 @@ add_library(dariyakyu_protocol
   src/protocol/produce.cpp
   src/protocol/fetch.cpp
   src/protocol/socket.cpp
+  src/protocol/group_apis.cpp
 )
 
 target_link_libraries(dariyakyu_protocol PUBLIC dariyakyu_storage)

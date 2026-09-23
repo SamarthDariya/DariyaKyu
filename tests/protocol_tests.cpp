@@ -119,7 +119,8 @@ TEST_CASE("Every api key is known and described") {
 }
 
 TEST_CASE("A key from a newer broker is neither known nor nameless") {
-    // Kafka's gaps are left as gaps rather than reused, so 5 stays unassigned.
+    // Kafka's gaps are left as gaps rather than reused, so 5 stays unassigned
+    // even now that the group apis have filled 8 through 14.
     const auto unassigned = static_cast<ApiKey>(5);
     CHECK_FALSE(isKnown(unassigned));
     CHECK(string(describe(unassigned)) == "unrecognised api key");
