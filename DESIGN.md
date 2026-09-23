@@ -1483,3 +1483,154 @@ because that is exactly when it is wanted: when the broker will not start.
 - **Multi-broker `Metadata`** — one node, so every partition's leader is this one. M8 makes it a
   real answer.
 - **TLS, SASL, quotas** — not in this project.
+
+### 5. Consumer groups
+
+The first subsystem in dariyakyu that is not a log.
+
+Everything until now has been storage with a protocol in front of it, and every
+component has been deliberately ignorant — the broker does not know what a record
+means, what a batch contains, or what a consumer is doing with either. A group
+coordinator cannot be ignorant in the same way: it tracks who is in a group, what
+generation they are on, and whether a rebalance is in progress. That state lives
+in memory, changes on a timer, and has a lifecycle.
+
+What *stays* ignorant is the assignment itself (decision 22): the coordinator
+relays opaque bytes and never looks inside. That is the fifth appearance of the
+pattern, and the one that makes client-side strategies possible.
+
+#### Offsets are records, and the coordinator is a partition leader
+
+Decision 21 gives both for free. `__offsets` is an ordinary topic:
+
+```
+key:   (group, topic, partition)
+value: (offset, metadata, timestampMs)
+```
+
+and the coordinator for a group is the leader of `hash(group) % N` of it. No new
+election, no new failover path, no new durability story — leadership, replication
+and recovery are the mechanisms already built for data partitions.
+
+**N is immutable.** Changing the partition count moves every group to a different
+coordinator *and* orphans its committed offsets, which are keyed into the old
+partition. Nothing needs to store N: the number of `__offsets` partitions on disk
+IS N, discovered by the startup scan that already runs. Creating the topic with a
+different count on a directory that already has one is refused.
+
+**`__offsets` grows without bound until M6.** It is a compacted topic by design
+and compaction is the next milestone; until then a busy group grows it steadily.
+Stated rather than discovered.
+
+**The coordinator serves from an in-memory map, rebuilt by replaying the
+partition.** Committing is an append plus a map update; reading never touches
+disk. That replay is the only reason `OffsetStore` needs to read its own topic.
+
+**A commit stores the NEXT offset to read.** Handle 500–509, commit 510. Getting
+this wrong reprocesses or skips exactly one message per restart, survives every
+test anyone writes by hand, and shows up in production. The type system cannot
+help here — both are an `Offset` — so it is stated at every boundary that touches
+one.
+
+#### The group state machine
+
+```
+        Empty ──join──▶ PreparingRebalance ──all joined──▶ CompletingRebalance
+          ▲                    ▲                                   │
+          │                    │                              leader syncs
+          └──last member───── Stable ◀─────────────────────────────┘
+                              leaves        join / leave / heartbeat expiry
+```
+
+Four states, and the two transient ones are where every subtlety lives:
+
+- **PreparingRebalance** — a rebalance was triggered and the coordinator is
+  collecting `JoinGroup` from everyone. Members already in the group learn of it
+  through their *heartbeat* being rejected with `RebalanceInProgress`, which is
+  what makes heartbeats more than a liveness check.
+- **CompletingRebalance** — everyone has joined, the leader is computing an
+  assignment, and the others are parked in `SyncGroup` waiting for their slice.
+
+**The generation id is a fencing token** — the third appearance of the pattern,
+after leader epochs and, later, producer epochs. It is bumped on entry to
+PreparingRebalance, and every subsequent request carries it. A zombie member from
+generation 4 that wakes up and commits is rejected with `IllegalGeneration`,
+because the group is on 5. Without it a partitioned consumer that comes back
+would happily commit offsets for partitions it no longer owns, moving another
+member's position backwards.
+
+**Rebalancing is stop-the-world.** Every member revokes everything and processing
+halts until the new assignment lands, so one restarting consumer freezes the group
+for seconds. That is decision 22's accepted cost, and feeling it is the point:
+cooperative rebalancing is Tier A precisely because the pain should come first.
+
+#### Why the client computes the assignment
+
+The broker knows everything and is the obvious place, so Kafka doing the opposite
+is the interesting part. Assignment strategies are application-specific and
+unpredictable — range, round-robin, sticky, rack-aware, capacity-weighted,
+co-partitioned. Broker-side logic means **a cluster upgrade for every new
+strategy**, coordinated with every team using it. Client-side, it is a class in
+one app and one deploy.
+
+```
+1. members ──JoinGroup(subscription, strategies)──▶ coordinator
+2. coordinator picks the first member as leader, bumps generation
+3. ◀── leader receives the full member list; others receive nothing
+4. leader computes the assignment locally
+5. leader ──SyncGroup(opaque assignment per member)──▶ coordinator
+6. ◀── each member receives only its own slice
+7. members fetch; heartbeats maintain liveness
+```
+
+The coordinator stores the assignment bytes and hands each member its own. It
+never parses them, which is what lets a new strategy ship without the broker
+knowing it exists.
+
+#### Expiry needs a thread
+
+A member that stops heartbeating has to trigger a rebalance, and nothing else
+would notice. Lazy expiry — checking on the next request — is simpler and wrong
+for the case that matters: a group whose members have *all* vanished never gets
+another request, so it never rebalances and its partitions stay assigned to
+nobody forever.
+
+So the coordinator owns a sweep thread, the same shape as M3's maintenance
+thread: condition-variable wait so stopping is immediate, failures counted rather
+than fatal or silent, joined in the destructor body before any member it touches
+is freed. M3's version exists to prove that shape works; this one reuses it.
+
+#### Six new error codes
+
+| Code | Means |
+|---|---|
+| `CoordinatorNotAvailable` | `__offsets` is not ready — retry |
+| `NotCoordinator` | wrong broker for this group; re-run `FindCoordinator` |
+| `IllegalGeneration` | a zombie from an earlier generation |
+| `UnknownMemberId` | expired, or never joined |
+| `RebalanceInProgress` | rejoin; this is how a member LEARNS of a rebalance |
+| `InvalidGroupId` | empty or unusable group name |
+
+`RebalanceInProgress` is the one doing real work. It is not a failure — it is the
+signal, delivered on the heartbeat a member was making anyway, which is why
+heartbeats exist at all rather than the coordinator simply timing members out.
+
+#### Rejected alternatives
+
+| Alternative | Why not |
+|---|---|
+| A separate offset store (a file, an embedded KV) | Offsets need durability, replication and recovery — a log, which already exists. Decision 21 |
+| A dedicated coordinator election | Partition leadership already elects, fences and fails over. Reusing it costs nothing |
+| Broker-side assignment | A cluster upgrade per strategy. Decision 22 |
+| Lazy expiry instead of a thread | A group whose members all vanish never rebalances |
+| Storing the LAST processed offset | Off by exactly one per restart, and it survives testing |
+| Cooperative rebalancing now | Tier A. The stop-the-world pain should be felt first |
+
+#### Banked for later
+
+- **Compaction of `__offsets`** — M6, and the reason the topic is compacted by
+  design rather than by accident.
+- **Cooperative rebalancing and static membership** — Tier A.
+- **Sticky assignment** — a client-side strategy, so it needs no broker change,
+  which is the whole argument for decision 22.
+- **`DescribeGroups` / `ListGroups`** — operational, not on the path to consuming.
