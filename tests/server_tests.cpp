@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "protocol/frame.hpp"
+#include "group/offsets_topic.hpp"
 #include "server/api_registry.hpp"
 #include "server/broker.hpp"
 #include "server/connection.hpp"
@@ -36,12 +37,18 @@ namespace {
 
 // A broker with nothing in it, for tests that only exercise dispatch.
 struct BareBroker {
-    TempDir              dir;
-    storage::LogManager  logs;
-    BrokerContext        context;
+    TempDir                 dir;
+    storage::LogManager     logs;
+    group::OffsetStore      offsets;
+    group::GroupCoordinator groups;
+    BrokerContext           context;
 
     explicit BareBroker(const string& name)
-        : dir(name), logs(dir.file("data"), testConfig()), context{logs, 1, "127.0.0.1", 9092} {}
+        : dir(name),
+          logs(dir.file("data"), testConfig()),
+          offsets(logs, group::kDefaultOffsetsPartitions),
+          context{logs, groups, offsets, group::kDefaultOffsetsPartitions, 1, "127.0.0.1",
+                  9092} {}
 };
 
 // Builds a frame for `header` plus `body`, then runs it through the registry and
@@ -1142,7 +1149,8 @@ TEST_CASE("Finished connections are reaped rather than accumulating") {
     // One more, to give the accept loop a chance to reap the rest.
     { Socket last = broker.connect(); }
 
-    CHECK(waitFor([&] { return broker.broker.logs().partitionCount() == 1; }));
+    // One data partition plus __offsets, which the broker creates at startup.
+    CHECK(broker.broker.logs().get(TopicPartition{"orders", 0}) != nullptr);
     CHECK(true);   // reaching here without exhausting threads is the assertion
 }
 
@@ -1222,4 +1230,42 @@ TEST_CASE("A broker restarts into the data it left behind") {
     CHECK(storage::RecordBatch::verifyCrc(records));
     CHECK(storage::RecordBatch::parseHeader(records).recordCount == 3);
     restarted.stop();
+}
+
+TEST_CASE("Internal topics are hidden from a request for everything") {
+    RunningBroker broker("broker-internal-topics");
+    broker.broker.logs().createPartition(TopicPartition{"orders", 0});
+
+    Socket          client = broker.connect();
+    MetadataRequest everything;
+    everything.allTopics = true;
+    BufferWriter body;
+    encodeMetadataRequest(body, everything);
+
+    const auto   frame = roundTripOverSocket(client.fd(), ApiKey::Metadata, 1, body.take());
+    BufferReader in(frame);
+    decodeResponseHeader(in);
+    const auto response = decodeMetadataResponse(in);
+
+    // A client subscribing to every topic should not find itself consuming the
+    // offsets of every other consumer.
+    REQUIRE(response.topics.size() == 1);
+    CHECK(response.topics[0].name == "orders");
+
+    // But asked for by name, it is answered — the topic is not a secret, just not
+    // part of "everything".
+    Socket          second = broker.connect();
+    MetadataRequest byName;
+    byName.topics = {"__offsets"};
+    BufferWriter namedBody;
+    encodeMetadataRequest(namedBody, byName);
+
+    const auto   namedFrame = roundTripOverSocket(second.fd(), ApiKey::Metadata, 2,
+                                                  namedBody.take());
+    BufferReader namedIn(namedFrame);
+    decodeResponseHeader(namedIn);
+    const auto named = decodeMetadataResponse(namedIn);
+    REQUIRE(named.topics.size() == 1);
+    CHECK(named.topics[0].name == "__offsets");
+    CHECK(named.topics[0].partitions.size() == group::kDefaultOffsetsPartitions);
 }

@@ -4,7 +4,9 @@
 
 #include "common/errors.hpp"
 #include "protocol/create_topic.hpp"
+#include "group/offsets_topic.hpp"
 #include "protocol/fetch.hpp"
+#include "protocol/group_apis.hpp"
 #include "protocol/list_offsets.hpp"
 #include "protocol/metadata.hpp"
 #include "protocol/produce.hpp"
@@ -92,7 +94,14 @@ void handleMetadata(RequestContext& request, Response& out) {
     };
 
     if (decoded.allTopics) {
-        for (const auto& [name, partitions] : byTopic) response.topics.push_back(describe(name));
+        for (const auto& [name, partitions] : byTopic) {
+            // Internal topics are excluded from "everything" but answered when
+            // asked for by name — Kafka's rule, and the right one: a client
+            // subscribing to every topic should not find itself consuming the
+            // offsets of every other consumer.
+            if (name.rfind("__", 0) == 0) continue;
+            response.topics.push_back(describe(name));
+        }
     } else {
         for (const auto& name : decoded.topics) response.topics.push_back(describe(name));
     }
@@ -268,12 +277,208 @@ void handleFetch(RequestContext& request, Response& out) {
     encodeFetchResponse(out, response);
 }
 
+// --------------------------------------------------------------------------
+// Consumer groups
+// --------------------------------------------------------------------------
+
+namespace {
+
+// Appends `response` encoded by `encoder`.
+template <typename Response, typename Encoder>
+void reply(protocol::Response& out, const Response& response, Encoder encoder) {
+    BufferWriter buffer;
+    encoder(buffer, response);
+    out.append(buffer.take());
+}
+
+}  // namespace
+
+void handleFindCoordinator(RequestContext& request, Response& out) {
+    const auto              decoded = decodeFindCoordinatorRequest(request.body);
+    FindCoordinatorResponse response;
+
+    if (decoded.groupId.empty()) {
+        response.error = ErrorCode::InvalidGroupId;
+        reply(out, response, encodeFindCoordinatorResponse);
+        return;
+    }
+
+    // hash(group) %% N names a partition of __offsets, and whoever leads it is the
+    // coordinator. No new election and no new failover path — partition
+    // leadership already does both.
+    const PartitionId partition =
+        group::coordinatorPartition(decoded.groupId, request.broker.offsetsPartitions);
+
+    if (request.broker.logs.get(TopicPartition{group::kOffsetsTopic, partition}) == nullptr) {
+        // __offsets is not ready. A client retries rather than giving up, because
+        // this is a startup race and not a permanent condition.
+        response.error = ErrorCode::CoordinatorNotAvailable;
+        reply(out, response, encodeFindCoordinatorResponse);
+        return;
+    }
+
+    // One node, so it is always this one. A client reads it rather than assuming,
+    // so M8 can move coordinators without the client changing.
+    response.nodeId = request.broker.nodeId;
+    response.host   = request.broker.advertisedHost;
+    response.port   = request.broker.advertisedPort;
+    reply(out, response, encodeFindCoordinatorResponse);
+}
+
+void handleJoinGroup(RequestContext& request, Response& out) {
+    const auto decoded = decodeJoinGroupRequest(request.body);
+
+    const auto joined = request.broker.groups.join(
+        decoded.groupId, decoded.memberId, request.header.clientId, decoded.subscription,
+        decoded.protocols, decoded.sessionTimeoutMs, storage::wallClockMillis());
+
+    JoinGroupResponse response;
+    response.error        = joined.error;
+    response.generation   = joined.generation;
+    response.protocolName = joined.protocolName;
+    response.leaderId     = joined.leaderId;
+    response.memberId     = joined.memberId;
+
+    for (const auto& member : joined.members)
+        response.members.push_back({member.memberId, member.subscription});
+
+    reply(out, response, encodeJoinGroupResponse);
+}
+
+void handleSyncGroup(RequestContext& request, Response& out) {
+    const auto decoded = decodeSyncGroupRequest(request.body);
+
+    const auto synced =
+        request.broker.groups.sync(decoded.groupId, decoded.memberId, decoded.generation,
+                                   decoded.assignments, storage::wallClockMillis());
+
+    SyncGroupResponse response;
+    response.error      = synced.error;
+    response.assignment = synced.assignment;
+    reply(out, response, encodeSyncGroupResponse);
+}
+
+void handleHeartbeat(RequestContext& request, Response& out) {
+    const auto decoded = decodeHeartbeatRequest(request.body);
+
+    HeartbeatResponse response;
+    response.error = request.broker.groups.heartbeat(decoded.groupId, decoded.memberId,
+                                                     decoded.generation,
+                                                     storage::wallClockMillis());
+    reply(out, response, encodeHeartbeatResponse);
+}
+
+void handleLeaveGroup(RequestContext& request, Response& out) {
+    const auto decoded = decodeLeaveGroupRequest(request.body);
+
+    LeaveGroupResponse response;
+    response.error = request.broker.groups.leave(decoded.groupId, decoded.memberId,
+                                                 storage::wallClockMillis());
+    reply(out, response, encodeLeaveGroupResponse);
+}
+
+void handleOffsetCommit(RequestContext& request, Response& out) {
+    const auto           decoded = decodeOffsetCommitRequest(request.body);
+    OffsetCommitResponse response;
+
+    // A member of a group must prove it is current; a standalone consumer — no
+    // member id, no generation — is committing on its own behalf and has nothing
+    // to prove. Kafka allows both, and refusing the second would mean a consumer
+    // could not track its position without joining a group it does not need.
+    ErrorCode membership = ErrorCode::None;
+    if (!decoded.memberId.empty() || decoded.generation >= 0) {
+        membership = request.broker.groups.heartbeat(decoded.groupId, decoded.memberId,
+                                                     decoded.generation,
+                                                     storage::wallClockMillis());
+    }
+
+    for (const auto& topic : decoded.topics) {
+        OffsetCommitResponse::Topic answer;
+        answer.name = topic.name;
+
+        for (const auto& asked : topic.partitions) {
+            OffsetCommitResponse::Partition result;
+            result.partition = asked.partition;
+
+            if (membership != ErrorCode::None) {
+                // A zombie from an earlier generation would otherwise move a
+                // position that another member now owns — backwards, silently.
+                result.error = membership;
+                answer.partitions.push_back(result);
+                continue;
+            }
+
+            try {
+                group::CommitValue value;
+                value.nextOffset        = asked.nextOffset;
+                value.metadata          = asked.metadata;
+                value.commitTimestampMs = storage::wallClockMillis();
+
+                request.broker.offsets.commit(
+                    {decoded.groupId, topic.name, asked.partition}, value);
+            } catch (const Error&) {
+                result.error = ErrorCode::Unknown;
+            }
+
+            answer.partitions.push_back(result);
+        }
+
+        response.topics.push_back(std::move(answer));
+    }
+
+    reply(out, response, encodeOffsetCommitResponse);
+}
+
+void handleOffsetFetch(RequestContext& request, Response& out) {
+    const auto          decoded = decodeOffsetFetchRequest(request.body);
+    OffsetFetchResponse response;
+
+    // No membership check. A consumer asking where it left off has nothing to
+    // prove — it is reading its own past, not claiming a partition.
+    for (const auto& topic : decoded.topics) {
+        OffsetFetchResponse::Topic answer;
+        answer.name = topic.name;
+
+        for (const PartitionId partition : topic.partitions) {
+            OffsetFetchResponse::Partition result;
+            result.partition = partition;
+
+            const auto found =
+                request.broker.offsets.fetch({decoded.groupId, topic.name, partition});
+
+            if (found) {
+                result.nextOffset = found->nextOffset;
+                result.metadata   = found->metadata;
+            } else {
+                // -1, never 0. "Never committed" and "committed at the beginning"
+                // differ by an entire topic's worth of records, and only the
+                // client knows which its reset policy wants.
+                result.nextOffset = kUnknownOffset;
+            }
+
+            answer.partitions.push_back(std::move(result));
+        }
+
+        response.topics.push_back(std::move(answer));
+    }
+
+    reply(out, response, encodeOffsetFetchResponse);
+}
+
 void registerAllHandlers(ApiRegistry& registry) {
     registry.registerHandler(ApiKey::ListOffsets, 0, handleListOffsets);
     registry.registerHandler(ApiKey::Metadata, 0, handleMetadata);
     registry.registerHandler(ApiKey::CreateTopic, 0, handleCreateTopic);
     registry.registerHandler(ApiKey::Produce, 0, handleProduce);
     registry.registerHandler(ApiKey::Fetch, 0, handleFetch);
+
+    registry.registerHandler(ApiKey::FindCoordinator, 0, handleFindCoordinator);
+    registry.registerHandler(ApiKey::JoinGroup, 0, handleJoinGroup);
+    registry.registerHandler(ApiKey::SyncGroup, 0, handleSyncGroup);
+    registry.registerHandler(ApiKey::Heartbeat, 0, handleHeartbeat);
+    registry.registerHandler(ApiKey::LeaveGroup, 0, handleLeaveGroup);
+    registry.registerHandler(ApiKey::OffsetCommit, 0, handleOffsetCommit);
+    registry.registerHandler(ApiKey::OffsetFetch, 0, handleOffsetFetch);
 }
 
 }  // namespace dariyakyu::server

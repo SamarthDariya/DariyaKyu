@@ -19,6 +19,15 @@ void handleCreateTopic(RequestContext& request, protocol::Response& out);
 void handleProduce(RequestContext& request, protocol::Response& out);
 void handleFetch(RequestContext& request, protocol::Response& out);
 
+// Consumer groups (M5).
+void handleFindCoordinator(RequestContext& request, protocol::Response& out);
+void handleJoinGroup(RequestContext& request, protocol::Response& out);
+void handleSyncGroup(RequestContext& request, protocol::Response& out);
+void handleHeartbeat(RequestContext& request, protocol::Response& out);
+void handleLeaveGroup(RequestContext& request, protocol::Response& out);
+void handleOffsetCommit(RequestContext& request, protocol::Response& out);
+void handleOffsetFetch(RequestContext& request, protocol::Response& out);
+
 // Registers every handler this build serves, at version 0.
 void registerAllHandlers(ApiRegistry& registry);
 
