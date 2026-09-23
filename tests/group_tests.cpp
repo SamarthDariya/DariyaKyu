@@ -744,3 +744,51 @@ TEST_CASE("Groups are independent of each other") {
     CHECK(coordinator.groupCount() == 1);
     CHECK(coordinator.memberCount("group-b") == 1);
 }
+
+TEST_CASE("A retry that arrives after the group settled is still a retry") {
+    GroupCoordinator coordinator;
+
+    // One member, settled.
+    const auto first = coordinator.join("g", "", "c1", {"orders"}, {"range"}, 10'000, 1000);
+    coordinator.sync("g", first.memberId, first.generation, {{first.memberId, {}}}, 1000);
+    REQUIRE(coordinator.stateOf("g") == GroupState::Stable);
+
+    // A second member arrives and is told to retry.
+    const auto second = coordinator.join("g", "", "c2", {"orders"}, {"range"}, 10'000, 1100);
+    CHECK(second.error == ErrorCode::RebalanceInProgress);
+    REQUIRE_FALSE(second.memberId.empty());
+
+    // The first rejoins, the rebalance completes, and the leader syncs — all
+    // before the second gets around to asking again.
+    const auto rejoined = coordinator.join("g", first.memberId, "c1", {"orders"}, {"range"},
+                                           10'000, 1200);
+    REQUIRE(rejoined.error == ErrorCode::None);
+    coordinator.sync("g", rejoined.leaderId, rejoined.generation,
+                     {{first.memberId, {}}, {second.memberId, {}}}, 1200);
+    REQUIRE(coordinator.stateOf("g") == GroupState::Stable);
+
+    // Now the retry lands. It must collect the result, not start a rebalance
+    // nobody else will rejoin for — the member would then wait forever, because
+    // every other member is settled and has no reason to ask again.
+    const auto retry = coordinator.join("g", second.memberId, "c2", {"orders"}, {"range"},
+                                        10'000, 1300);
+    CHECK(retry.error == ErrorCode::None);
+    CHECK(retry.generation == rejoined.generation);
+    CHECK(coordinator.stateOf("g") == GroupState::Stable);
+}
+
+TEST_CASE("A settled member that changes its subscription does rebalance") {
+    GroupCoordinator coordinator;
+
+    const auto first = coordinator.join("g", "", "c1", {"orders"}, {"range"}, 10'000, 1000);
+    coordinator.sync("g", first.memberId, first.generation, {{first.memberId, {}}}, 1000);
+    REQUIRE(coordinator.stateOf("g") == GroupState::Stable);
+
+    // Asking for a topic it was not assigned is a real event, not a retry: the
+    // member wants partitions nobody has given it. Told to retry, because the
+    // rebalance it just caused has to complete first.
+    const auto changed = coordinator.join("g", first.memberId, "c1", {"orders", "payments"},
+                                          {"range"}, 10'000, 1100);
+    CHECK(changed.error == ErrorCode::None);
+    CHECK(changed.generation == first.generation + 1);
+}
