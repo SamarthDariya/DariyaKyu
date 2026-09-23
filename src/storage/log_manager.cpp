@@ -318,10 +318,7 @@ vector<TopicPartition> LogManager::hostedPartitions() const {
     // logs_ is an unordered_map, so its iteration order is an implementation
     // detail. Metadata's answer goes on the wire, and a wire format that differs
     // between two runs of the same broker is a debugging trap.
-    sort(all.begin(), all.end(), [](const TopicPartition& a, const TopicPartition& b) {
-        if (a.topic != b.topic) return a.topic < b.topic;
-        return a.partition < b.partition;
-    });
+    sort(all.begin(), all.end());   // topic then partition, by TopicPartition's own ordering
 
     return all;
 }

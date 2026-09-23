@@ -76,6 +76,11 @@ struct TopicPartition {
 
     bool operator==(const TopicPartition&) const = default;
 
+    // Ordered by topic then partition, which is the order anything listing
+    // partitions wants: Metadata's answer goes on the wire, and a format that
+    // differed between two runs of the same broker would be a debugging trap.
+    auto operator<=>(const TopicPartition&) const = default;
+
     // "orders-3" — also the on-disk directory name, so this doubles as the path
     // component rather than being a debug-only convenience.
     //

@@ -6,6 +6,9 @@
 #include <string>
 #include <vector>
 
+#include <set>
+
+#include "cli/assignor.hpp"
 #include "cli/client.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/fetch.hpp"
@@ -18,6 +21,7 @@
 using namespace std;
 using namespace dariyakyu;
 using namespace dariyakyu::protocol;
+using namespace dariyakyu::cli;
 using namespace dariyakyu::test;
 
 // ===========================================================================
@@ -268,4 +272,154 @@ TEST_CASE("Several clients share one broker") {
         CHECK(values.back() == "p" + to_string(p) + " r19");
     }
     broker.stop();
+}
+
+// ===========================================================================
+// Assignors
+// ===========================================================================
+
+namespace {
+
+AssignmentInput inputFor(const vector<string>& members, const vector<string>& topics,
+                         const map<string, int32_t>& counts) {
+    AssignmentInput input;
+    for (const auto& member : members) input.members[member] = topics;
+    input.partitionCounts = counts;
+    return input;
+}
+
+size_t totalAssigned(const map<string, vector<TopicPartition>>& assignment) {
+    size_t total = 0;
+    for (const auto& [member, partitions] : assignment) total += partitions.size();
+    return total;
+}
+
+}  // namespace
+
+TEST_CASE("An assignment round-trips through its opaque bytes") {
+    const vector<TopicPartition> assigned{{"orders", 0}, {"orders", 2}, {"payments", 1}};
+    const auto                   decoded = decodeAssignment(encodeAssignment(assigned));
+
+    CHECK(decoded.size() == 3);
+    CHECK(decoded[0] == TopicPartition{"orders", 0});
+    CHECK(decoded[1] == TopicPartition{"orders", 2});
+    CHECK(decoded[2] == TopicPartition{"payments", 1});
+}
+
+TEST_CASE("An empty assignment is legal, not an error") {
+    // A group with more members than partitions leaves some holding nothing.
+    // They heartbeat on, waiting for the next rebalance.
+    CHECK(decodeAssignment({}).empty());
+    CHECK(decodeAssignment(encodeAssignment({})).empty());
+}
+
+TEST_CASE("Range gives contiguous blocks, remainder to the earliest members") {
+    const auto assignment = assignRange(inputFor({"a", "b"}, {"orders"}, {{"orders", 3}}));
+
+    // Three partitions between two members: two and one. The extra goes to the
+    // earlier member, so the result depends only on the sorted member list — not
+    // on who joined first, and not on which leader computed it.
+    CHECK(assignment.at("a") == vector<TopicPartition>{{"orders", 0}, {"orders", 1}});
+    CHECK(assignment.at("b") == vector<TopicPartition>{{"orders", 2}});
+    CHECK(totalAssigned(assignment) == 3);
+}
+
+TEST_CASE("Range gives the same member partition zero of every topic") {
+    const auto assignment = assignRange(
+        inputFor({"a", "b"}, {"orders", "payments"}, {{"orders", 4}, {"payments", 4}}));
+
+    // The co-partitioning property, and the reason range exists: a join across
+    // two topics keyed the same way needs both halves of a key on one consumer.
+    CHECK(assignment.at("a")[0] == TopicPartition{"orders", 0});
+    CHECK(assignment.at("a")[2] == TopicPartition{"payments", 0});
+    CHECK(totalAssigned(assignment) == 8);
+}
+
+TEST_CASE("Round robin deals one partition at a time") {
+    const auto assignment = assignRoundRobin(inputFor({"a", "b"}, {"orders"}, {{"orders", 5}}));
+
+    CHECK(assignment.at("a") ==
+          vector<TopicPartition>{{"orders", 0}, {"orders", 2}, {"orders", 4}});
+    CHECK(assignment.at("b") == vector<TopicPartition>{{"orders", 1}, {"orders", 3}});
+    CHECK(totalAssigned(assignment) == 5);
+}
+
+TEST_CASE("Round robin spreads more evenly across topics than range") {
+    const auto counts = map<string, int32_t>{{"a-topic", 3}, {"b-topic", 3}};
+    const auto range  = assignRange(inputFor({"x", "y"}, {"a-topic", "b-topic"}, counts));
+    const auto robin  = assignRoundRobin(inputFor({"x", "y"}, {"a-topic", "b-topic"}, counts));
+
+    // Range hands the remainder of EVERY topic to the same earliest member, so
+    // its imbalance compounds; round robin carries the deal across topics.
+    CHECK(range.at("x").size() == 4);
+    CHECK(range.at("y").size() == 2);
+    CHECK(robin.at("x").size() == 3);
+    CHECK(robin.at("y").size() == 3);
+}
+
+TEST_CASE("Every partition is assigned exactly once") {
+    for (const int members : {1, 2, 3, 5, 7}) {
+        vector<string> ids;
+        for (int i = 0; i < members; ++i) ids.push_back("member-" + to_string(i));
+
+        for (const auto& assignment :
+             {assignRange(inputFor(ids, {"orders"}, {{"orders", 12}})),
+              assignRoundRobin(inputFor(ids, {"orders"}, {{"orders", 12}}))}) {
+            set<TopicPartition> seen;
+            size_t              count = 0;
+            for (const auto& [member, partitions] : assignment)
+                for (const auto& tp : partitions) {
+                    seen.insert(tp);
+                    ++count;
+                }
+            // Twice would mean two consumers reading the same partition, which
+            // breaks the one guarantee a group makes. Never would mean records
+            // nobody reads.
+            CHECK(seen.size() == 12);
+            CHECK(count == 12);
+        }
+    }
+}
+
+TEST_CASE("More members than partitions leaves some holding nothing") {
+    const auto assignment =
+        assignRange(inputFor({"a", "b", "c", "d"}, {"orders"}, {{"orders", 2}}));
+
+    CHECK(totalAssigned(assignment) == 2);
+    CHECK(assignment.size() == 4);   // everyone is still in the group
+
+    int idle = 0;
+    for (const auto& [member, partitions] : assignment)
+        if (partitions.empty()) ++idle;
+    CHECK(idle == 2);
+}
+
+TEST_CASE("A member gets nothing from a topic it did not subscribe to") {
+    AssignmentInput input;
+    input.members["a"]      = {"orders"};
+    input.members["b"]      = {"payments"};
+    input.partitionCounts   = {{"orders", 2}, {"payments", 2}};
+
+    for (const auto& assignment : {assignRange(input), assignRoundRobin(input)}) {
+        for (const auto& tp : assignment.at("a")) CHECK(tp.topic == "orders");
+        for (const auto& tp : assignment.at("b")) CHECK(tp.topic == "payments");
+        CHECK(totalAssigned(assignment) == 4);
+    }
+}
+
+TEST_CASE("Two leaders computing the same group agree") {
+    const auto input = inputFor({"c", "a", "b"}, {"orders"}, {{"orders", 7}});
+
+    // Ordered by member id rather than by arrival, so which member happened to be
+    // elected leader cannot change the answer.
+    for (int i = 0; i < 5; ++i) {
+        CHECK(assignRange(input) == assignRange(input));
+        CHECK(assignRoundRobin(input) == assignRoundRobin(input));
+    }
+}
+
+TEST_CASE("An assignment from a newer client is refused, not half-read") {
+    auto bytes = encodeAssignment({{"orders", 0}});
+    bytes[1]   = 99;
+    CHECK_THROWS_AS(decodeAssignment(bytes), CorruptData);
 }

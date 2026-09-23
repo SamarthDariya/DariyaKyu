@@ -106,6 +106,7 @@ target_compile_options(dariyakyu_protocol PRIVATE -Wall -Wextra -Wpedantic)
 add_library(dariyakyu_cli
   src/cli/client.cpp
   src/cli/dump.cpp
+  src/cli/assignor.cpp
 )
 
 target_link_libraries(dariyakyu_cli PUBLIC dariyakyu_protocol)
