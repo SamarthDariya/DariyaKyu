@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "protocol/fetch.hpp"
+#include "protocol/group_apis.hpp"
 #include "protocol/list_offsets.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/metadata.hpp"
@@ -806,5 +807,239 @@ TEST_CASE("A truncated fetch response is refused at every length") {
         const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
         BufferReader          in(partial);
         CHECK_THROWS_AS(decodeFetchResponse(in), CorruptData);
+    }
+}
+
+// ===========================================================================
+// The consumer-group APIs
+// ===========================================================================
+
+TEST_CASE("FindCoordinator round-trips") {
+    FindCoordinatorRequest request{"payments-consumer"};
+    const auto decoded = roundTrip(
+        [&](BufferWriter& out) { encodeFindCoordinatorRequest(out, request); },
+        [](BufferReader& in) { return decodeFindCoordinatorRequest(in); });
+    CHECK(decoded.groupId == "payments-consumer");
+
+    FindCoordinatorResponse response{ErrorCode::None, 1, "127.0.0.1", 9092};
+    const auto decodedResponse = roundTrip(
+        [&](BufferWriter& out) { encodeFindCoordinatorResponse(out, response); },
+        [](BufferReader& in) { return decodeFindCoordinatorResponse(in); });
+    CHECK(decodedResponse.nodeId == 1);
+    CHECK(decodedResponse.host == "127.0.0.1");
+    CHECK(decodedResponse.port == 9092);
+}
+
+TEST_CASE("A coordinator that is not available says so") {
+    FindCoordinatorResponse response;
+    response.error = ErrorCode::CoordinatorNotAvailable;
+
+    const auto decoded = roundTrip(
+        [&](BufferWriter& out) { encodeFindCoordinatorResponse(out, response); },
+        [](BufferReader& in) { return decodeFindCoordinatorResponse(in); });
+
+    // __offsets not ready yet. A client retries rather than giving up.
+    CHECK(decoded.error == ErrorCode::CoordinatorNotAvailable);
+    CHECK(decoded.nodeId == -1);
+}
+
+TEST_CASE("JoinGroup round-trips, with and without a member id") {
+    JoinGroupRequest first;
+    first.groupId      = "g";
+    first.subscription = {"orders", "payments"};
+    first.protocols    = {"range", "roundrobin"};
+
+    const auto decodedFirst = roundTrip(
+        [&](BufferWriter& out) { encodeJoinGroupRequest(out, first); },
+        [](BufferReader& in) { return decodeJoinGroupRequest(in); });
+
+    // Empty on a first join — the coordinator issues one, because a client that
+    // chose its own could collide with another and become indistinguishable.
+    CHECK(decodedFirst.memberId.empty());
+    CHECK(decodedFirst.subscription.size() == 2);
+    CHECK(decodedFirst.protocols == vector<string>{"range", "roundrobin"});
+
+    JoinGroupRequest rejoin = first;
+    rejoin.memberId         = "consumer-a-1";
+    const auto decodedRejoin = roundTrip(
+        [&](BufferWriter& out) { encodeJoinGroupRequest(out, rejoin); },
+        [](BufferReader& in) { return decodeJoinGroupRequest(in); });
+    CHECK(decodedRejoin.memberId == "consumer-a-1");
+}
+
+TEST_CASE("Only a leader's JoinGroup response carries the member list") {
+    JoinGroupResponse leader;
+    leader.generation   = 5;
+    leader.protocolName = "range";
+    leader.leaderId     = "a";
+    leader.memberId     = "a";
+    leader.members      = {{"a", {"orders"}}, {"b", {"orders"}}};
+
+    const auto decodedLeader = roundTrip(
+        [&](BufferWriter& out) { encodeJoinGroupResponse(out, leader); },
+        [](BufferReader& in) { return decodeJoinGroupResponse(in); });
+    CHECK(decodedLeader.members.size() == 2);
+    CHECK(decodedLeader.members[1].memberId == "b");
+    CHECK(decodedLeader.members[0].subscription == vector<string>{"orders"});
+
+    JoinGroupResponse follower = leader;
+    follower.memberId          = "b";
+    follower.members.clear();
+
+    const auto decodedFollower = roundTrip(
+        [&](BufferWriter& out) { encodeJoinGroupResponse(out, follower); },
+        [](BufferReader& in) { return decodeJoinGroupResponse(in); });
+    CHECK(decodedFollower.members.empty());
+    CHECK(decodedFollower.leaderId == "a");
+    CHECK(decodedFollower.generation == 5);
+}
+
+TEST_CASE("SyncGroup carries opaque assignment bytes") {
+    SyncGroupRequest request;
+    request.groupId     = "g";
+    request.generation  = 3;
+    request.memberId    = "a";
+    request.assignments = {{"a", {0x01, 0x02}}, {"b", {0xFF}}};
+
+    const auto decoded = roundTrip(
+        [&](BufferWriter& out) { encodeSyncGroupRequest(out, request); },
+        [](BufferReader& in) { return decodeSyncGroupRequest(in); });
+
+    // The broker stores these and hands each member its own. It never parses
+    // them, which is what lets a new strategy ship without the broker knowing it
+    // exists.
+    REQUIRE(decoded.assignments.size() == 2);
+    CHECK(decoded.assignments.at("a") == vector<uint8_t>{0x01, 0x02});
+    CHECK(decoded.assignments.at("b") == vector<uint8_t>{0xFF});
+
+    SyncGroupRequest follower;
+    follower.groupId    = "g";
+    follower.generation = 3;
+    follower.memberId   = "b";
+    const auto decodedFollower = roundTrip(
+        [&](BufferWriter& out) { encodeSyncGroupRequest(out, follower); },
+        [](BufferReader& in) { return decodeSyncGroupRequest(in); });
+    CHECK(decodedFollower.assignments.empty());
+}
+
+TEST_CASE("An assignment of arbitrary bytes survives untouched") {
+    vector<uint8_t> opaque(256);
+    for (size_t i = 0; i < opaque.size(); ++i) opaque[i] = static_cast<uint8_t>(i);
+
+    SyncGroupResponse response;
+    response.assignment = opaque;
+
+    const auto decoded = roundTrip(
+        [&](BufferWriter& out) { encodeSyncGroupResponse(out, response); },
+        [](BufferReader& in) { return decodeSyncGroupResponse(in); });
+    CHECK(decoded.assignment == opaque);
+}
+
+TEST_CASE("Heartbeat and LeaveGroup round-trip") {
+    HeartbeatRequest heartbeat{"g", 7, "a"};
+    const auto decodedHeartbeat = roundTrip(
+        [&](BufferWriter& out) { encodeHeartbeatRequest(out, heartbeat); },
+        [](BufferReader& in) { return decodeHeartbeatRequest(in); });
+    CHECK(decodedHeartbeat.generation == 7);
+
+    HeartbeatResponse rebalancing{ErrorCode::RebalanceInProgress};
+    const auto decodedResponse = roundTrip(
+        [&](BufferWriter& out) { encodeHeartbeatResponse(out, rebalancing); },
+        [](BufferReader& in) { return decodeHeartbeatResponse(in); });
+
+    // Not a failure — the signal, on the heartbeat the member was making anyway.
+    CHECK(decodedResponse.error == ErrorCode::RebalanceInProgress);
+
+    LeaveGroupRequest leave{"g", "a"};
+    const auto decodedLeave = roundTrip(
+        [&](BufferWriter& out) { encodeLeaveGroupRequest(out, leave); },
+        [](BufferReader& in) { return decodeLeaveGroupRequest(in); });
+    CHECK(decodedLeave.memberId == "a");
+}
+
+TEST_CASE("OffsetCommit round-trips the next offset to read") {
+    OffsetCommitRequest request;
+    request.groupId    = "g";
+    request.generation = 4;
+    request.memberId   = "a";
+    request.topics.push_back({"orders", {{0, Offset(510), "deploy-7"}, {1, Offset(0), ""}}});
+
+    const auto decoded = roundTrip(
+        [&](BufferWriter& out) { encodeOffsetCommitRequest(out, request); },
+        [](BufferReader& in) { return decodeOffsetCommitRequest(in); });
+
+    // 510, not 509. Handle 500 through 509, commit 510 — off by one here
+    // reprocesses or skips exactly one message per restart.
+    CHECK(decoded.topics[0].partitions[0].nextOffset == Offset(510));
+    CHECK(decoded.topics[0].partitions[0].metadata == "deploy-7");
+    CHECK(decoded.topics[0].partitions[1].nextOffset == Offset(0));
+    CHECK(decoded.generation == 4);
+}
+
+TEST_CASE("A negative committed offset is refused") {
+    BufferWriter out;
+    writeString(out, "g");
+    out.writeInt32(1);
+    writeString(out, "a");
+    out.writeInt32(1);
+    writeString(out, "orders");
+    out.writeInt32(1);
+    out.writeInt32(0);
+    out.writeInt64(-1);
+    const auto   bytes = out.take();
+    BufferReader in(bytes);
+
+    // Not a position a consumer reached. Accepting it would make the next fetch
+    // ask for something before the log began, and the group would silently
+    // restart from the earliest record it could find.
+    CHECK_THROWS_AS(decodeOffsetCommitRequest(in), CorruptData);
+}
+
+TEST_CASE("OffsetFetch distinguishes never-committed from committed-at-zero") {
+    OffsetFetchResponse response;
+    response.topics.push_back({"orders",
+                               {{0, Offset(0), "", ErrorCode::None},
+                                {1, Offset(-1), "", ErrorCode::None}}});
+
+    const auto decoded = roundTrip(
+        [&](BufferWriter& out) { encodeOffsetFetchResponse(out, response); },
+        [](BufferReader& in) { return decodeOffsetFetchResponse(in); });
+
+    // Zero means "committed, at the beginning". -1 means "never committed", which
+    // a consumer reads as "start wherever your reset policy says". Those differ
+    // by an entire topic's worth of records.
+    CHECK(decoded.topics[0].partitions[0].nextOffset == Offset(0));
+    CHECK(decoded.topics[0].partitions[1].nextOffset == Offset(-1));
+}
+
+TEST_CASE("OffsetFetch requests round-trip") {
+    OffsetFetchRequest request;
+    request.groupId = "g";
+    request.topics.push_back({"orders", {0, 1, 2}});
+    request.topics.push_back({"payments", {}});
+
+    const auto decoded = roundTrip(
+        [&](BufferWriter& out) { encodeOffsetFetchRequest(out, request); },
+        [](BufferReader& in) { return decodeOffsetFetchRequest(in); });
+
+    CHECK(decoded.topics[0].partitions == vector<PartitionId>{0, 1, 2});
+    CHECK(decoded.topics[1].partitions.empty());
+}
+
+TEST_CASE("Every group request is refused at every truncation") {
+    JoinGroupRequest join;
+    join.groupId      = "g";
+    join.memberId     = "a";
+    join.subscription = {"orders"};
+    join.protocols    = {"range"};
+
+    BufferWriter out;
+    encodeJoinGroupRequest(out, join);
+    const auto full = out.take();
+
+    for (size_t length = 0; length < full.size(); ++length) {
+        const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
+        BufferReader          in(partial);
+        CHECK_THROWS_AS(decodeJoinGroupRequest(in), CorruptData);
     }
 }

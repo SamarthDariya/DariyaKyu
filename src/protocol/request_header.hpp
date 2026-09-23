@@ -15,15 +15,28 @@ namespace dariyakyu::protocol {
 // translation layer would otherwise have to remap every key as well as every
 // field. Kafka's gaps (5..18) are left as gaps rather than reused.
 enum class ApiKey : std::int16_t {
-    Produce     = 0,
-    Fetch       = 1,
-    ListOffsets = 2,
-    Metadata    = 3,
-    CreateTopic = 19,
+    Produce         = 0,
+    Fetch           = 1,
+    ListOffsets     = 2,
+    Metadata        = 3,
+
+    // Consumer groups (M5), also at Kafka's numbers.
+    OffsetCommit    = 8,
+    OffsetFetch     = 9,
+    FindCoordinator = 10,
+    JoinGroup       = 11,
+    Heartbeat       = 12,
+    LeaveGroup      = 13,
+    SyncGroup       = 14,
+
+    CreateTopic     = 19,
 };
 
-inline constexpr std::array<ApiKey, 5> kAllApiKeys{
-    ApiKey::Produce, ApiKey::Fetch, ApiKey::ListOffsets, ApiKey::Metadata, ApiKey::CreateTopic,
+inline constexpr std::array<ApiKey, 12> kAllApiKeys{
+    ApiKey::Produce,      ApiKey::Fetch,       ApiKey::ListOffsets, ApiKey::Metadata,
+    ApiKey::OffsetCommit, ApiKey::OffsetFetch, ApiKey::FindCoordinator,
+    ApiKey::JoinGroup,    ApiKey::Heartbeat,   ApiKey::LeaveGroup,  ApiKey::SyncGroup,
+    ApiKey::CreateTopic,
 };
 
 // Whether this build has a handler for `key` at all.

@@ -26,6 +26,13 @@ const char* describe(ApiKey key) {
         case ApiKey::Fetch: return "Fetch";
         case ApiKey::ListOffsets: return "ListOffsets";
         case ApiKey::Metadata: return "Metadata";
+        case ApiKey::OffsetCommit: return "OffsetCommit";
+        case ApiKey::OffsetFetch: return "OffsetFetch";
+        case ApiKey::FindCoordinator: return "FindCoordinator";
+        case ApiKey::JoinGroup: return "JoinGroup";
+        case ApiKey::Heartbeat: return "Heartbeat";
+        case ApiKey::LeaveGroup: return "LeaveGroup";
+        case ApiKey::SyncGroup: return "SyncGroup";
         case ApiKey::CreateTopic: return "CreateTopic";
     }
     return "unrecognised api key";
