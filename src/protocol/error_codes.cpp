@@ -25,6 +25,12 @@ const char* describe(ErrorCode code) {
         case ErrorCode::InvalidTopic: return "invalid topic name";
         case ErrorCode::RequestTimedOut: return "request timed out";
         case ErrorCode::UnsupportedVersion: return "unsupported api version";
+        case ErrorCode::CoordinatorNotAvailable: return "group coordinator not available";
+        case ErrorCode::NotCoordinator: return "not the coordinator for this group";
+        case ErrorCode::IllegalGeneration: return "stale generation";
+        case ErrorCode::UnknownMemberId: return "unknown member id";
+        case ErrorCode::RebalanceInProgress: return "rebalance in progress — rejoin";
+        case ErrorCode::InvalidGroupId: return "invalid group id";
     }
     // Reached only for a code off the wire that this build does not know, which a
     // client of a newer broker can genuinely produce.
