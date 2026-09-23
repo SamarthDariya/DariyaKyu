@@ -339,7 +339,7 @@ int doConsumeGroup(cli::Client& client, const string& topic, const Options& opti
     cli::GroupConsumer consumer(client, options.group, {topic}, options.strategy);
 
     while (true) {
-        const auto assigned = consumer.join();
+        const auto assigned = consumer.ensureJoined();
 
         fprintf(stderr, "member %s, generation %d%s, assigned:", consumer.memberId().c_str(),
                 consumer.generation(), consumer.isLeader() ? " (leader)" : "");
