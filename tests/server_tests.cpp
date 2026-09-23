@@ -10,10 +10,13 @@
 #include "protocol/fetch.hpp"
 #include "protocol/metadata.hpp"
 #include "protocol/produce.hpp"
+#include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "protocol/frame.hpp"
 #include "server/api_registry.hpp"
+#include "server/broker.hpp"
 #include "server/connection.hpp"
 #include "server/socket.hpp"
 #include "server/handlers.hpp"
@@ -791,6 +794,16 @@ TEST_CASE("What was produced is what is fetched back") {
 
 namespace {
 
+template <typename Predicate>
+bool waitFor(Predicate predicate, chrono::milliseconds limit = chrono::milliseconds(5000)) {
+    const auto deadline = chrono::steady_clock::now() + limit;
+    while (chrono::steady_clock::now() < deadline) {
+        if (predicate()) return true;
+        this_thread::sleep_for(chrono::milliseconds(1));
+    }
+    return predicate();
+}
+
 // A listening socket on a free port, plus a client connected to it and the
 // server's end of that connection.
 struct ConnectedPair {
@@ -1008,4 +1021,205 @@ TEST_CASE("A connection can be stopped from another thread") {
     connection.stop();
     server.join();
     CHECK(true);
+}
+
+// ===========================================================================
+// Acceptor and Broker
+// ===========================================================================
+
+namespace {
+
+// A broker on a free port, stopped when it goes out of scope.
+struct RunningBroker {
+    TempDir        dir;
+    server::Broker broker;
+
+    explicit RunningBroker(const string& name, storage::LogConfig config = testConfig())
+        : dir(name), broker(makeOptions(dir.file("data"), config)) {
+        broker.start();
+    }
+    ~RunningBroker() { broker.stop(); }
+
+    Socket connect() { return Socket::connectTo("127.0.0.1", broker.port()); }
+
+private:
+    static server::Broker::Options makeOptions(const filesystem::path& dataDir,
+                                               storage::LogConfig      config) {
+        server::Broker::Options options;
+        options.dataDir               = dataDir;
+        options.defaults              = config;
+        options.host                  = "127.0.0.1";
+        options.port                  = 0;   // let the OS pick
+        options.maintenanceIntervalMs = 1000;
+        return options;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("A broker listens on the port it was given and reports it") {
+    RunningBroker broker("broker-listen");
+
+    // Asked for 0, so the bound port is the only one that exists — and it is
+    // what Metadata must advertise, not the one requested.
+    CHECK(broker.broker.port() > 0);
+    CHECK_NOTHROW(broker.connect());
+}
+
+TEST_CASE("A broker answers over a real socket") {
+    RunningBroker broker("broker-answers");
+    broker.broker.logs().createPartition(TopicPartition{"orders", 0});
+
+    Socket client = broker.connect();
+
+    MetadataRequest request;
+    request.allTopics = true;
+    BufferWriter body;
+    encodeMetadataRequest(body, request);
+
+    const auto   frame = roundTripOverSocket(client.fd(), ApiKey::Metadata, 1, body.take());
+    BufferReader in(frame);
+    CHECK(decodeResponseHeader(in) == 1);
+    const auto response = decodeMetadataResponse(in);
+
+    REQUIRE(response.brokers.size() == 1);
+    CHECK(response.brokers[0].port == broker.broker.port());
+    CHECK(response.topics[0].name == "orders");
+}
+
+TEST_CASE("Several clients are served at once") {
+    RunningBroker broker("broker-concurrent");
+    broker.broker.logs().createPartition(TopicPartition{"orders", 0});
+
+    constexpr int kClients = 8;
+    atomic<int>   answered{0};
+    vector<thread> clients;
+
+    for (int c = 0; c < kClients; ++c) {
+        clients.emplace_back([&] {
+            Socket client = broker.connect();
+            for (int i = 0; i < 10; ++i) {
+                const auto     batch = makeUnstampedBatch(1000 + i, 48);
+                ProduceRequest produce;
+                produce.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+                BufferWriter body;
+                encodeProduceRequest(body, produce);
+
+                const auto   frame = roundTripOverSocket(client.fd(), ApiKey::Produce, i,
+                                                         body.take());
+                BufferReader in(frame);
+                decodeResponseHeader(in);
+                if (decodeProduceResponse(in).topics[0].partitions[0].error == ErrorCode::None)
+                    answered.fetch_add(1, memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& client : clients) client.join();
+
+    // One thread per connection, all writing to one partition — which is safe
+    // only because Log::append is the single appender and LogManager locks its
+    // own registry. There is no broker-wide lock anywhere in this.
+    CHECK(answered.load() == kClients * 10);
+    CHECK(broker.broker.logs().get(TopicPartition{"orders", 0})->logEndOffset() ==
+          Offset(kClients * 10));
+}
+
+TEST_CASE("Finished connections are reaped rather than accumulating") {
+    RunningBroker broker("broker-reap");
+    broker.broker.logs().createPartition(TopicPartition{"orders", 0});
+
+    // Thirty short-lived connections. Without reaping, a broker keeps one thread
+    // object per connection it has EVER served.
+    for (int i = 0; i < 30; ++i) {
+        Socket       client = broker.connect();
+        MetadataRequest request;
+        BufferWriter body;
+        encodeMetadataRequest(body, request);
+        roundTripOverSocket(client.fd(), ApiKey::Metadata, i, body.take());
+        client.close();
+    }
+
+    // One more, to give the accept loop a chance to reap the rest.
+    { Socket last = broker.connect(); }
+
+    CHECK(waitFor([&] { return broker.broker.logs().partitionCount() == 1; }));
+    CHECK(true);   // reaching here without exhausting threads is the assertion
+}
+
+TEST_CASE("Stopping a broker with clients connected is prompt and clean") {
+    RunningBroker broker("broker-stop");
+    broker.broker.logs().createPartition(TopicPartition{"orders", 0});
+
+    vector<Socket> clients;
+    for (int i = 0; i < 4; ++i) clients.push_back(broker.connect());
+
+    // Every one of those has a thread blocked in read(), which notices no flag.
+    // stop() closes the listening socket to end the accept loop, then shuts down
+    // each connection so its read reports end of stream, then joins.
+    const auto before = chrono::steady_clock::now();
+    broker.broker.stop();
+    const auto elapsed = chrono::steady_clock::now() - before;
+
+    CHECK(elapsed < chrono::seconds(3));
+
+    // And the clients see the hangup rather than waiting on a socket nothing
+    // will ever write to.
+    for (auto& client : clients)
+        CHECK_FALSE(readFrame(client.fd(), kMaxFrameBytes).has_value());
+}
+
+TEST_CASE("Stopping twice is harmless") {
+    RunningBroker broker("broker-stop-twice");
+    CHECK_NOTHROW(broker.broker.stop());
+    CHECK_NOTHROW(broker.broker.stop());
+}
+
+TEST_CASE("A broker restarts into the data it left behind") {
+    TempDir dir("broker-restart");
+    const filesystem::path dataDir = dir.file("data");
+
+    server::Broker::Options options;
+    options.dataDir               = dataDir;
+    options.defaults              = testConfig();
+    options.host                  = "127.0.0.1";
+    options.port                  = 0;
+    options.maintenanceIntervalMs = 1000;
+
+    {
+        server::Broker broker(options);
+        broker.start();
+        broker.logs().createPartition(TopicPartition{"orders", 0});
+
+        Socket         client = broker.port() > 0 ? Socket::connectTo("127.0.0.1", broker.port())
+                                                  : Socket{};
+        const auto     batch  = makeUnstampedBatch(1000, 48, 3);
+        ProduceRequest produce;
+        produce.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+        BufferWriter body;
+        encodeProduceRequest(body, produce);
+        roundTripOverSocket(client.fd(), ApiKey::Produce, 1, body.take());
+        broker.stop();
+    }
+
+    // A second broker over the same directory: loadAll finds the partition, its
+    // partition.meta supplies its config, and the records are still there.
+    server::Broker restarted(options);
+    restarted.start();
+
+    Socket       client = Socket::connectTo("127.0.0.1", restarted.port());
+    FetchRequest fetch;
+    fetch.topics.push_back({"orders", {{0, Offset(0), 1 << 20}}});
+    BufferWriter fetchBody;
+    encodeFetchRequest(fetchBody, fetch);
+
+    const auto   frame = roundTripOverSocket(client.fd(), ApiKey::Fetch, 1, fetchBody.take());
+    BufferReader in(frame);
+    decodeResponseHeader(in);
+    const auto view = decodeFetchResponse(in);
+
+    const auto& records = view.topics[0].partitions[0].records;
+    REQUIRE_FALSE(records.empty());
+    CHECK(storage::RecordBatch::verifyCrc(records));
+    CHECK(storage::RecordBatch::parseHeader(records).recordCount == 3);
+    restarted.stop();
 }

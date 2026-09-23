@@ -106,6 +106,8 @@ add_library(dariyakyu_server
   src/server/handlers.cpp
   src/server/socket.cpp
   src/server/connection.cpp
+  src/server/acceptor.cpp
+  src/server/broker.cpp
 )
 
 target_link_libraries(dariyakyu_server PUBLIC dariyakyu_protocol)
@@ -122,6 +124,10 @@ target_compile_options(dariyakyu_server PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(dariyakyu-dump apps/dariyakyu_dump.cpp)
 target_link_libraries(dariyakyu-dump PRIVATE dariyakyu_storage)
 target_compile_options(dariyakyu-dump PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(dariyakyu-broker apps/dariyakyu_broker.cpp)
+target_link_libraries(dariyakyu-broker PRIVATE dariyakyu_server)
+target_compile_options(dariyakyu-broker PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
 # Tests

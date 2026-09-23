@@ -144,6 +144,15 @@ unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, LogConfig fal
 }
 
 Offset Log::append(span<uint8_t> batchBytes) {
+    // Held for the whole function, so reading the log end offset, stamping it
+    // into the batch, and handing that batch to the segment are one indivisible
+    // step. Two threads without it read the same offset, stamp the same value,
+    // and the segment's contiguity check rejects all but the first.
+    //
+    // Always taken BEFORE segmentsMutex_, never after — which is what keeps the
+    // pair deadlock-free.
+    lock_guard appendLock(appendMutex_);
+
     // The producer could not know this: it encoded before the broker had seen
     // the batch, so every offset inside it is a delta and the base is blank.
     // Assigning it here is what makes offsets a single global sequence per
@@ -159,8 +168,8 @@ Offset Log::append(span<uint8_t> batchBytes) {
     // there is no upgrade.
     maybeRoll(wallClockMillis());
 
-    // relaxed is enough for the load: only the appender writes this, so it is
-    // reading its own last value.
+    // relaxed is enough for the load: appendMutex_ is what makes this exclusive,
+    // and a mutex already orders everything either side of it.
     const Offset base = logEndOffset_.load(memory_order_relaxed);
 
     RecordBatch::stampBaseOffset(batchBytes, base);
@@ -169,8 +178,8 @@ Offset Log::append(span<uint8_t> batchBytes) {
 
     // SHARED, not exclusive, even though this mutates the active segment.
     //
-    // That is safe only because there is exactly one appender per partition — the
-    // contract this whole class is built on. What the lock is for is excluding a
+    // Safe because appendMutex_ above already excludes every other writer, so the
+    // segment sees one appender at a time. What THIS lock is for is excluding a
     // ROLL: without it, maybeRoll on the maintenance thread could swap active_
     // out from under this dereference. Readers hold the same shared lock, so they
     // still proceed alongside the appender, which is the point.

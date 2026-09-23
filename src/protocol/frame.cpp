@@ -27,12 +27,21 @@ bool readExactly(int fd, span<uint8_t> out) {
             // A signal arriving mid-read is not a failure. Treating it as one
             // makes a broker that dies whenever anything sends it a signal.
             if (errno == EINTR) continue;
-            throw IoError("read", "socket", errno);
+
+            // A reset is the peer going away, and it is treated exactly like a
+            // clean close below.
+            //
+            // Not a nicety: a server shutting down does shutdown() then close(),
+            // and whether the client sees a FIN or an RST depends on timing it
+            // cannot influence. A client that threw on one and not the other
+            // would crash on roughly half of all normal broker restarts.
+            if (errno != ECONNRESET) throw IoError("read", "socket", errno);
         }
 
-        if (got == 0) {
+        if (got <= 0) {
             // End of stream. Clean only if nothing had been read yet — a peer
-            // that closed part-way through promised bytes it did not send.
+            // that vanished part-way through promised bytes it did not send,
+            // and that is corruption whether it left politely or not.
             if (filled == 0) return false;
             throw CorruptData("frame: stream ended after " + to_string(filled) + " of " +
                               to_string(out.size()) + " byte(s)");

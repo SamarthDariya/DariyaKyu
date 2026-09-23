@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
@@ -179,7 +180,22 @@ public:
     // BEFORE the crc field, so the checksum does not cover them and does not
     // need recomputing — over a body the broker may not even be able to read.
     //
-    // Single-appender only: one thread per partition.
+    // Safe to call from several threads, and serialised so that only one is ever
+    // inside at a time.
+    //
+    // M2 wrote this as "single-appender only: one thread per partition", which
+    // was true while the only caller was a test. M4 made it false: the server
+    // gives every CONNECTION a thread, and any connection may produce to any
+    // partition, so eight clients writing to one partition means eight threads
+    // here. Without serialisation they read the same log end offset, stamp the
+    // same base offset into their batches, and all but one fail the segment's
+    // contiguity check.
+    //
+    // A mutex rather than routing produces to a per-partition thread. The
+    // routing version is M9's architecture and needs a queue to exist first; this
+    // costs one uncontended lock per append and keeps every invariant below it
+    // exactly as it was — the segment still sees one appender at a time, which is
+    // all its own comments ever needed.
     Offset append(std::span<std::uint8_t> batchBytes);
 
     // Where the bytes for `offset` live, or why there are none.
@@ -315,6 +331,13 @@ private:
     // mutable, so const readers can take a shared lock. Guards the map and the
     // active_ pointer — not the bytes either of them describes.
     mutable std::shared_mutex segmentsMutex_;
+
+    // Serialises WRITERS against each other. Readers never take it, so a fetch
+    // is unaffected by a produce in flight.
+    //
+    // Always acquired before segmentsMutex_, never after. Nothing in this class
+    // takes them the other way round, which is what keeps the pair deadlock-free.
+    std::mutex appendMutex_;
 };
 
 }  // namespace dariyakyu::storage
