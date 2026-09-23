@@ -111,6 +111,20 @@ target_link_libraries(dariyakyu_cli PUBLIC dariyakyu_protocol)
 target_compile_options(dariyakyu_cli PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
+# Library: group
+# ---------------------------------------------------------------------------
+#
+# Consumer groups: the offsets topic, the coordinator, and the group state
+# machine. Depends on storage and protocol; the server links it, not the reverse.
+
+add_library(dariyakyu_group
+  src/group/offsets_topic.cpp
+)
+
+target_link_libraries(dariyakyu_group PUBLIC dariyakyu_protocol)
+target_compile_options(dariyakyu_group PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
 # Library: server
 # ---------------------------------------------------------------------------
 #
@@ -125,7 +139,7 @@ add_library(dariyakyu_server
   src/server/broker.cpp
 )
 
-target_link_libraries(dariyakyu_server PUBLIC dariyakyu_protocol)
+target_link_libraries(dariyakyu_server PUBLIC dariyakyu_protocol dariyakyu_group)
 target_compile_options(dariyakyu_server PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
@@ -191,7 +205,7 @@ add_test(NAME codec_tests COMMAND codec_tests)
 # The storage suites share tests/test_support.hpp, so each needs tests/ on its
 # include path. Split by layer rather than kept as one file: a single 4,000-line
 # suite meant every change rebuilt and reran all of it.
-foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests server_tests cli_tests)
+foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests server_tests cli_tests group_tests)
   add_executable(${suite} tests/${suite}.cpp)
   target_link_libraries(${suite} PRIVATE dariyakyu_server dariyakyu_cli doctest::doctest)
   target_include_directories(${suite} PRIVATE tests)
