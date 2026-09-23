@@ -28,6 +28,15 @@ public:
     // member sees it on the way into a stable generation.
     std::vector<TopicPartition> join();
 
+    // The assignment this member currently holds, rejoining if the group moved on.
+    //
+    // THE call a consumer makes every time round its loop, and join() is really
+    // just its first iteration. Heartbeating is not optional bookkeeping: an eager
+    // rebalance cannot complete until every member has rejoined, so a member that
+    // stops asking stalls everyone else in its group until its session expires.
+    // A consumer that joined once and then only fetched would be that member.
+    const std::vector<TopicPartition>& ensureJoined();
+
     // Returns false when the group is rebalancing and this member must rejoin.
     // That is the ordinary way a member finds out, not an error.
     bool heartbeat();
@@ -69,6 +78,10 @@ private:
     std::string  memberId_;
     std::int32_t generation_ = -1;
     bool         isLeader_   = false;
+
+    // What the last successful sync handed us. Cached so ensureJoined() can
+    // return it on the common path, where nothing has changed.
+    std::vector<TopicPartition> assignment_;
 };
 
 }  // namespace dariyakyu::cli

@@ -446,6 +446,31 @@ struct Coverage {
     bool exclusive() const { return distinct.size() == total; }
 };
 
+// Runs a member's loop until the group settles on `expected` partitions.
+//
+// This is what a consumer actually does — heartbeat, and rejoin when told to —
+// and running it is not a convenience for the test. An eager rebalance completes
+// only once every member has rejoined, so a member that joined and then went
+// quiet stalls the rest of its group until its session expires. A test where one
+// member calls join() once and stops is testing a consumer nobody would write.
+vector<TopicPartition> settleAt(GroupConsumer& consumer, size_t expected) {
+    for (int round = 0; round < 400; ++round) {
+        const auto assigned = consumer.ensureJoined();
+        if (assigned.size() == expected) return assigned;
+        this_thread::sleep_for(chrono::milliseconds(5));
+    }
+    return {};
+}
+
+// Runs a member's loop for a fixed number of rounds, for the cases where what
+// matters is that it kept heartbeating rather than what it ended up holding.
+void runLoop(GroupConsumer& consumer, int rounds) {
+    for (int round = 0; round < rounds; ++round) {
+        consumer.ensureJoined();
+        this_thread::sleep_for(chrono::milliseconds(5));
+    }
+}
+
 }  // namespace
 
 TEST_CASE("One consumer in a group gets every partition") {
@@ -484,8 +509,8 @@ TEST_CASE("Two consumers split a topic between them, exclusively") {
     // settles. Run on threads because each is blocked on the other.
     vector<TopicPartition> assignedA;
     vector<TopicPartition> assignedB;
-    thread joinA([&] { assignedA = a.join(); });
-    thread joinB([&] { assignedB = b.join(); });
+    thread joinA([&] { assignedA = settleAt(a, 2); });
+    thread joinB([&] { assignedB = settleAt(b, 2); });
     joinA.join();
     joinB.join();
 
@@ -519,8 +544,8 @@ TEST_CASE("When one consumer leaves, the other takes over its partitions") {
     GroupConsumer b(clientB, "g", {"orders"});
 
     vector<TopicPartition> assignedA;
-    thread joinA([&] { assignedA = a.join(); });
-    thread joinB([&] { b.join(); });
+    thread joinA([&] { assignedA = settleAt(a, 2); });
+    thread joinB([&] { settleAt(b, 2); });
     joinA.join();
     joinB.join();
     REQUIRE(assignedA.size() == 2);
@@ -535,7 +560,7 @@ TEST_CASE("When one consumer leaves, the other takes over its partitions") {
     // exist rather than the coordinator simply timing members out.
     CHECK_FALSE(a.heartbeat());
 
-    const auto afterwards = a.join();
+    const auto afterwards = settleAt(a, 4);
     CHECK(afterwards.size() == 4);
     CHECK(a.generation() > generationBefore);
 
@@ -619,8 +644,8 @@ TEST_CASE("A stale member cannot commit over a live one") {
 
     // b joins, which bumps the generation and leaves a stale.
     GroupConsumer b(clientB, "g", {"orders"});
-    thread joinB([&] { b.join(); });
-    thread rejoinA([&] { a.join(); });
+    thread joinB([&] { runLoop(b, 80); });
+    thread rejoinA([&] { runLoop(a, 80); });
     joinB.join();
     rejoinA.join();
 

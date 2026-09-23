@@ -122,7 +122,10 @@ vector<TopicPartition> GroupConsumer::join() {
             vector<pair<string, vector<string>>> members;
             for (const auto& member : joined.members)
                 members.emplace_back(member.memberId, member.subscription);
-            if (auto assigned = syncAsLeader(members)) return *assigned;
+            if (auto assigned = syncAsLeader(members)) {
+                assignment_ = *assigned;
+                return assignment_;
+            }
             ::usleep(20 * 1000);
             continue;
         }
@@ -148,11 +151,17 @@ vector<TopicPartition> GroupConsumer::join() {
                 break;   // rejoin from the top
             }
 
-            return decodeAssignment(result.assignment);
+            assignment_ = decodeAssignment(result.assignment);
+            return assignment_;
         }
     }
 
     throw Error("group '" + groupId_ + "' never settled");
+}
+
+const vector<TopicPartition>& GroupConsumer::ensureJoined() {
+    if (generation_ < 0 || !heartbeat()) join();
+    return assignment_;
 }
 
 bool GroupConsumer::heartbeat() {
@@ -224,6 +233,7 @@ void GroupConsumer::leave() {
     memberId_.clear();
     generation_ = -1;
     isLeader_   = false;
+    assignment_.clear();
 }
 
 }  // namespace dariyakyu::cli
