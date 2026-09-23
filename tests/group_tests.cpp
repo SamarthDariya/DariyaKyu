@@ -6,6 +6,8 @@
 #include <set>
 #include <string>
 
+#include "common/buffer.hpp"
+#include "group/commit_record.hpp"
 #include "group/offsets_topic.hpp"
 #include "test_support.hpp"
 
@@ -110,4 +112,128 @@ TEST_CASE("The partition count survives a restart without being stored") {
     // found by the startup scan that already runs.
     CHECK(ensureOffsetsTopic(reopened, 8) == 8);
     CHECK_THROWS_AS(ensureOffsetsTopic(reopened, 16), CorruptData);
+}
+
+// ===========================================================================
+// Commit records
+// ===========================================================================
+
+namespace {
+
+CommitKey sampleKey() { return CommitKey{"payments-consumer", "orders", 3}; }
+
+CommitValue sampleValue() {
+    CommitValue value;
+    value.nextOffset        = Offset(510);
+    value.metadata          = "deploy-42";
+    value.commitTimestampMs = 1'700'000'000'000;
+    return value;
+}
+
+}  // namespace
+
+TEST_CASE("A commit key round-trips") {
+    const auto decoded = decodeCommitKey(encodeCommitKey(sampleKey()));
+    CHECK(decoded.group == "payments-consumer");
+    CHECK(decoded.topic == "orders");
+    CHECK(decoded.partition == 3);
+    CHECK(decoded == sampleKey());
+}
+
+TEST_CASE("Two groups reading one partition have different keys") {
+    // The key is what compaction collapses on, so it has to identify exactly one
+    // consumer position. Sharing one would make two independent groups overwrite
+    // each other's progress.
+    const auto a = encodeCommitKey({"group-a", "orders", 0});
+    const auto b = encodeCommitKey({"group-b", "orders", 0});
+    CHECK(a != b);
+
+    const auto p0 = encodeCommitKey({"group-a", "orders", 0});
+    const auto p1 = encodeCommitKey({"group-a", "orders", 1});
+    CHECK(p0 != p1);
+
+    const auto t0 = encodeCommitKey({"group-a", "orders", 0});
+    const auto t1 = encodeCommitKey({"group-a", "payments", 0});
+    CHECK(t0 != t1);
+}
+
+TEST_CASE("The same key encodes identically every time") {
+    // Compaction compares keys as BYTES, so two encodings of the same key that
+    // differed by a byte would be two keys, and the older commit would survive
+    // forever beside the newer one.
+    for (int i = 0; i < 20; ++i) CHECK(encodeCommitKey(sampleKey()) == encodeCommitKey(sampleKey()));
+}
+
+TEST_CASE("A commit value round-trips") {
+    const auto decoded = decodeCommitValue(encodeCommitValue(sampleValue()));
+    CHECK(decoded.nextOffset == Offset(510));
+    CHECK(decoded.metadata == "deploy-42");
+    CHECK(decoded.commitTimestampMs == 1'700'000'000'000);
+}
+
+TEST_CASE("The stored offset is the next one to read") {
+    // Handle 500 through 509, commit 510. Off by one here reprocesses or skips
+    // exactly one message per restart — it survives every test written by hand,
+    // and shows up in production.
+    CommitValue value;
+    value.nextOffset = Offset(510);
+
+    const auto decoded = decodeCommitValue(encodeCommitValue(value));
+    CHECK(decoded.nextOffset == Offset(510));
+    CHECK(decoded.nextOffset != Offset(509));
+}
+
+TEST_CASE("An empty metadata and an absent one are the same thing") {
+    CommitValue value = sampleValue();
+    value.metadata    = "";
+    CHECK(decodeCommitValue(encodeCommitValue(value)).metadata.empty());
+}
+
+TEST_CASE("A negative committed offset is refused") {
+    BufferWriter out;
+    out.writeInt16(1);
+    out.writeInt64(-5);
+    out.writeInt16(0);
+    out.writeInt64(0);
+    const auto bytes = out.take();
+
+    // Not a position a consumer can have reached. Accepting it would make the
+    // next fetch ask for something before the log began, and the group would
+    // silently restart from the earliest record.
+    CHECK_THROWS_AS(decodeCommitValue(bytes), CorruptData);
+}
+
+TEST_CASE("A version this build does not know is refused") {
+    auto key = encodeCommitKey(sampleKey());
+    key[1]   = 99;
+    CHECK_THROWS_AS(decodeCommitKey(key), CorruptData);
+
+    auto value = encodeCommitValue(sampleValue());
+    value[1]   = 99;
+    CHECK_THROWS_AS(decodeCommitValue(value), CorruptData);
+}
+
+TEST_CASE("Trailing bytes are refused") {
+    auto key = encodeCommitKey(sampleKey());
+    key.push_back(0);
+    CHECK_THROWS_AS(decodeCommitKey(key), CorruptData);
+
+    auto value = encodeCommitValue(sampleValue());
+    value.push_back(0);
+    CHECK_THROWS_AS(decodeCommitValue(value), CorruptData);
+}
+
+TEST_CASE("A truncated commit record is refused at every length") {
+    const auto key = encodeCommitKey(sampleKey());
+    for (size_t length = 0; length < key.size(); ++length)
+        CHECK_THROWS_AS(decodeCommitKey(vector<uint8_t>(key.begin(),
+                                                        key.begin() + static_cast<long>(length))),
+                        CorruptData);
+
+    const auto value = encodeCommitValue(sampleValue());
+    for (size_t length = 0; length < value.size(); ++length)
+        CHECK_THROWS_AS(
+            decodeCommitValue(vector<uint8_t>(value.begin(),
+                                              value.begin() + static_cast<long>(length))),
+            CorruptData);
 }
