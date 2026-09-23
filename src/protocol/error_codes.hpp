@@ -34,6 +34,14 @@ enum class ErrorCode : std::int16_t {
     InvalidTopic            = 7,
     RequestTimedOut         = 8,
     UnsupportedVersion      = 9,
+
+    // Consumer groups (M5).
+    CoordinatorNotAvailable = 10,   // __offsets is not ready; retry
+    NotCoordinator          = 11,   // wrong broker; re-run FindCoordinator
+    IllegalGeneration       = 12,   // a zombie from an earlier generation
+    UnknownMemberId         = 13,   // expired, or never joined
+    RebalanceInProgress     = 14,   // rejoin — see below
+    InvalidGroupId          = 15,
 };
 
 static_assert(std::is_same_v<std::underlying_type_t<ErrorCode>, std::int16_t>,
@@ -41,12 +49,21 @@ static_assert(std::is_same_v<std::underlying_type_t<ErrorCode>, std::int16_t>,
 
 // Every code, for exhaustive switches and for tests that must not silently skip
 // a newly added one.
-inline constexpr std::array<ErrorCode, 10> kAllErrorCodes{
+inline constexpr std::array<ErrorCode, 16> kAllErrorCodes{
     ErrorCode::None,          ErrorCode::Unknown,                 ErrorCode::OffsetOutOfRange,
     ErrorCode::CorruptMessage, ErrorCode::NotLeaderForPartition,  ErrorCode::UnknownTopicOrPartition,
     ErrorCode::TopicAlreadyExists, ErrorCode::InvalidTopic,       ErrorCode::RequestTimedOut,
     ErrorCode::UnsupportedVersion,
+    ErrorCode::CoordinatorNotAvailable, ErrorCode::NotCoordinator, ErrorCode::IllegalGeneration,
+    ErrorCode::UnknownMemberId, ErrorCode::RebalanceInProgress,   ErrorCode::InvalidGroupId,
 };
+
+// RebalanceInProgress is not a failure.
+//
+// It is how a member LEARNS that a rebalance has started — delivered on the
+// heartbeat it was making anyway, which is why heartbeats exist at all rather
+// than the coordinator simply timing members out. A member that receives it
+// rejoins; nothing has gone wrong.
 
 // The one mapping that is unambiguous, so the one that gets a function.
 //
