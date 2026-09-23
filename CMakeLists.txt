@@ -120,6 +120,7 @@ target_compile_options(dariyakyu_cli PRIVATE -Wall -Wextra -Wpedantic)
 add_library(dariyakyu_group
   src/group/offsets_topic.cpp
   src/group/commit_record.cpp
+  src/group/offset_store.cpp
 )
 
 target_link_libraries(dariyakyu_group PUBLIC dariyakyu_protocol)

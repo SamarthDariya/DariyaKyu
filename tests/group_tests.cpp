@@ -8,6 +8,7 @@
 
 #include "common/buffer.hpp"
 #include "group/commit_record.hpp"
+#include "group/offset_store.hpp"
 #include "group/offsets_topic.hpp"
 #include "test_support.hpp"
 
@@ -236,4 +237,200 @@ TEST_CASE("A truncated commit record is refused at every length") {
             decodeCommitValue(vector<uint8_t>(value.begin(),
                                               value.begin() + static_cast<long>(length))),
             CorruptData);
+}
+
+// ===========================================================================
+// The offset store
+// ===========================================================================
+
+namespace {
+
+// A broker's worth of storage with __offsets in it.
+struct StoreFixture {
+    TempDir             dir;
+    storage::LogManager logs;
+    OffsetStore         store;
+
+    explicit StoreFixture(const string& name, int32_t partitions = 8)
+        : dir(name), logs(dir.file("data"), testConfig()), store(logs, partitions) {
+        ensureOffsetsTopic(logs, partitions);
+    }
+};
+
+CommitValue valueAt(int64_t offset) {
+    CommitValue value;
+    value.nextOffset        = Offset(offset);
+    value.commitTimestampMs = storage::wallClockMillis();
+    return value;
+}
+
+}  // namespace
+
+TEST_CASE("A committed offset reads back") {
+    StoreFixture fixture("store-commit");
+
+    CHECK_FALSE(fixture.store.fetch({"g", "orders", 0}).has_value());
+
+    fixture.store.commit({"g", "orders", 0}, valueAt(510));
+
+    const auto found = fixture.store.fetch({"g", "orders", 0});
+    REQUIRE(found.has_value());
+    CHECK(found->nextOffset == Offset(510));
+    CHECK(fixture.store.size() == 1);
+}
+
+TEST_CASE("A later commit replaces an earlier one") {
+    StoreFixture fixture("store-overwrite");
+
+    fixture.store.commit({"g", "orders", 0}, valueAt(100));
+    fixture.store.commit({"g", "orders", 0}, valueAt(200));
+
+    CHECK(fixture.store.fetch({"g", "orders", 0})->nextOffset == Offset(200));
+    CHECK(fixture.store.size() == 1);   // one position, not two
+}
+
+TEST_CASE("Groups, topics and partitions are independent positions") {
+    StoreFixture fixture("store-independent");
+
+    fixture.store.commit({"a", "orders", 0}, valueAt(10));
+    fixture.store.commit({"b", "orders", 0}, valueAt(20));
+    fixture.store.commit({"a", "payments", 0}, valueAt(30));
+    fixture.store.commit({"a", "orders", 1}, valueAt(40));
+
+    CHECK(fixture.store.size() == 4);
+    CHECK(fixture.store.fetch({"a", "orders", 0})->nextOffset == Offset(10));
+    CHECK(fixture.store.fetch({"b", "orders", 0})->nextOffset == Offset(20));
+    CHECK(fixture.store.fetch({"a", "payments", 0})->nextOffset == Offset(30));
+    CHECK(fixture.store.fetch({"a", "orders", 1})->nextOffset == Offset(40));
+}
+
+TEST_CASE("A commit lands in the group's coordinator partition and nowhere else") {
+    StoreFixture fixture("store-routing");
+
+    const PartitionId expected = coordinatorPartition("payments-consumer", 8);
+    fixture.store.commit({"payments-consumer", "orders", 0}, valueAt(7));
+
+    // Exactly one __offsets partition grew — the one hash(group) % N names.
+    for (PartitionId p = 0; p < 8; ++p) {
+        storage::Log* log = fixture.logs.get(TopicPartition{kOffsetsTopic, p});
+        REQUIRE(log != nullptr);
+        if (p == expected) CHECK(log->logEndOffset() > Offset(0));
+        else CHECK(log->logEndOffset() == Offset(0));
+    }
+}
+
+TEST_CASE("A forgotten position is gone") {
+    StoreFixture fixture("store-forget");
+
+    fixture.store.commit({"g", "orders", 0}, valueAt(100));
+    fixture.store.forget({"g", "orders", 0});
+
+    CHECK_FALSE(fixture.store.fetch({"g", "orders", 0}).has_value());
+    CHECK(fixture.store.size() == 0);
+}
+
+TEST_CASE("Replay rebuilds what was committed") {
+    StoreFixture fixture("store-replay");
+
+    for (int i = 0; i < 20; ++i)
+        fixture.store.commit({"g", "orders", i % 4}, valueAt(100 + i));
+    const size_t before = fixture.store.size();
+
+    // The map is thrown away and rebuilt from the topic alone — which is what a
+    // coordinator does on failover.
+    fixture.store.replay();
+
+    CHECK(fixture.store.size() == before);
+    CHECK(fixture.store.fetch({"g", "orders", 3})->nextOffset == Offset(119));
+}
+
+TEST_CASE("Replay keeps the last commit, not the first") {
+    StoreFixture fixture("store-replay-last-wins");
+
+    fixture.store.commit({"g", "orders", 0}, valueAt(100));
+    fixture.store.commit({"g", "orders", 0}, valueAt(200));
+    fixture.store.commit({"g", "orders", 0}, valueAt(300));
+
+    fixture.store.replay();
+
+    // Last write wins, in log order — which is exactly what compaction will
+    // collapse the topic down to, so a replayed map and a compacted topic agree
+    // by construction rather than by agreement.
+    CHECK(fixture.store.fetch({"g", "orders", 0})->nextOffset == Offset(300));
+    CHECK(fixture.store.size() == 1);
+}
+
+TEST_CASE("Replay honours a tombstone") {
+    StoreFixture fixture("store-replay-tombstone");
+
+    fixture.store.commit({"g", "orders", 0}, valueAt(100));
+    fixture.store.commit({"g", "orders", 1}, valueAt(200));
+    fixture.store.forget({"g", "orders", 0});
+
+    fixture.store.replay();
+
+    // A null value, not an empty one. An empty value would be a commit of offset
+    // zero, and the position would come back rather than going away.
+    CHECK_FALSE(fixture.store.fetch({"g", "orders", 0}).has_value());
+    CHECK(fixture.store.fetch({"g", "orders", 1})->nextOffset == Offset(200));
+    CHECK(fixture.store.size() == 1);
+}
+
+TEST_CASE("Offsets survive the broker being restarted") {
+    TempDir dir("store-restart");
+    const filesystem::path dataDir = dir.file("data");
+
+    {
+        storage::LogManager logs(dataDir, testConfig());
+        ensureOffsetsTopic(logs, 8);
+        OffsetStore store(logs, 8);
+        for (int i = 0; i < 12; ++i) store.commit({"g", "orders", i % 3}, valueAt(500 + i));
+    }
+
+    // A fresh manager over the same directory, and a fresh store that has never
+    // seen a commit. Everything below is the log doing the durability.
+    storage::LogManager reopened(dataDir, testConfig());
+    reopened.loadAll();
+    OffsetStore restored(reopened, 8);
+    restored.replay();
+
+    CHECK(restored.size() == 3);
+    CHECK(restored.fetch({"g", "orders", 0})->nextOffset == Offset(509));
+    CHECK(restored.fetch({"g", "orders", 1})->nextOffset == Offset(510));
+    CHECK(restored.fetch({"g", "orders", 2})->nextOffset == Offset(511));
+}
+
+TEST_CASE("Replaying an empty topic finds nothing") {
+    StoreFixture fixture("store-replay-empty");
+    fixture.store.replay();
+    CHECK(fixture.store.size() == 0);
+}
+
+TEST_CASE("Metadata rides along with the offset") {
+    StoreFixture fixture("store-metadata");
+
+    CommitValue value       = valueAt(42);
+    value.metadata          = "deploy-7";
+    fixture.store.commit({"g", "orders", 0}, value);
+    fixture.store.replay();
+
+    // Opaque to the broker, like everything a client attaches — somewhere to put
+    // a deploy id for whoever reads the topic later.
+    CHECK(fixture.store.fetch({"g", "orders", 0})->metadata == "deploy-7");
+}
+
+TEST_CASE("Many commits across many partitions all come back") {
+    StoreFixture fixture("store-replay-many");
+
+    for (int g = 0; g < 5; ++g)
+        for (int p = 0; p < 6; ++p)
+            fixture.store.commit({"group-" + to_string(g), "orders", p}, valueAt(g * 100 + p));
+
+    fixture.store.replay();
+
+    CHECK(fixture.store.size() == 30);
+    for (int g = 0; g < 5; ++g)
+        for (int p = 0; p < 6; ++p)
+            CHECK(fixture.store.fetch({"group-" + to_string(g), "orders", p})->nextOffset ==
+                  Offset(g * 100 + p));
 }
