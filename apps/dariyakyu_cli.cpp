@@ -4,6 +4,7 @@
 //   dariyakyu-cli describe [topic]
 //   dariyakyu-cli produce  <topic> <partition>            records from stdin, one per line
 //   dariyakyu-cli consume  <topic> <partition> [--from earliest|latest|N] [--follow]
+//   dariyakyu-cli consume  <topic> --group <g> [--strategy range|roundrobin] [--follow]
 //   dariyakyu-cli dump-segment <partition-dir>            no broker needed
 //
 // A real client, not test scaffolding: it links the same protocol library the
@@ -15,11 +16,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "cli/client.hpp"
 #include "cli/dump.hpp"
+#include "cli/group_consumer.hpp"
 #include "common/errors.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/fetch.hpp"
@@ -40,6 +43,8 @@ struct Options {
     int32_t partitions = 1;
     string  from      = "earliest";
     bool    follow    = false;
+    string  group;
+    string  strategy  = "range";
 };
 
 string valueOf(const vector<string>& args, const string& name, const string& fallback) {
@@ -66,6 +71,8 @@ Options parseOptions(const vector<string>& args) {
     options.partitions = stoi(valueOf(args, "--partitions", "1"));
     options.from       = valueOf(args, "--from", "earliest");
     options.follow     = hasFlag(args, "--follow");
+    options.group      = valueOf(args, "--group", "");
+    options.strategy   = valueOf(args, "--strategy", "range");
     return options;
 }
 
@@ -216,6 +223,44 @@ Offset resolveStart(cli::Client& client, const string& topic, PartitionId partit
     return answer.offset;
 }
 
+// Prints every COMPLETE batch in `records`, advancing `offset` past what it
+// printed, and returns how many records that was.
+//
+// A response may end mid-batch — the fetch contract — so an incomplete trailing
+// batch is discarded rather than treated as damage. The next fetch starts at
+// `offset`, which never moved past it, so nothing is lost.
+//
+// `prefix` labels the line when more than one partition is being read at once.
+// Empty for the single-partition form, where it would be noise.
+size_t printBatches(span<const uint8_t> records, Offset& offset, const string& prefix) {
+    size_t position = 0;
+    size_t printed  = 0;
+
+    while (position < records.size()) {
+        const auto remaining = records.subspan(position);
+        size_t     total     = 0;
+        try {
+            total = storage::RecordBatch::totalSizeOf(remaining);
+        } catch (const CorruptData&) {
+            break;
+        }
+        if (total > remaining.size()) break;
+
+        const auto batch  = remaining.subspan(0, total);
+        const auto header = storage::RecordBatch::parseHeader(batch);
+        for (const auto& record : storage::RecordBatch::decodeRecords(batch)) {
+            printf("%s%lld\t%.*s\n", prefix.c_str(),
+                   (long long)record.offsetFrom(header.baseOffset).value(),
+                   record.value ? static_cast<int>(record.value->size()) : 0,
+                   record.value ? reinterpret_cast<const char*>(record.value->data()) : "");
+            ++printed;
+        }
+        offset   = header.lastOffset() + 1;
+        position += total;
+    }
+    return printed;
+}
+
 int doConsume(cli::Client& client, const string& topic, PartitionId partition,
               const Options& options) {
     Offset offset = resolveStart(client, topic, partition, options.from);
@@ -251,30 +296,88 @@ int doConsume(cli::Client& client, const string& topic, PartitionId partition,
             continue;
         }
 
-        // A response may end mid-batch — the fetch contract — so an incomplete
-        // trailing batch is discarded rather than treated as damage.
-        size_t position = 0;
-        while (position < answer.records.size()) {
-            const auto remaining = answer.records.subspan(position);
-            size_t     total     = 0;
-            try {
-                total = storage::RecordBatch::totalSizeOf(remaining);
-            } catch (const CorruptData&) {
-                break;
-            }
-            if (total > remaining.size()) break;
-
-            const auto batch  = remaining.subspan(0, total);
-            const auto header = storage::RecordBatch::parseHeader(batch);
-            for (const auto& record : storage::RecordBatch::decodeRecords(batch)) {
-                printf("%lld\t%.*s\n", (long long)record.offsetFrom(header.baseOffset).value(),
-                       record.value ? static_cast<int>(record.value->size()) : 0,
-                       record.value ? reinterpret_cast<const char*>(record.value->data()) : "");
-            }
-            offset   = header.lastOffset() + 1;
-            position += total;
-        }
+        printBatches(answer.records, offset, "");
         fflush(stdout);
+    }
+}
+
+// Reads one partition once, from `position`, and prints what came back.
+// Returns how many records, or -1 if the partition said something we cannot
+// continue past.
+long fetchOnce(cli::Client& client, const TopicPartition& tp, Offset& position) {
+    FetchRequest request;
+    request.topics.push_back({tp.topic, {{tp.partition, position, 1 << 20}}});
+
+    const auto   body = client.call(ApiKey::Fetch, encodedBody(request, encodeFetchRequest));
+    BufferReader in(body);
+    const auto   response = decodeFetchResponse(in);
+    const auto&  answer   = response.topics.at(0).partitions.at(0);
+
+    if (answer.error == ErrorCode::OffsetOutOfRange) {
+        // A group's committed offset can fall off the start of the log if the
+        // group was down longer than retention. Resuming at the log start loses
+        // records, and saying so matters more than the records: silence here is
+        // exactly the data loss nobody notices.
+        fprintf(stderr, "%s: committed offset %lld is gone; resuming at %lld\n",
+                tp.toString().c_str(), (long long)position.value(),
+                (long long)answer.logStartOffset.value());
+        position = answer.logStartOffset;
+        return 0;
+    }
+    if (reportError(answer.error, tp.toString())) return -1;
+
+    return static_cast<long>(printBatches(answer.records, position, tp.toString() + "\t"));
+}
+
+// Consume as a member of a group: the broker says which partitions are ours and
+// remembers where we got to, so two of these split a topic and either can die.
+//
+// --from is ignored here, and that is the point of a group: where to start is
+// the group's committed offset, not a flag. A group that has never committed
+// starts at the beginning.
+int doConsumeGroup(cli::Client& client, const string& topic, const Options& options) {
+    cli::GroupConsumer consumer(client, options.group, {topic}, options.strategy);
+
+    while (true) {
+        const auto assigned = consumer.join();
+
+        fprintf(stderr, "member %s, generation %d%s, assigned:", consumer.memberId().c_str(),
+                consumer.generation(), consumer.isLeader() ? " (leader)" : "");
+        for (const auto& tp : assigned) fprintf(stderr, " %s", tp.toString().c_str());
+        fprintf(stderr, "%s\n", assigned.empty() ? " nothing" : "");
+
+        map<TopicPartition, Offset> positions;
+        for (const auto& tp : assigned)
+            positions[tp] = consumer.committed(tp).value_or(Offset(0));
+
+        bool rejoin = false;
+        while (!rejoin) {
+            long read = 0;
+            for (const auto& tp : assigned) {
+                const Offset before = positions[tp];
+                const long   count  = fetchOnce(client, tp, positions[tp]);
+                if (count < 0) return 1;
+                read += count;
+
+                // Committed AFTER printing, so a crash between the two replays
+                // records rather than skipping them. At-least-once, which is the
+                // only choice this side of a transaction.
+                if (positions[tp] != before) consumer.commit(tp, positions[tp]);
+            }
+            fflush(stdout);
+            if (read > 0) continue;
+
+            if (!options.follow) {
+                consumer.leave();
+                return 0;
+            }
+
+            // Caught up. The heartbeat is what turns a stall into a rejoin: it is
+            // how this member finds out somebody else joined or left.
+            rejoin = !consumer.heartbeat();
+            if (!rejoin) ::usleep(200 * 1000);
+        }
+        fprintf(stderr, "rebalancing\n");
     }
 }
 
@@ -285,6 +388,8 @@ void usage() {
             "  dariyakyu-cli describe [topic] [--broker host:port]\n"
             "  dariyakyu-cli produce  <topic> <partition> [--broker host:port]\n"
             "  dariyakyu-cli consume  <topic> <partition> [--from earliest|latest|N] "
+            "[--follow] [--broker host:port]\n"
+            "  dariyakyu-cli consume  <topic> --group <g> [--strategy range|roundrobin] "
             "[--follow] [--broker host:port]\n"
             "  dariyakyu-cli dump-segment <partition-dir>\n");
 }
@@ -325,6 +430,10 @@ int main(int argc, char** argv) {
             return doProduce(client, args[1], stoi(args[2]));
         }
         if (command == "consume") {
+            if (args.size() < 2) { usage(); return 2; }
+            // A group picks its own partitions, so naming one would be a
+            // contradiction rather than a refinement.
+            if (!options.group.empty()) return doConsumeGroup(client, args[1], options);
             if (args.size() < 3) { usage(); return 2; }
             return doConsume(client, args[1], stoi(args[2]), options);
         }
