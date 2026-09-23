@@ -1,9 +1,15 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 
+#include "group/group_coordinator.hpp"
+#include "group/offsets_topic.hpp"
+#include "group/offset_store.hpp"
 #include "server/acceptor.hpp"
 #include "server/api_registry.hpp"
 #include "storage/log_manager.hpp"
@@ -32,6 +38,14 @@ public:
 
         NodeId       nodeId              = 1;
         std::int64_t maintenanceIntervalMs = 30'000;
+
+        // Partitions of __offsets, and therefore the number of possible
+        // coordinators. Immutable once the topic exists — see offsets_topic.hpp.
+        std::int32_t offsetsPartitions = group::kDefaultOffsetsPartitions;
+
+        // How often expired members are swept. Shorter than a session timeout,
+        // or a member could be gone for two timeouts before anyone notices.
+        std::int64_t groupSweepIntervalMs = 1'000;
     };
 
     explicit Broker(Options options);
@@ -53,11 +67,28 @@ public:
     storage::LogManager& logs() { return logs_; }
 
 private:
-    Options              options_;
-    storage::LogManager  logs_;
-    ApiRegistry          registry_;
-    BrokerContext        context_;
+    void sweepGroups();
+
+    Options             options_;
+
+    // Declaration order is destruction order reversed, so logs_ outlives
+    // everything that reads it and the sweep thread is joined before any of it
+    // goes. Same reasoning as LogManager joining its own sweeper.
+    storage::LogManager     logs_;
+    group::OffsetStore      offsets_;
+    group::GroupCoordinator groups_;
+
+    ApiRegistry               registry_;
+    BrokerContext             context_;
     std::unique_ptr<Acceptor> acceptor_;
+
+    // Expiry needs a thread: a group whose members have ALL vanished never sends
+    // another request, so nothing else would ever notice and its partitions would
+    // stay assigned to nobody. Same shape as LogManager's maintenance thread.
+    std::thread             sweepThread_;
+    std::mutex              sweepMutex_;
+    std::condition_variable sweepWake_;
+    bool                    sweepStopping_ = false;
 };
 
 }  // namespace dariyakyu::server

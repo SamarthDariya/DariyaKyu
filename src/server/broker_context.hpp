@@ -8,6 +8,8 @@
 #include "common/types.hpp"
 #include "protocol/request_header.hpp"
 #include "protocol/response.hpp"
+#include "group/group_coordinator.hpp"
+#include "group/offset_store.hpp"
 #include "storage/log_manager.hpp"
 
 namespace dariyakyu::server {
@@ -23,6 +25,16 @@ namespace dariyakyu::server {
 // a deliberate act rather than a global appearing.
 struct BrokerContext {
     storage::LogManager& logs;
+
+    // M5's additions, and the first state in this struct that is not a log.
+    // Growing it is how a new subsystem becomes reachable from a handler, which
+    // keeps that a deliberate act rather than a global appearing.
+    group::GroupCoordinator& groups;
+    group::OffsetStore&      offsets;
+
+    // How many partitions __offsets has, which is what hash(group) %% N uses.
+    // Immutable for the life of the data directory.
+    std::int32_t offsetsPartitions = 0;
 
     // Reported in Metadata as the leader of every partition. One node, so it is
     // always this one — but a client reads it rather than assuming, so M8 moves
