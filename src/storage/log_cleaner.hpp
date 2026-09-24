@@ -9,6 +9,7 @@
 #include "common/types.hpp"
 #include "storage/key_offset_map.hpp"
 #include "storage/record_batch.hpp"
+#include "storage/segment.hpp"
 
 namespace dariyakyu::storage {
 
@@ -76,5 +77,28 @@ bool retain(const Record& record, Offset offset, std::int64_t timestampMs,
 // as an empty one: an empty value is an ordinary record whose value happens to be
 // zero bytes long, and it means the key is still there.
 inline bool isTombstone(const Record& record) { return !record.value.has_value(); }
+
+// What one segment's rewrite produced.
+struct CleanedSegment {
+    std::filesystem::path logFile;      // the .cleaned one, not yet in place
+    std::filesystem::path indexFile;
+    std::uint64_t         recordsKept    = 0;
+    std::uint64_t         recordsDropped = 0;
+    bool                  empty() const { return recordsKept == 0; }
+};
+
+// Rewrites one segment into `<base>.log.cleaned` / `<base>.index.cleaned`,
+// keeping only the records `rules` retains.
+//
+// Absolute offsets are PRESERVED, never renumbered — a consumer holding offset
+// 4,000 must still find offset 4,000, and a FileRange already on a socket must
+// still mean what it meant. A batch that loses records keeps the survivors at
+// their own offsets, so it gains holes; a batch that loses all of them is not
+// written at all.
+//
+// The caller hands the result to Log::replaceSegment, which is where it becomes
+// visible. Nothing here touches the live segment.
+CleanedSegment rewriteSegment(const std::filesystem::path& logFile, Offset baseOffset,
+                              const RollPolicy& roll, const RetainRules& rules);
 
 }  // namespace dariyakyu::storage

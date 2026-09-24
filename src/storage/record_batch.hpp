@@ -187,6 +187,24 @@ public:
                 std::optional<std::span<const std::uint8_t>> value,
                 std::span<const RecordHeader>                headers = {});
 
+    // Appends a record at an EXPLICIT offset delta, which compaction needs and
+    // nothing else does.
+    //
+    // append() numbers records 0, 1, 2… because a producer's records are
+    // consecutive by construction. A cleaner's are not: it rebuilds a batch from
+    // the records it kept, and renumbering those would move a surviving record to
+    // an offset a consumer is already holding. So the caller supplies the delta,
+    // and the batch it builds has holes in it — which is exactly what a compacted
+    // log is.
+    //
+    // Deltas must be non-negative and strictly increasing, which build() relies on
+    // to write lastOffsetDelta. Out of order is a caller bug, not a data problem,
+    // so it throws.
+    void appendAt(std::int32_t offsetDelta, std::int64_t timestamp,
+                  std::optional<std::span<const std::uint8_t>> key,
+                  std::optional<std::span<const std::uint8_t>> value,
+                  std::span<const RecordHeader>                headers = {});
+
     bool         empty() const { return count_ == 0; }
     std::int32_t recordCount() const { return count_; }
 
@@ -201,6 +219,10 @@ private:
     std::int32_t count_          = 0;
     std::int64_t firstTimestamp_ = 0;
     std::int64_t maxTimestamp_   = 0;
+
+    // The last delta written, which is count_ - 1 for a producer's batch and
+    // anything at all for a cleaner's.
+    std::int32_t lastDelta_ = -1;
 };
 
 }  // namespace dariyakyu::storage

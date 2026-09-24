@@ -206,6 +206,17 @@ RecordBatchBuilder::RecordBatchBuilder(Compression compression) : compression_(c
 void RecordBatchBuilder::append(int64_t timestamp, optional<span<const uint8_t>> key,
                                 optional<span<const uint8_t>> value,
                                 span<const RecordHeader>      headers) {
+    appendAt(count_, timestamp, key, value, headers);
+}
+
+void RecordBatchBuilder::appendAt(int32_t offsetDelta, int64_t timestamp,
+                                  optional<span<const uint8_t>> key,
+                                  optional<span<const uint8_t>> value,
+                                  span<const RecordHeader>      headers) {
+    if (offsetDelta <= lastDelta_)
+        throw Error("record batch: offset delta " + to_string(offsetDelta) +
+                    " does not follow " + to_string(lastDelta_));
+
     if (count_ == 0) {
         firstTimestamp_ = timestamp;
         maxTimestamp_   = timestamp;
@@ -218,7 +229,7 @@ void RecordBatchBuilder::append(int64_t timestamp, optional<span<const uint8_t>>
     BufferWriter scratch;
     scratch.writeInt8(0);                                // per-record attributes: unused in v2
     scratch.writeVarlong(timestamp - firstTimestamp_);   // delta, not absolute
-    scratch.writeVarint(count_);                         // offset delta within the batch
+    scratch.writeVarint(offsetDelta);                    // offset delta within the batch
     writeNullableBytes(scratch, key);
     writeNullableBytes(scratch, value);
 
@@ -233,6 +244,7 @@ void RecordBatchBuilder::append(int64_t timestamp, optional<span<const uint8_t>>
     records_.writeVarint(static_cast<int32_t>(encoded.size()));
     records_.writeBytes(encoded);
 
+    lastDelta_ = offsetDelta;
     ++count_;
 }
 
@@ -254,7 +266,7 @@ vector<uint8_t> RecordBatchBuilder::build() {
     out.writeUint32(0);                                   // crc, patched below
 
     out.writeInt16(static_cast<int16_t>(static_cast<uint8_t>(compression_) & kCompressionMask));
-    out.writeInt32(count_ - 1);                           // lastOffsetDelta
+    out.writeInt32(lastDelta_);                           // lastOffsetDelta
     out.writeInt64(firstTimestamp_);
     out.writeInt64(maxTimestamp_);
     out.writeInt64(-1);                                   // producerId    — M7
