@@ -1,5 +1,7 @@
 #include "storage/log_cleaner.hpp"
 
+#include <chrono>
+
 #include "common/errors.hpp"
 #include "common/file_handle.hpp"
 #include "storage/offset_index.hpp"
@@ -152,10 +154,31 @@ CleanedSegment rewriteSegment(const filesystem::path& logFile, Offset baseOffset
     return result;
 }
 
-CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, int64_t nowMs) {
-    CleanResult result;
+double dirtyRatio(const Log& log, Offset firstDirtyOffset) {
+    uint64_t total = 0;
+    uint64_t dirty = 0;
 
-    const auto sealed = log.sealedSegments();
+    for (const auto& info : log.sealedSegments()) {
+        total += info.sizeBytes;
+        if (info.baseOffset >= firstDirtyOffset) dirty += info.sizeBytes;
+    }
+
+    if (total == 0) return 0.0;
+    return static_cast<double>(dirty) / static_cast<double>(total);
+}
+
+CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, Offset firstDirtyOffset,
+                     int64_t nowMs) {
+    CleanResult result;
+    result.nextDirtyOffset = firstDirtyOffset;
+
+    // Segments entirely below the mark were cleaned by an earlier pass. Skipped
+    // rather than re-examined: their records are already the newest for their
+    // keys as far as anything below the mark is concerned.
+    vector<Log::SealedInfo> sealed;
+    for (const auto& info : log.sealedSegments())
+        if (info.nextOffset > firstDirtyOffset) sealed.push_back(info);
+
     if (sealed.empty()) return result;
 
     result.nextDirtyOffset = sealed.front().baseOffset;
@@ -222,6 +245,105 @@ CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, int64_t nowMs) {
     }
 
     return result;
+}
+
+LogCleaner::LogCleaner(LogManager& logs, CleanerConfig config)
+    : logs_(logs), config_(config) {}
+
+LogCleaner::~LogCleaner() { stopCleaning(); }
+
+Offset LogCleaner::firstDirtyOffset(const TopicPartition& tp) const {
+    lock_guard lock(mutex_);
+    const auto found = firstDirty_.find(tp);
+    return found == firstDirty_.end() ? Offset(0) : found->second;
+}
+
+optional<TopicPartition> LogCleaner::pickDirtiest() const {
+    optional<TopicPartition> choice;
+    double                   best = config_.minCleanableDirtyRatio;
+
+    for (const auto& tp : logs_.hostedPartitions()) {
+        const Log* log = logs_.get(tp);
+        if (log == nullptr || !log->config().compacted()) continue;
+
+        const double ratio = dirtyRatio(*log, firstDirtyOffset(tp));
+
+        // Strictly greater, so the floor itself is not a qualifying score — a
+        // partition sitting exactly at the threshold is left for when it is
+        // properly dirty.
+        if (ratio > best) {
+            best   = ratio;
+            choice = tp;
+        }
+    }
+
+    return choice;
+}
+
+optional<CleanResult> LogCleaner::cleanOnce(const TopicPartition& tp, int64_t nowMs) {
+    Log* log = logs_.get(tp);
+    if (log == nullptr || !log->config().compacted()) return nullopt;
+
+    const Offset from = firstDirtyOffset(tp);
+    if (dirtyRatio(*log, from) <= config_.minCleanableDirtyRatio) return nullopt;
+
+    // Run OUTSIDE the lock. A pass rewrites files and can take a long time, and
+    // holding the lock across it would make stopping the cleaner wait for it.
+    const CleanResult result = cleanLog(*log, config_, from, nowMs);
+
+    {
+        lock_guard lock(mutex_);
+        firstDirty_[tp] = result.nextDirtyOffset;
+    }
+
+    dropped_.fetch_add(result.recordsDropped, memory_order_release);
+    return result;
+}
+
+optional<CleanResult> LogCleaner::runOnce(int64_t nowMs) {
+    const auto tp = pickDirtiest();
+    if (!tp) return nullopt;
+    return cleanOnce(*tp, nowMs);
+}
+
+void LogCleaner::startCleaning() {
+    if (thread_.joinable()) return;
+
+    thread_ = thread([this] {
+        while (true) {
+            {
+                unique_lock lock(mutex_);
+
+                // A condition variable rather than a sleep, for the reason
+                // LogManager's sweeper uses one: with a plain sleep, stopping
+                // would wait out the whole interval, and a shutdown that slow
+                // gets SIGKILLed by whatever is supervising it.
+                wake_.wait_for(lock, chrono::milliseconds(config_.intervalMs),
+                               [this] { return stopRequested_; });
+                if (stopRequested_) return;
+            }
+
+            // A pass that throws must not take the broker down — one unreadable
+            // segment would stop every partition being compacted. But swallowing
+            // it silently would leave compaction quietly dead, so failures are
+            // counted where an operator can see them.
+            try {
+                runOnce(wallClockMillis());
+                passes_.fetch_add(1, memory_order_release);
+            } catch (const Error&) {
+                failures_.fetch_add(1, memory_order_release);
+            }
+        }
+    });
+}
+
+void LogCleaner::stopCleaning() {
+    {
+        lock_guard lock(mutex_);
+        stopRequested_ = true;
+    }
+    wake_.notify_all();
+    if (thread_.joinable()) thread_.join();
 }
 
 }  // namespace dariyakyu::storage

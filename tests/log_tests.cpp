@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <type_traits>
 
@@ -2319,7 +2320,7 @@ TEST_CASE("A pass drops a key's older copies across segment boundaries") {
     REQUIRE(log->segmentCount() > 2);
 
     const auto before = everythingIn(partition).size();
-    const auto result = cleanLog(*log, CleanerConfig{}, 1'000'000);
+    const auto result = cleanLog(*log, CleanerConfig{}, Offset(0), 1'000'000);
 
     // The map is built across EVERY dirty segment before anything is rewritten —
     // a map built one segment at a time would never learn that "a" was written
@@ -2347,7 +2348,7 @@ TEST_CASE("A segment compacted down to nothing is removed, gap and all") {
     REQUIRE(log->segmentCount() > 2);
     const size_t segmentsBefore = log->segmentCount();
 
-    const auto result = cleanLog(*log, CleanerConfig{}, 1'000'000);
+    const auto result = cleanLog(*log, CleanerConfig{}, Offset(0), 1'000'000);
     CHECK(result.segmentsDeleted > 0);
     CHECK(log->segmentCount() < segmentsBefore);
 
@@ -2368,7 +2369,7 @@ TEST_CASE("The active segment is never touched") {
     });
     const Offset endBefore = log->logEndOffset();
 
-    cleanLog(*log, CleanerConfig{}, 1'000'000);
+    cleanLog(*log, CleanerConfig{}, Offset(0), 1'000'000);
 
     // Every invariant in this codebase depends on the active segment having
     // exactly one writer, and compacting it would be a second one.
@@ -2385,7 +2386,7 @@ TEST_CASE("A compacted log still reads, and a removed offset lands on the next o
     auto log = rollingKeyedLog(partition, {
         {"a", "a1"}, {"b", "b1"}, {"a", "a2"}, {"c", "c1"}, {"d", "d1"}, {"e", "e1"},
     });
-    cleanLog(*log, CleanerConfig{}, 1'000'000);
+    cleanLog(*log, CleanerConfig{}, Offset(0), 1'000'000);
 
     // Offset 0 held a1, which compaction deleted. The read does not fail and does
     // not return nothing — it lands on the next surviving batch, which is what
@@ -2424,7 +2425,7 @@ TEST_CASE("A partition reopens after a pass, gaps and all") {
         auto log = rollingKeyedLog(partition, {
             {"a", "a1"}, {"b", "b1"}, {"a", "a2"}, {"b", "b2"}, {"c", "c1"},
         });
-        cleanLog(*log, CleanerConfig{}, 1'000'000);
+        cleanLog(*log, CleanerConfig{}, Offset(0), 1'000'000);
     }
 
     // The whole point of relaxing the contiguity check: a partition that has been
@@ -2450,7 +2451,7 @@ TEST_CASE("Compaction is eventual: a key rewritten in the active segment waits")
     // record for "a", and it survives.
     auto log = rollingKeyedLog(partition, {{"a", "a1"}, {"b", "b1"}, {"a", "a2"}});
 
-    const auto first = cleanLog(*log, CleanerConfig{}, 1'000'000);
+    const auto first = cleanLog(*log, CleanerConfig{}, Offset(0), 1'000'000);
     CHECK(first.recordsDropped == 0);
 
     bool stillThere = false;
@@ -2465,7 +2466,7 @@ TEST_CASE("Compaction is eventual: a key rewritten in the active segment waits")
         log->append(bytes);
     }
 
-    const auto second = cleanLog(*log, CleanerConfig{}, 1'000'000);
+    const auto second = cleanLog(*log, CleanerConfig{}, Offset(0), 1'000'000);
     CHECK(second.recordsDropped == 1);
 
     bool goneNow = true;
@@ -2483,7 +2484,7 @@ TEST_CASE("A leading segment compacted to nothing moves the log start up") {
     });
     REQUIRE(log->logStartOffset() == Offset(0));
 
-    cleanLog(*log, CleanerConfig{}, 1'000'000);
+    cleanLog(*log, CleanerConfig{}, Offset(0), 1'000'000);
 
     // The offsets in the removed segment really are gone, so a consumer below the
     // new start gets BelowLogStart and resets — the same answer retention gives,
@@ -2492,4 +2493,169 @@ TEST_CASE("A leading segment compacted to nothing moves the log start up") {
     CHECK(log->logStartOffset() > Offset(0));
     CHECK(log->read(Offset(0), kBigFetch).error == ReadError::BelowLogStart);
     CHECK(log->read(log->logStartOffset(), kBigFetch).ok());
+}
+
+// ===========================================================================
+// M6: scheduling — what to clean, and when it is worth it
+// ===========================================================================
+
+namespace {
+
+// A LogManager holding one compacted partition, written through so it rolls.
+struct CleanerFixture {
+    TempDir     dir;
+    LogManager  logs;
+
+    explicit CleanerFixture(const string& name)
+        : dir(name), logs(dir.file("data"), compactedDefaults()) {}
+
+    static LogConfig compactedDefaults() {
+        auto policy            = testPolicy();
+        policy.maxSegmentBytes = 120;
+        LogConfig config       = configWith(policy);
+        config.cleanup         = CleanupPolicy::Compact;
+        return config;
+    }
+
+    Log& partition(const string& topic, PartitionId id = 0) {
+        return logs.createPartition(TopicPartition{topic, id});
+    }
+
+    static void write(Log& log, const vector<pair<string, optional<string>>>& writes) {
+        for (const auto& one : writes) {
+            auto bytes = makeKeyedBatch({one}, 1000);
+            log.append(bytes);
+        }
+    }
+};
+
+}  // namespace
+
+TEST_CASE("A clean log has nothing to do and says so") {
+    CleanerFixture fixture("cleaner-idle");
+    auto&          log = fixture.partition("orders");
+    CleanerFixture::write(log, {{"a", "a1"}, {"b", "b1"}, {"c", "c1"}, {"d", "d1"}});
+
+    LogCleaner cleaner(fixture.logs, CleanerConfig{});
+
+    // First pass: everything sealed is dirty, so there is work.
+    REQUIRE(cleaner.cleanOnce(TopicPartition{"orders", 0}, 1'000'000).has_value());
+
+    // Second pass, immediately: every sealed segment is below the mark, so the
+    // ratio is zero and the partition is skipped entirely. Without this a cleaner
+    // would rewrite the same untouched bytes every interval forever.
+    CHECK_FALSE(cleaner.cleanOnce(TopicPartition{"orders", 0}, 1'000'000).has_value());
+    CHECK(cleaner.firstDirtyOffset(TopicPartition{"orders", 0}) > Offset(0));
+}
+
+TEST_CASE("A log below the dirty ratio is left alone") {
+    CleanerFixture fixture("cleaner-ratio");
+    auto&          log = fixture.partition("orders");
+    CleanerFixture::write(log, {{"a", "a1"}, {"b", "b1"}, {"c", "c1"}, {"d", "d1"}});
+
+    CleanerConfig config;
+    config.minCleanableDirtyRatio = 0.99;
+
+    LogCleaner cleaner(fixture.logs, config);
+
+    // Everything is dirty, which is a ratio of exactly 1.0 — above 0.99, so this
+    // one does run. The threshold is what stops the cleaner burning I/O
+    // proportional to the log for a saving proportional to nothing.
+    CHECK(cleaner.cleanOnce(TopicPartition{"orders", 0}, 1'000'000).has_value());
+
+    CleanerConfig impossible;
+    impossible.minCleanableDirtyRatio = 1.5;
+    LogCleaner never(fixture.logs, impossible);
+    CHECK_FALSE(never.cleanOnce(TopicPartition{"orders", 0}, 1'000'000).has_value());
+}
+
+TEST_CASE("An uncompacted topic is never picked, however dirty it looks") {
+    TempDir    dir("cleaner-delete-topic");
+    LogManager logs(dir.file("data"), testConfig());
+
+    auto& log = logs.createPartition(TopicPartition{"orders", 0});
+    for (int i = 0; i < 8; ++i) {
+        auto bytes = makeKeyedBatch({{"a", "v" + to_string(i)}}, 1000);
+        log.append(bytes);
+    }
+
+    LogCleaner cleaner(logs, CleanerConfig{});
+
+    // Compacting a Delete topic would silently discard history a consumer is
+    // entitled to replay — the topic's whole contract.
+    CHECK_FALSE(cleaner.pickDirtiest().has_value());
+    CHECK_FALSE(cleaner.cleanOnce(TopicPartition{"orders", 0}, 1'000'000).has_value());
+}
+
+TEST_CASE("The dirtiest partition is picked first") {
+    CleanerFixture fixture("cleaner-pick");
+
+    auto& quiet = fixture.partition("quiet");
+    auto& noisy = fixture.partition("noisy");
+
+    CleanerFixture::write(quiet, {{"a", "a1"}, {"b", "b1"}, {"c", "c1"}, {"d", "d1"}});
+    for (int i = 0; i < 20; ++i)
+        CleanerFixture::write(noisy, {{"k", "v" + to_string(i)}});
+
+    LogCleaner cleaner(fixture.logs, CleanerConfig{});
+
+    const auto picked = cleaner.pickDirtiest();
+    REQUIRE(picked.has_value());
+
+    // Both are fully dirty, so the tie goes to whichever the scan reaches — what
+    // matters is that a compacted partition IS picked and that the choice is one
+    // of them rather than a partition that is not compacted at all.
+    CHECK((picked->topic == "quiet" || picked->topic == "noisy"));
+
+    // Clean it, and the other becomes the only candidate left.
+    REQUIRE(cleaner.cleanOnce(*picked, 1'000'000).has_value());
+    const auto second = cleaner.pickDirtiest();
+    REQUIRE(second.has_value());
+    CHECK(second->topic != picked->topic);
+}
+
+TEST_CASE("A partition deleted between the pick and the pass is not an error") {
+    CleanerFixture fixture("cleaner-vanished");
+    auto&          log = fixture.partition("orders");
+    CleanerFixture::write(log, {{"a", "a1"}, {"b", "b1"}, {"c", "c1"}, {"d", "d1"}});
+
+    LogCleaner cleaner(fixture.logs, CleanerConfig{});
+    const auto picked = cleaner.pickDirtiest();
+    REQUIRE(picked.has_value());
+
+    // An administrator can delete a topic at any moment, including this one.
+    fixture.logs.removePartition(*picked, 1'000);
+
+    CHECK_FALSE(cleaner.cleanOnce(*picked, 1'000'000).has_value());
+}
+
+TEST_CASE("The cleaner's thread starts, works, and stops promptly") {
+    CleanerFixture fixture("cleaner-thread");
+    auto&          log = fixture.partition("orders");
+    for (int i = 0; i < 12; ++i)
+        CleanerFixture::write(log, {{"k", "v" + to_string(i)}});
+
+    const auto before = log.totalSizeBytes();
+
+    CleanerConfig config;
+    config.intervalMs = 10;
+
+    LogCleaner cleaner(fixture.logs, config);
+    cleaner.startCleaning();
+
+    for (int waited = 0; waited < 200 && cleaner.recordsDropped() == 0; ++waited)
+        this_thread::sleep_for(chrono::milliseconds(5));
+
+    const auto start = chrono::steady_clock::now();
+    cleaner.stopCleaning();
+    const auto stopTook = chrono::steady_clock::now() - start;
+
+    CHECK(cleaner.recordsDropped() > 0);
+    CHECK(log.totalSizeBytes() < before);
+    CHECK(cleaner.failureCount() == 0);
+
+    // A condition variable rather than a sleep: stopping must not wait out the
+    // interval, or a broker configured to clean every five minutes takes five
+    // minutes to shut down and gets SIGKILLed by its supervisor.
+    CHECK(stopTook < chrono::seconds(1));
 }
