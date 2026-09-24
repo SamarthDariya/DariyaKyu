@@ -8,6 +8,7 @@
 
 #include "common/types.hpp"
 #include "storage/key_offset_map.hpp"
+#include "storage/log.hpp"
 #include "storage/record_batch.hpp"
 #include "storage/segment.hpp"
 
@@ -100,5 +101,44 @@ struct CleanedSegment {
 // visible. Nothing here touches the live segment.
 CleanedSegment rewriteSegment(const std::filesystem::path& logFile, Offset baseOffset,
                               const RollPolicy& roll, const RetainRules& rules);
+
+// How a pass over one partition went.
+struct CleanResult {
+    std::size_t   segmentsCleaned = 0;
+    std::size_t   segmentsDeleted = 0;   // compacted down to nothing
+    std::uint64_t recordsKept     = 0;
+    std::uint64_t recordsDropped  = 0;
+    std::size_t   keysMapped      = 0;
+    bool          mapFilled       = false;
+
+    // Where the next pass should start: the first offset this one did NOT map.
+    Offset nextDirtyOffset{0};
+};
+
+// The broker's cleaner settings. Not per-partition, and not in partition.meta:
+// these are memory and scheduling, which belong to the process rather than to the
+// data. delete.retention.ms is the per-topic one, and it lives in LogConfig.
+struct CleanerConfig {
+    // Entries, not bytes. The map is the memory bound (see KeyOffsetMap), and an
+    // entry is a fixed size, so entries is the honest unit.
+    std::size_t maxKeyMapEntries = 1'000'000;
+
+    // Below this, a partition is not worth a pass. Without it the cleaner would
+    // rewrite whole segments to remove a handful of records, burning I/O
+    // proportional to the log for a saving proportional to nothing.
+    double minCleanableDirtyRatio = 0.5;
+
+    std::int64_t intervalMs = 15'000;
+};
+
+// One compaction pass over one partition.
+//
+// The key map is built over EVERY dirty segment before any of them is rewritten.
+// A key written in segment 1 and again in segment 5 has to lose its copy in
+// segment 1, which a map built segment-at-a-time would never notice.
+//
+// The active segment is never touched. It is being appended to, and every
+// invariant in this codebase depends on it having exactly one writer.
+CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, std::int64_t nowMs);
 
 }  // namespace dariyakyu::storage

@@ -322,6 +322,16 @@ public:
     bool replaceSegment(Offset baseOffset, const std::filesystem::path& cleanedLog,
                         const std::filesystem::path& cleanedIndex, std::int64_t nowMs);
 
+    // Drops the sealed segment based at `baseOffset` — for a segment compaction
+    // emptied, where there is nothing left to swap in.
+    //
+    // Unlike replaceSegment this DOES unlink, because no new file took the old
+    // one's place. The gap it leaves in the offset sequence is legal precisely
+    // because this only happens on a compacted log, where Log::open expects it.
+    //
+    // Returns false if that segment is already gone.
+    bool removeSegment(Offset baseOffset, std::int64_t nowMs);
+
     // How many deleted-but-not-yet-freed segments are being held.
     std::size_t graveyardSize() const;
 
