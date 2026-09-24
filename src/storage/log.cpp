@@ -120,23 +120,9 @@ unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, LogConfig fal
     for (auto it = logs.begin(); it != newest; ++it)
         sealed.emplace(it->first, SealedSegment::open(it->second));
 
-    // Contiguity. Each segment must begin exactly where the previous one ended,
-    // or a segment file has been removed by hand and there is a hole in the
-    // offset sequence. Reads would silently skip it — every consumer crossing the
-    // gap would jump forward and never know — so it is refused instead.
-    for (auto it = sealed.begin(); it != sealed.end(); ++it) {
-        const auto following = next(it);
-        const Offset expected =
-            (following == sealed.end()) ? newest->first : following->first;
-        if (it->second->nextOffset() != expected)
-            throw CorruptData("log " + dir.string() + ": segment " +
-                              it->first.toString() + " ends at " +
-                              it->second->nextOffset().toString() + " but the next begins at " +
-                              expected.toString() + " — a segment file is missing");
-    }
-
-    // Resolved before recovery, because recovery needs the roll policy — and the
-    // stored one may differ from the caller's.
+    // Resolved BEFORE the contiguity check below, not merely before recovery: what
+    // counts as a hole depends on the cleanup policy, so the rules have to be in
+    // hand before the sequence is judged.
     //
     // "Holds records" is judged from the sealed segments plus the fact that a
     // newest segment exists: a partition with a segment file that has any bytes in
@@ -144,6 +130,32 @@ unique_ptr<Log> Log::open(TopicPartition tp, filesystem::path dir, LogConfig fal
     const bool hasRecords =
         !sealed.empty() || filesystem::file_size(newest->second) > 0;
     const LogConfig config = resolveConfig(dir, tp, fallback, hasRecords);
+
+    // Contiguity. On a Delete log each segment must begin exactly where the
+    // previous one ended, or a segment file has been removed by hand and there is
+    // a hole in the offset sequence. Reads would silently skip it — every consumer
+    // crossing the gap would jump forward and never know — so it is refused.
+    //
+    // On a Compact log that same gap is the cleaner doing its job. Compaction
+    // deletes records without renumbering the survivors, and a segment whose
+    // records all lost can go entirely, so the base offsets skip. What stays
+    // illegal either way is OVERLAP: two segments claiming the same offset is
+    // never something compaction produces, and serving one of them arbitrarily
+    // would make a read's answer depend on map iteration order.
+    for (auto it = sealed.begin(); it != sealed.end(); ++it) {
+        const auto   following = next(it);
+        const Offset expected =
+            (following == sealed.end()) ? newest->first : following->first;
+        const Offset ends = it->second->nextOffset();
+
+        const bool broken = config.compacted() ? ends > expected : ends != expected;
+        if (broken)
+            throw CorruptData("log " + dir.string() + ": segment " +
+                              it->first.toString() + " ends at " + ends.toString() +
+                              " but the next begins at " + expected.toString() +
+                              (config.compacted() ? " — segments overlap"
+                                                  : " — a segment file is missing"));
+    }
 
     auto active = ActiveSegment::recover(newest->second, config.roll);
 

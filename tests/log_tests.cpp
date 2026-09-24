@@ -648,6 +648,62 @@ TEST_CASE("A hole left by a missing middle segment is refused") {
     CHECK_THROWS_AS(Log::open(TopicPartition{"orders", 0}, partition, configWith(policy)), CorruptData);
 }
 
+TEST_CASE("The same hole is legal on a compacted log") {
+    TempDir dir("log-open-hole-compacted");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    const auto bases = writeThenAbandon(partition, policy, 50);
+    REQUIRE(bases.size() > 3);
+
+    // Compaction deletes records without renumbering the survivors, and a segment
+    // whose records all lost goes entirely — so a compacted log's base offsets
+    // skip, and refusing that would make a cleaned partition unopenable.
+    filesystem::remove(segmentLogPath(partition, bases[1]));
+    filesystem::remove(segmentIndexPath(partition, bases[1]));
+
+    LogConfig config = configWith(policy);
+    config.cleanup   = CleanupPolicy::Compact;
+
+    // The meta file on disk says Delete, and it wins over the caller's fallback —
+    // which is the point of partition.meta. Rewrite it to describe the partition
+    // as it now is.
+    writePartitionMeta(partition, PartitionMeta{TopicPartition{"orders", 0}, config});
+
+    auto log = Log::open(TopicPartition{"orders", 0}, partition, config);
+    CHECK(log->config().compacted());
+    CHECK(log->segmentCount() == bases.size() - 1);
+}
+
+TEST_CASE("Overlapping segments are refused however the log is cleaned") {
+    TempDir dir("log-open-overlap");
+    const filesystem::path partition = dir.file("orders-0");
+    auto    policy         = testPolicy();
+    policy.maxSegmentBytes = 500;
+    const auto bases = writeThenAbandon(partition, policy, 50);
+    REQUIRE(bases.size() > 3);
+
+    // Copy a later segment's file over an earlier base offset, so two segments
+    // claim the same offsets. Compaction never produces this, and serving one of
+    // them arbitrarily would make a read's answer depend on map iteration order.
+    filesystem::copy_file(segmentLogPath(partition, bases[2]),
+                          segmentLogPath(partition, bases[1]),
+                          filesystem::copy_options::overwrite_existing);
+    filesystem::copy_file(segmentIndexPath(partition, bases[2]),
+                          segmentIndexPath(partition, bases[1]),
+                          filesystem::copy_options::overwrite_existing);
+
+    LogConfig config = configWith(policy);
+    config.cleanup   = CleanupPolicy::Compact;
+    writePartitionMeta(partition, PartitionMeta{TopicPartition{"orders", 0}, config});
+
+    // Checked by message, not just by type: this file is also corrupt in other
+    // ways, and a test that passed because the base offset disagreed with the
+    // first batch would not be testing the overlap rule at all.
+    CHECK_THROWS_WITH_AS(Log::open(TopicPartition{"orders", 0}, partition, config),
+                         doctest::Contains("segments overlap"), CorruptData);
+}
+
 // ===========================================================================
 // Log: truncation
 // ===========================================================================
