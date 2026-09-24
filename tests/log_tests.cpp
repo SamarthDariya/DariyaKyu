@@ -1621,3 +1621,64 @@ TEST_CASE("A meta from another partition is refused") {
     CHECK_THROWS_AS(Log::open(TopicPartition{"payments", 0}, partition, testConfig()),
                     CorruptData);
 }
+
+// ===========================================================================
+// M6: the cleanup policy, and reading a meta file written before it existed
+// ===========================================================================
+
+TEST_CASE("A cleanup policy survives the meta file round trip") {
+    PartitionMeta meta = sampleMeta();
+    meta.config.cleanup                       = CleanupPolicy::Compact;
+    meta.config.compaction.deleteRetentionMs  = 90'000;
+
+    const auto decoded = decodePartitionMeta(encodePartitionMeta(meta));
+
+    CHECK(decoded.config.cleanup == CleanupPolicy::Compact);
+    CHECK(decoded.config.compacted());
+    CHECK(decoded.config.compaction.deleteRetentionMs == 90'000);
+}
+
+TEST_CASE("Delete is what a topic gets unless it asks otherwise") {
+    // The default matters more than it looks: a topic that became compacted by
+    // accident stops deleting anything, and the disk fills with data an operator
+    // believed was on a seven-day window.
+    CHECK(LogConfig{}.cleanup == CleanupPolicy::Delete);
+    CHECK_FALSE(LogConfig{}.compacted());
+    CHECK(decodePartitionMeta(encodePartitionMeta(sampleMeta())).config.cleanup ==
+          CleanupPolicy::Delete);
+}
+
+TEST_CASE("A meta file written before compaction existed still opens") {
+    // Every partition on disk was written at v1. Refusing those would mean adding
+    // a field to this file makes a broker unable to open its own data — so an
+    // older version is read, and the fields it predates take their defaults.
+    auto v2 = encodePartitionMeta(sampleMeta());
+
+    // Truncate the two v2 fields off the end and stamp the version back to 1,
+    // which is byte-for-byte what the M3 encoder produced.
+    vector<uint8_t> v1(v2.begin(), v2.end() - (1 + 8));
+    v1[5] = 1;
+
+    const auto decoded = decodePartitionMeta(v1);
+    CHECK(decoded.config.cleanup == CleanupPolicy::Delete);
+    CHECK(decoded.config.compaction.deleteRetentionMs ==
+          CompactionPolicy{}.deleteRetentionMs);
+    CHECK(decoded.tp == sampleMeta().tp);
+}
+
+TEST_CASE("A meta file from a newer broker is refused, not guessed at") {
+    auto bytes = encodePartitionMeta(sampleMeta());
+    bytes[5]   = PartitionMeta::kVersion + 1;
+
+    // The asymmetry with the case above is the whole point. An older file is
+    // missing fields whose defaults we know; a newer one may have changed what
+    // the fields it shares MEAN, and a misread retention limit deletes data.
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
+}
+
+TEST_CASE("An unrecognised cleanup policy is corruption, not a default") {
+    auto bytes = encodePartitionMeta(sampleMeta());
+    bytes[bytes.size() - 9] = 7;
+
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
+}

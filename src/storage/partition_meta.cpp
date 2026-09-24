@@ -63,6 +63,10 @@ vector<uint8_t> encodePartitionMeta(const PartitionMeta& meta) {
                        : kUnlimitedBytes);
     out.writeInt64(meta.config.retention.segmentDeleteDelayMs);
 
+    // v2 and later.
+    out.writeInt8(static_cast<int8_t>(meta.config.cleanup));
+    out.writeInt64(meta.config.compaction.deleteRetentionMs);
+
     return out.take();
 }
 
@@ -77,9 +81,11 @@ PartitionMeta decodePartitionMeta(span<const uint8_t> bytes) {
                           to_string(PartitionMeta::kMagic) + " — this is not a partition.meta");
 
     const int16_t version = in.readInt16();
-    if (version != PartitionMeta::kVersion)
+    if (version > PartitionMeta::kVersion || version < PartitionMeta::kOldestReadable)
         throw CorruptData("partition.meta: version " + to_string(version) +
-                          ", this build understands only " + to_string(PartitionMeta::kVersion));
+                          ", this build understands " +
+                          to_string(PartitionMeta::kOldestReadable) + ".." +
+                          to_string(PartitionMeta::kVersion));
 
     PartitionMeta meta;
 
@@ -107,6 +113,17 @@ PartitionMeta decodePartitionMeta(span<const uint8_t> bytes) {
                                             : optional<uint64_t>(static_cast<uint64_t>(retentionBytes));
 
     meta.config.retention.segmentDeleteDelayMs = in.readInt64();
+
+    // A v1 file predates compaction, so it describes a Delete topic — which is
+    // what LogConfig already defaults to. Nothing to read, and nothing to guess.
+    if (version >= 2) {
+        const int8_t cleanup = in.readInt8();
+        if (cleanup != 0 && cleanup != 1)
+            throw CorruptData("partition.meta: cleanup policy " + to_string(cleanup));
+        meta.config.cleanup = static_cast<CleanupPolicy>(cleanup);
+
+        meta.config.compaction.deleteRetentionMs = in.readInt64();
+    }
 
     // Bytes left over mean this is not the file it claims to be — most likely
     // one that was appended to rather than replaced. The version matched, so
