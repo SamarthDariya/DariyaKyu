@@ -17,6 +17,7 @@
 #include "protocol/list_offsets.hpp"
 #include "protocol/metadata.hpp"
 #include "protocol/produce.hpp"
+#include "storage/log_cleaner.hpp"
 #include "server/broker.hpp"
 #include "test_support.hpp"
 
@@ -701,6 +702,187 @@ TEST_CASE("A group produces and consumes what it was assigned") {
     CHECK(read == 12);
     CHECK(consumer.committed({"orders", 0}) == Offset(6));
     CHECK(consumer.committed({"orders", 1}) == Offset(6));
+
+    broker.stop();
+}
+
+// ===========================================================================
+// M6 gate: a compacted topic collapses to one record per key
+// ===========================================================================
+
+namespace {
+
+// Produces one keyed record and returns the offset it landed at.
+Offset produceKeyed(cli::Client& client, const string& topic, PartitionId partition,
+                    const string& key, optional<string> value) {
+    RecordBatchBuilder builder;
+    const span<const uint8_t> keyBytes{reinterpret_cast<const uint8_t*>(key.data()), key.size()};
+    if (value)
+        builder.append(storage::wallClockMillis(), keyBytes,
+                       span<const uint8_t>{reinterpret_cast<const uint8_t*>(value->data()),
+                                           value->size()});
+    else
+        builder.append(storage::wallClockMillis(), keyBytes, nullopt);
+    auto batch = builder.build();
+
+    ProduceRequest request;
+    request.topics.push_back({topic, {{partition, span<const uint8_t>(batch), 0}}});
+
+    const auto   responseBody = client.call(ApiKey::Produce, body(request, encodeProduceRequest));
+    BufferReader in(responseBody);
+    const auto   response = decodeProduceResponse(in);
+    const auto&  answer   = response.topics.at(0).partitions.at(0);
+    REQUIRE(answer.error == ErrorCode::None);
+    return answer.baseOffset;
+}
+
+// Every (key, value) currently in a partition, read back from disk.
+map<string, string> liveValues(const filesystem::path& partition) {
+    map<string, filesystem::path> logs;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log")
+            logs[entry.path().filename().string()] = entry.path();
+
+    map<string, string> values;
+    for (const auto& [name, path] : logs)
+        storage::scanSegment(path, [&](const storage::ScannedBatch& batch) {
+            for (const auto& record : RecordBatch::decodeRecords(batch.bytes)) {
+                const string key = keyText(record);
+                if (storage::isTombstone(record)) values.erase(key);
+                else values[key] = valueText(record);
+            }
+        });
+    return values;
+}
+
+size_t recordsOnDisk(const filesystem::path& partition) {
+    map<string, filesystem::path> logs;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log")
+            logs[entry.path().filename().string()] = entry.path();
+
+    size_t count = 0;
+    for (const auto& [name, path] : logs)
+        storage::scanSegment(path, [&](const storage::ScannedBatch& batch) {
+            count += RecordBatch::decodeRecords(batch.bytes).size();
+        });
+    return count;
+}
+
+}  // namespace
+
+TEST_CASE("A compacted topic collapses many updates to one record per key") {
+    TempDir dir("gate-compaction");
+
+    server::Broker::Options options = optionsFor(dir.file("data"));
+    options.defaults.roll.maxSegmentBytes = 4096;     // roll often, so much is cleanable
+    options.cleaner.intervalMs            = 10;
+
+    server::Broker broker(options);
+    broker.start();
+
+    storage::LogConfig compacted = options.defaults;
+    compacted.cleanup            = storage::CleanupPolicy::Compact;
+    broker.logs().createPartition(TopicPartition{"profiles", 0}, compacted);
+
+    cli::Client client("127.0.0.1", broker.port());
+
+    // 100 keys, 30 updates each. Every key's final value is "v29".
+    constexpr int kKeys    = 100;
+    constexpr int kUpdates = 30;
+    for (int round = 0; round < kUpdates; ++round)
+        for (int key = 0; key < kKeys; ++key)
+            produceKeyed(client, "profiles", 0, "user-" + to_string(key),
+                         "v" + to_string(round));
+
+    const auto partition = dir.file("data") / "profiles-0";
+
+    // The cleaner runs on its own thread and has been compacting throughout the
+    // loop above, so the log never held all 3,000. Wait for it to settle near one
+    // record per key — never exactly, because the active segment is not compacted
+    // and holds the most recent writes.
+    constexpr size_t kSettled = kKeys * 3;
+    for (int waited = 0; waited < 600 && recordsOnDisk(partition) > kSettled; ++waited)
+        this_thread::sleep_for(chrono::milliseconds(10));
+
+    const auto after = recordsOnDisk(partition);
+    CHECK(after < static_cast<size_t>(kKeys * kUpdates) / 2);
+    CHECK(after <= kSettled);
+    CHECK(broker.cleaner().recordsDropped() > 0);
+    CHECK(broker.cleaner().failureCount() == 0);
+
+    // The point of all of it: every key still reads back its newest value.
+    const auto values = liveValues(partition);
+    CHECK(values.size() == kKeys);
+    for (int key = 0; key < kKeys; ++key)
+        CHECK(values.at("user-" + to_string(key)) == "v" + to_string(kUpdates - 1));
+
+    broker.stop();
+}
+
+TEST_CASE("A tombstoned key disappears from a compacted topic") {
+    TempDir dir("gate-tombstone");
+
+    server::Broker::Options options = optionsFor(dir.file("data"));
+    options.defaults.roll.maxSegmentBytes       = 1024;
+    options.defaults.compaction.deleteRetentionMs = 0;   // collectable immediately
+    options.cleaner.intervalMs                  = 10;
+
+    server::Broker broker(options);
+    broker.start();
+
+    storage::LogConfig compacted = options.defaults;
+    compacted.cleanup            = storage::CleanupPolicy::Compact;
+    broker.logs().createPartition(TopicPartition{"profiles", 0}, compacted);
+
+    cli::Client client("127.0.0.1", broker.port());
+
+    produceKeyed(client, "profiles", 0, "doomed", "here");
+    produceKeyed(client, "profiles", 0, "keeper", "stays");
+    produceKeyed(client, "profiles", 0, "doomed", nullopt);   // the tombstone
+
+    // Enough writes to roll everything above into sealed segments, since the
+    // active one is never cleaned.
+    for (int i = 0; i < 40; ++i)
+        produceKeyed(client, "profiles", 0, "filler-" + to_string(i), "x");
+
+    const auto partition = dir.file("data") / "profiles-0";
+    for (int waited = 0; waited < 400; ++waited) {
+        const auto values = liveValues(partition);
+        if (!values.count("doomed") && broker.cleaner().recordsDropped() > 0) break;
+        this_thread::sleep_for(chrono::milliseconds(10));
+    }
+
+    const auto values = liveValues(partition);
+    CHECK(values.count("doomed") == 0);
+    CHECK(values.at("keeper") == "stays");
+    CHECK(broker.cleaner().failureCount() == 0);
+
+    broker.stop();
+}
+
+TEST_CASE("An uncompacted topic keeps every version, however many there are") {
+    TempDir dir("gate-delete-topic");
+
+    server::Broker::Options options = optionsFor(dir.file("data"));
+    options.defaults.roll.maxSegmentBytes = 1024;
+    options.cleaner.intervalMs            = 10;
+
+    server::Broker broker(options);
+    broker.start();
+    broker.logs().createPartition(TopicPartition{"events", 0});
+
+    cli::Client client("127.0.0.1", broker.port());
+    for (int i = 0; i < 60; ++i)
+        produceKeyed(client, "events", 0, "same-key", "v" + to_string(i));
+
+    this_thread::sleep_for(chrono::milliseconds(200));
+
+    // The history a Delete topic promises. Compacting it would silently discard
+    // data a consumer is entitled to replay.
+    const auto partition = dir.file("data") / "events-0";
+    CHECK(recordsOnDisk(partition) == 60);
+    CHECK(broker.cleaner().recordsDropped() == 0);
 
     broker.stop();
 }

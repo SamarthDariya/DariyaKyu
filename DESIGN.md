@@ -915,6 +915,15 @@ The key map is built over **every** dirty segment before any of them is rewritte
 in segment 1 and again in segment 5 has to lose its copy in segment 1, which a segment-at-a-time
 map would never notice.
 
+**The map starts at the dirty mark; the rewrite starts at the log start.** These are deliberately
+different, and conflating them is a bug that hides well. `firstDirtyOffset` records where the last
+pass stopped mapping, so remapping below it would only cost time. But a key written at offset 10
+and again at offset 2,000 has its *older* copy in a segment cleaned passes ago — so the rewrite
+has to reach segments the map build skipped, or that copy stays on disk forever and the partition
+settles at one record per key **per pass** rather than one record per key. Segments that would
+lose nothing are asked first and skipped, so a clean partition does not pay a full rewrite every
+interval.
+
 **Two consequences that surprise people, and neither is a defect.**
 
 *Compaction is eventual.* The dirty range ends at the active segment, which is not cleaned and is
