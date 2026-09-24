@@ -182,6 +182,39 @@ vector<uint8_t> makeUnstampedBatch(int64_t timestamp, size_t payloadBytes = 32,
     return builder.build();
 }
 
+// A batch of keyed records, which is what a compacted topic actually carries.
+//
+// A nullopt value is a TOMBSTONE — "this key is gone" — and is deliberately
+// distinct from an empty value, which is an ordinary record whose value happens
+// to be zero bytes long.
+vector<uint8_t> makeKeyedBatch(
+    const vector<pair<string, optional<string>>>& records, int64_t timestamp = 1000) {
+    RecordBatchBuilder builder;
+    for (const auto& [key, value] : records) {
+        const span<const uint8_t> keyBytes{reinterpret_cast<const uint8_t*>(key.data()),
+                                           key.size()};
+        if (value)
+            builder.append(timestamp, keyBytes,
+                           span<const uint8_t>{reinterpret_cast<const uint8_t*>(value->data()),
+                                               value->size()});
+        else
+            builder.append(timestamp, keyBytes, nullopt);
+    }
+    return builder.build();
+}
+
+// The key of a record, as a string. Records borrow into the buffer they were
+// decoded from, so this must outlive nothing.
+string keyText(const Record& record) {
+    if (!record.key) return {};
+    return string(reinterpret_cast<const char*>(record.key->data()), record.key->size());
+}
+
+string valueText(const Record& record) {
+    if (!record.value) return {};
+    return string(reinterpret_cast<const char*>(record.value->data()), record.value->size());
+}
+
 // Walks every .log file in a partition directory in base-offset order and
 // collects the offsets it actually finds on disk. Used to prove rolling loses
 // nothing — deliberately independent of Log's own bookkeeping.
