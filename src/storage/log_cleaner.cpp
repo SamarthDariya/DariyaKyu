@@ -3,6 +3,7 @@
 #include "common/errors.hpp"
 #include "common/file_handle.hpp"
 #include "storage/offset_index.hpp"
+#include "storage/log.hpp"
 #include "storage/segment.hpp"
 
 using namespace std;
@@ -147,6 +148,78 @@ CleanedSegment rewriteSegment(const filesystem::path& logFile, Offset baseOffset
     // cleaned file differ from every other sealed index on disk, and
     // SealedSegment::open would be reading zeroes past the real entries.
     index.flushAndTrim();
+
+    return result;
+}
+
+CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, int64_t nowMs) {
+    CleanResult result;
+
+    const auto sealed = log.sealedSegments();
+    if (sealed.empty()) return result;
+
+    result.nextDirtyOffset = sealed.front().baseOffset;
+
+    // Phase one: map every dirty segment, oldest first, before rewriting any of
+    // them. A key written early and again late has to lose its early copy, and a
+    // map built one segment at a time would never see the later write.
+    KeyOffsetMap map(cleaner.maxKeyMapEntries);
+    size_t       mappable = 0;
+
+    for (const auto& info : sealed) {
+        bool refused = false;
+        scanSegment(info.logFile, [&](const ScannedBatch& batch) {
+            if (refused) return;
+            for (const auto& record : RecordBatch::decodeRecords(batch.bytes)) {
+                if (!record.key) continue;
+                if (!map.put(*record.key, record.offsetFrom(batch.header.baseOffset))) {
+                    refused = true;
+                    return;
+                }
+            }
+        });
+
+        // The budget filling is a NORMAL outcome, not a failure. This pass cleans
+        // what it managed to map and the next one starts where this stopped — a
+        // cleaner that gave up here would stop compacting exactly the partitions
+        // with the most keys.
+        if (refused) {
+            result.mapFilled = true;
+            break;
+        }
+
+        ++mappable;
+        result.nextDirtyOffset = info.nextOffset;
+    }
+
+    result.keysMapped = map.size();
+
+    // Phase two: rewrite the segments that were fully mapped.
+    const RetainRules rules{&map, nowMs, log.config().compaction.deleteRetentionMs};
+
+    for (size_t i = 0; i < mappable; ++i) {
+        const auto& info = sealed[i];
+
+        const CleanedSegment cleaned =
+            rewriteSegment(info.logFile, info.baseOffset, log.config().roll, rules);
+
+        result.recordsKept += cleaned.recordsKept;
+        result.recordsDropped += cleaned.recordsDropped;
+
+        if (cleaned.empty()) {
+            // Every record in the segment lost. Keeping an empty one would leave
+            // a file that decodes to nothing and a base offset that no longer
+            // describes anything — and a compacted log is allowed the gap.
+            error_code ec;
+            filesystem::remove(cleaned.logFile, ec);
+            filesystem::remove(cleaned.indexFile, ec);
+            if (log.removeSegment(info.baseOffset, nowMs)) ++result.segmentsDeleted;
+            continue;
+        }
+
+        if (log.replaceSegment(info.baseOffset, cleaned.logFile, cleaned.indexFile, nowMs))
+            ++result.segmentsCleaned;
+    }
 
     return result;
 }

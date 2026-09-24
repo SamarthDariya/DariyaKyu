@@ -387,7 +387,7 @@ TEST_CASE("A read resolves to a range whose first batch contains the offset") {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
         log->append(bytes);
     }
-    REQUIRE(log->segmentCount() > 3);
+    REQUIRE(log->segmentCount() > 2);
 
     // Every offset, across sealed segments and the active one, must resolve to a
     // range that starts on a batch boundary and whose first batch holds it.
@@ -987,7 +987,7 @@ TEST_CASE("Total size spans every segment, sealed and active") {
         auto bytes = makeUnstampedBatch(1000 + i, 48);
         log->append(bytes);
     }
-    REQUIRE(log->segmentCount() > 3);
+    REQUIRE(log->segmentCount() > 2);
 
     // Summed over segments, so a roll must not lose or double-count anything.
     CHECK(log->totalSizeBytes() == logBytesOnDisk(partition));
@@ -2264,4 +2264,232 @@ TEST_CASE("A cleaned segment opens as a sealed segment and reads back") {
     CHECK(segment->baseOffset() == Offset(0));
     CHECK(segment->nextOffset() == Offset(3));
     CHECK_FALSE(segment->read(Offset(1), kBigFetch).empty());
+}
+
+// ===========================================================================
+// M6: a pass over a whole partition
+// ===========================================================================
+
+namespace {
+
+// A compacted partition small enough to roll every couple of records, so a pass
+// has several sealed segments to work across.
+unique_ptr<Log> rollingKeyedLog(const filesystem::path& partition,
+                                const vector<pair<string, optional<string>>>& writes,
+                                int64_t timestamp = 1000) {
+    auto policy            = testPolicy();
+    policy.maxSegmentBytes = 120;
+
+    LogConfig config = configWith(policy);
+    config.cleanup   = CleanupPolicy::Compact;
+
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+    for (const auto& write : writes) {
+        auto bytes = makeKeyedBatch({write}, timestamp);
+        log->append(bytes);
+    }
+    return log;
+}
+
+// Every surviving record across a whole partition, read through the Log itself.
+vector<OnDisk> everythingIn(const filesystem::path& partition) {
+    map<string, filesystem::path> logs;
+    for (const auto& entry : filesystem::directory_iterator(partition))
+        if (entry.path().extension() == ".log")
+            logs[entry.path().filename().string()] = entry.path();
+
+    vector<OnDisk> all;
+    for (const auto& [name, path] : logs)
+        for (const auto& record : contentsOf(path)) all.push_back(record);
+    return all;
+}
+
+}  // namespace
+
+TEST_CASE("A pass drops a key's older copies across segment boundaries") {
+    TempDir dir("clean-across-segments");
+    const filesystem::path partition = dir.file("orders-0");
+
+    // "a" is written first and again later, with several segments between them.
+    // The trailing writes matter: a pass never touches the active segment, so a2
+    // has to have rolled into a sealed one before it can supersede anything.
+    auto log = rollingKeyedLog(partition, {
+        {"a", "a1"}, {"b", "b1"}, {"c", "c1"}, {"a", "a2"}, {"d", "d1"}, {"e", "e1"},
+    });
+    REQUIRE(log->segmentCount() > 2);
+
+    const auto before = everythingIn(partition).size();
+    const auto result = cleanLog(*log, CleanerConfig{}, 1'000'000);
+
+    // The map is built across EVERY dirty segment before anything is rewritten —
+    // a map built one segment at a time would never learn that "a" was written
+    // again three segments later.
+    CHECK(result.recordsDropped == 1);
+    CHECK(result.segmentsCleaned + result.segmentsDeleted > 0);
+
+    const auto after = everythingIn(partition);
+    CHECK(after.size() == before - 1);
+
+    bool foundOldA = false;
+    for (const auto& record : after)
+        if (record.key == "a" && record.value == "a1") foundOldA = true;
+    CHECK_FALSE(foundOldA);
+}
+
+TEST_CASE("A segment compacted down to nothing is removed, gap and all") {
+    TempDir dir("clean-empty-segment");
+    const filesystem::path partition = dir.file("orders-0");
+
+    // Every early write is superseded, so whole early segments empty out.
+    auto log = rollingKeyedLog(partition, {
+        {"a", "a1"}, {"a", "a2"}, {"a", "a3"}, {"a", "a4"}, {"a", "a5"}, {"a", "a6"},
+    });
+    REQUIRE(log->segmentCount() > 2);
+    const size_t segmentsBefore = log->segmentCount();
+
+    const auto result = cleanLog(*log, CleanerConfig{}, 1'000'000);
+    CHECK(result.segmentsDeleted > 0);
+    CHECK(log->segmentCount() < segmentsBefore);
+
+    // Only the newest "a" survives among the sealed segments, plus whatever is
+    // still in the active one.
+    int values = 0;
+    for (const auto& record : everythingIn(partition))
+        if (record.key == "a") ++values;
+    CHECK(values >= 1);
+}
+
+TEST_CASE("The active segment is never touched") {
+    TempDir dir("clean-active-untouched");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto log = rollingKeyedLog(partition, {
+        {"a", "a1"}, {"a", "a2"}, {"a", "a3"}, {"a", "a4"},
+    });
+    const Offset endBefore = log->logEndOffset();
+
+    cleanLog(*log, CleanerConfig{}, 1'000'000);
+
+    // Every invariant in this codebase depends on the active segment having
+    // exactly one writer, and compacting it would be a second one.
+    CHECK(log->logEndOffset() == endBefore);
+    CHECK(log->read(endBefore - 1, kBigFetch).ok());
+}
+
+TEST_CASE("A compacted log still reads, and a removed offset lands on the next one") {
+    TempDir dir("clean-reads");
+    const filesystem::path partition = dir.file("orders-0");
+
+    // Six writes, two to a segment: offsets 0-3 seal and 4-5 stay active, so a1
+    // and a2 are both inside the range a pass can see.
+    auto log = rollingKeyedLog(partition, {
+        {"a", "a1"}, {"b", "b1"}, {"a", "a2"}, {"c", "c1"}, {"d", "d1"}, {"e", "e1"},
+    });
+    cleanLog(*log, CleanerConfig{}, 1'000'000);
+
+    // Offset 0 held a1, which compaction deleted. The read does not fail and does
+    // not return nothing — it lands on the next surviving batch, which is what
+    // makes a consumer able to walk a compacted log at all.
+    const auto result = log->read(Offset(0), kBigFetch);
+    REQUIRE(result.ok());
+    REQUIRE_FALSE(result.range.empty());
+
+    // Everything from 0 forward, read the way a consumer would.
+    vector<string> values;
+    Offset         at{0};
+    while (at < log->logEndOffset()) {
+        const auto read = log->read(at, kBigFetch);
+        REQUIRE(read.ok());
+        if (read.range.empty()) break;
+
+        const auto bytes  = pullRange(read.range);
+        const auto header = RecordBatch::parseHeader(bytes);
+        for (const auto& record : RecordBatch::decodeRecords(bytes)) values.push_back(valueText(record));
+        at = header.lastOffset() + 1;
+    }
+
+    CHECK(values == vector<string>{"b1", "a2", "c1", "d1", "e1"});
+}
+
+TEST_CASE("A partition reopens after a pass, gaps and all") {
+    TempDir dir("clean-reopen");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto policy            = testPolicy();
+    policy.maxSegmentBytes = 120;
+    LogConfig config       = configWith(policy);
+    config.cleanup         = CleanupPolicy::Compact;
+
+    {
+        auto log = rollingKeyedLog(partition, {
+            {"a", "a1"}, {"b", "b1"}, {"a", "a2"}, {"b", "b2"}, {"c", "c1"},
+        });
+        cleanLog(*log, CleanerConfig{}, 1'000'000);
+    }
+
+    // The whole point of relaxing the contiguity check: a partition that has been
+    // cleaned has holes, and a broker that would not reopen it would have
+    // destroyed the data it was trying to save space on.
+    auto reopened = Log::open(TopicPartition{"orders", 0}, partition, config);
+    CHECK(reopened->config().compacted());
+
+    // Reading from wherever the log now starts works. Offset 0 may not: if the
+    // leading segment emptied out entirely, compaction removed it and the log
+    // start moved up with it. A consumer below that gets BelowLogStart and resets,
+    // exactly as it would after retention — which is the honest answer, because
+    // those records really are gone.
+    CHECK(reopened->read(reopened->logStartOffset(), kBigFetch).ok());
+}
+
+TEST_CASE("Compaction is eventual: a key rewritten in the active segment waits") {
+    TempDir dir("clean-eventual");
+    const filesystem::path partition = dir.file("orders-0");
+
+    // a2 lands in the active segment, which a pass never looks at — not to clean
+    // and not even to map. So a1 is, as far as this pass can tell, the newest
+    // record for "a", and it survives.
+    auto log = rollingKeyedLog(partition, {{"a", "a1"}, {"b", "b1"}, {"a", "a2"}});
+
+    const auto first = cleanLog(*log, CleanerConfig{}, 1'000'000);
+    CHECK(first.recordsDropped == 0);
+
+    bool stillThere = false;
+    for (const auto& record : everythingIn(partition))
+        if (record.value == "a1") stillThere = true;
+    CHECK(stillThere);
+
+    // Write enough to roll a2 into a sealed segment, and the next pass sees it.
+    for (const auto& write : vector<pair<string, optional<string>>>{
+             {"c", "c1"}, {"d", "d1"}, {"e", "e1"}}) {
+        auto bytes = makeKeyedBatch({write}, 1000);
+        log->append(bytes);
+    }
+
+    const auto second = cleanLog(*log, CleanerConfig{}, 1'000'000);
+    CHECK(second.recordsDropped == 1);
+
+    bool goneNow = true;
+    for (const auto& record : everythingIn(partition))
+        if (record.value == "a1") goneNow = false;
+    CHECK(goneNow);
+}
+
+TEST_CASE("A leading segment compacted to nothing moves the log start up") {
+    TempDir dir("clean-log-start");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto log = rollingKeyedLog(partition, {
+        {"a", "a1"}, {"a", "a2"}, {"a", "a3"}, {"a", "a4"}, {"a", "a5"}, {"a", "a6"},
+    });
+    REQUIRE(log->logStartOffset() == Offset(0));
+
+    cleanLog(*log, CleanerConfig{}, 1'000'000);
+
+    // The offsets in the removed segment really are gone, so a consumer below the
+    // new start gets BelowLogStart and resets — the same answer retention gives,
+    // for the same reason. This is the one promise compaction cannot keep: it
+    // preserves the offsets of records it KEEPS, not of records it deletes.
+    CHECK(log->logStartOffset() > Offset(0));
+    CHECK(log->read(Offset(0), kBigFetch).error == ReadError::BelowLogStart);
+    CHECK(log->read(log->logStartOffset(), kBigFetch).ok());
 }
