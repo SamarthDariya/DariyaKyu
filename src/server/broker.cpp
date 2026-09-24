@@ -13,6 +13,7 @@ namespace dariyakyu::server {
 Broker::Broker(Options options)
     : options_(std::move(options)),
       logs_(options_.dataDir, options_.defaults),
+      cleaner_(logs_, options_.cleaner),
       offsets_(logs_, options_.offsetsPartitions),
       context_{logs_,
                groups_,
@@ -51,6 +52,7 @@ void Broker::start() {
     // Started AFTER the acceptor, so a broker that fails to bind has not already
     // spawned a thread to clean up.
     logs_.startMaintenance(options_.maintenanceIntervalMs);
+    cleaner_.startCleaning();
 
     sweepThread_ = thread([this] { sweepGroups(); });
 }
@@ -88,7 +90,10 @@ void Broker::stop() {
     sweepWake_.notify_all();
     if (sweepThread_.joinable()) sweepThread_.join();
 
-    // Then the log sweep, the last other thread touching partitions.
+    // Then the two threads that touch partitions. The cleaner first: it is the
+    // one that rewrites files, and a pass in flight has to finish before the
+    // sweeper can free anything it is standing on.
+    cleaner_.stopCleaning();
     logs_.stopMaintenance();
 }
 

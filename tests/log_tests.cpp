@@ -2659,3 +2659,55 @@ TEST_CASE("The cleaner's thread starts, works, and stops promptly") {
     // minutes to shut down and gets SIGKILLed by its supervisor.
     CHECK(stopTook < chrono::seconds(1));
 }
+
+TEST_CASE("A second pass removes a copy left in an already-cleaned segment") {
+    CleanerFixture fixture("cleaner-old-copy");
+    auto&          log = fixture.partition("orders");
+
+    // "a" is written early, then a first pass cleans the segments holding it.
+    CleanerFixture::write(log, {{"a", "a1"}, {"b", "b1"}, {"c", "c1"}, {"d", "d1"}});
+
+    LogCleaner cleaner(fixture.logs, CleanerConfig{});
+    cleaner.cleanOnce(TopicPartition{"orders", 0}, 1'000'000);
+    const Offset mark = cleaner.firstDirtyOffset(TopicPartition{"orders", 0});
+    REQUIRE(mark > Offset(0));
+
+    // Now "a" is written again, well above the mark.
+    CleanerFixture::write(log, {{"a", "a2"}, {"e", "e1"}, {"f", "f1"}, {"g", "g1"}});
+
+    const auto result = cleaner.cleanOnce(TopicPartition{"orders", 0}, 1'000'000);
+    REQUIRE(result.has_value());
+
+    // a1 lives in a segment BELOW the mark, which the map no longer covers. A
+    // pass that rewrote only the dirty segments would leave it there forever, and
+    // the partition would settle at one record per key per pass rather than one
+    // record per key. So the rewrite runs from the log start, not from the mark.
+    bool oldCopy = false;
+    for (const auto& record : everythingIn(fixture.dir.file("data") / "orders-0"))
+        if (record.value == "a1") oldCopy = true;
+    CHECK_FALSE(oldCopy);
+    CHECK(result->recordsDropped >= 1);
+}
+
+TEST_CASE("A segment with nothing to lose is not rewritten") {
+    CleanerFixture fixture("cleaner-no-rewrite");
+    auto&          log = fixture.partition("orders");
+    CleanerFixture::write(log, {{"a", "a1"}, {"b", "b1"}, {"c", "c1"}, {"d", "d1"}});
+
+    LogCleaner cleaner(fixture.logs, CleanerConfig{});
+    cleaner.cleanOnce(TopicPartition{"orders", 0}, 1'000'000);
+
+    // Distinct keys only, so nothing supersedes anything.
+    CleanerFixture::write(log, {{"e", "e1"}, {"f", "f1"}, {"g", "g1"}, {"h", "h1"}});
+
+    const auto result = cleaner.cleanOnce(TopicPartition{"orders", 0}, 1'000'000);
+    REQUIRE(result.has_value());
+
+    // Rewriting from the log start must not mean rewriting everything every pass.
+    // A segment that would lose nothing is asked first and skipped — otherwise a
+    // clean partition costs a full rewrite, a swap and a graveyard entry per pass
+    // to produce byte-identical files.
+    CHECK(result->recordsDropped == 0);
+    CHECK(result->segmentsCleaned == 0);
+    CHECK(result->segmentsDeleted == 0);
+}
