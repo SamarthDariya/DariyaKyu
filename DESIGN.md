@@ -857,6 +857,78 @@ On startup `Log` scans its directory:
 Bounded work regardless of partition size — decision 11's crash-recovery freebie, now visible
 in the type signatures.
 
+#### Added at M6 — compaction
+
+A regular topic is the full history. A **compacted** topic is the current value of every key:
+the cleaner walks the log and keeps only the newest record per key, deleting the rest. That is
+what makes `__offsets` bounded — a group committing once a second writes 86,400 records a day
+for one key, and 86,399 of them are garbage the moment the next one lands.
+
+`LogConfig` gains one field:
+
+```cpp
+enum class CleanupPolicy { Delete, Compact };
+```
+
+`Delete` is decision 4's retention, unchanged. `Compact` is this section. They are alternatives
+rather than a pair: a compacted topic keeps its keys forever, so an age limit applied to one
+would silently undo it.
+
+**Offsets are never renumbered, so a compacted log has gaps.** The cleaner deletes records but
+cannot move the survivors — a consumer holding offset 4,000 must still find offset 4,000, and a
+`FileRange` already on a socket must still mean what it meant. So the offsets in a cleaned
+segment run `...3998, 4002, 4017...`, and three things have to accept that:
+
+- **`Log::open`'s continuity check.** It currently rejects a gap between one segment's
+  `nextOffset` and the next segment's base, which is right for a `Delete` log — there, a gap is
+  a lost file, and opening the partition anyway would serve a hole as if it were data. On a
+  `Compact` log the same gap is the cleaner working. The check stays, and learns the policy.
+- **Reads.** A fetch for an offset the cleaner removed returns the next surviving batch rather
+  than an error. This falls out of how a read already works — the index gives a position at or
+  below the target and the segment scans forward — so it is a property to test rather than
+  code to add.
+- **The index.** Nothing. Entries are `(relativeOffset, position)` and lookup is "greatest
+  entry at or below", which does not care that the offsets between them are missing.
+
+**Deleting a key is itself an append.** "Key K is gone" is a record with a **null value** — a
+tombstone. It cannot be collected the moment it is applied: a consumer that was behind would
+skip past the deletion entirely and keep serving a value that no longer exists. So a tombstone
+survives `deleteRetentionMs` past the pass that could first have removed it, and only then goes.
+That window is the promise made to a lagging consumer, and it is the only part of compaction
+that is about time rather than about keys.
+
+**The key map is what bounds a pass.** Deciding "is this the newest record for K?" needs every
+key in the range being cleaned held in memory at once, so the map — not the segment count — is
+the limit. It is configured as an entry budget, and a budget that fills is a normal outcome: the
+pass cleans the range it managed to map and the next one starts where it stopped. A cleaner that
+failed when it ran out of map would stop compacting exactly on the partitions that most need it.
+
+**One segment rewritten at a time, and the swap is a rename.** Decision 11's "rewrite one
+segment and swap it, rather than an 8 GB rewrite", made concrete: survivors go into
+`.log.cleaned` and `.index.cleaned`, which are then renamed over the originals. Because the base
+offset does not change, the filename does not either, so the swap is two renames and the
+segment map keeps its key. The old `SealedSegment` goes to the graveyard M3 already built,
+for the same reason retention's do — a `FileRange` handed out a moment ago still names its
+descriptor.
+
+The key map is built over **every** dirty segment before any of them is rewritten. A key written
+in segment 1 and again in segment 5 has to lose its copy in segment 1, which a segment-at-a-time
+map would never notice.
+
+**The cleaner gets its own thread**, as the thread inventory above already promised. A pass
+rewrites files and can run long; sharing the maintenance sweeper's thread would stall retention
+behind compaction, which is the one form of cleanup that has a deadline.
+
+##### Rejected alternatives
+
+| Alternative | Why not |
+|---|---|
+| Renumber offsets so the log stays dense | Breaks every consumer position and every issued `FileRange`. The gap is the cheaper cost by far. |
+| Merge several small cleaned segments into one, as Kafka does | Changes base offsets, so the swap stops being a rename and the segment map has to be rebuilt. Worth it when segments are mostly empty; banked until they are. |
+| Collect tombstones immediately | A lagging consumer never learns the key was deleted. The whole point of the horizon. |
+| Compact the active segment too | It is being appended to. Every other invariant in this file depends on the active segment having exactly one writer. |
+| Fail a pass when the key map fills | Stops compaction precisely on the partitions with the most keys, which are the ones that need it. |
+
 ### 2. `LogManager`, topics, retention, and the write path
 
 #### On-disk layout
