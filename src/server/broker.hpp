@@ -12,6 +12,7 @@
 #include "group/offset_store.hpp"
 #include "server/acceptor.hpp"
 #include "server/api_registry.hpp"
+#include "storage/log_cleaner.hpp"
 #include "storage/log_manager.hpp"
 
 namespace dariyakyu::server {
@@ -46,6 +47,10 @@ public:
         // How often expired members are swept. Shorter than a session timeout,
         // or a member could be gone for two timeouts before anyone notices.
         std::int64_t groupSweepIntervalMs = 1'000;
+
+        // Compaction. Its own settings rather than per-topic, because they are
+        // memory and scheduling — which belong to the process, not the data.
+        storage::CleanerConfig cleaner;
     };
 
     explicit Broker(Options options);
@@ -65,6 +70,7 @@ public:
     std::int32_t port() const;
 
     storage::LogManager& logs() { return logs_; }
+    storage::LogCleaner& cleaner() { return cleaner_; }
 
 private:
     void sweepGroups();
@@ -75,6 +81,11 @@ private:
     // everything that reads it and the sweep thread is joined before any of it
     // goes. Same reasoning as LogManager joining its own sweeper.
     storage::LogManager     logs_;
+
+    // After logs_, so it is destroyed before them — its thread reads partitions,
+    // and a cleaner outliving the LogManager would be rewriting freed segments.
+    storage::LogCleaner     cleaner_;
+
     group::OffsetStore      offsets_;
     group::GroupCoordinator groups_;
 

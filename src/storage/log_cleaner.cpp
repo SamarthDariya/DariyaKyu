@@ -167,29 +167,48 @@ double dirtyRatio(const Log& log, Offset firstDirtyOffset) {
     return static_cast<double>(dirty) / static_cast<double>(total);
 }
 
+namespace {
+
+// Whether rewriting this segment would actually remove anything.
+//
+// Read-only, and worth the extra scan: most passes re-examine segments that were
+// already cleaned, and rewriting one that loses nothing costs a full write plus a
+// swap plus a graveyard entry to produce a byte-identical file.
+bool wouldDropAnything(const filesystem::path& logFile, const RetainRules& rules) {
+    bool any = false;
+    scanSegment(logFile, [&](const ScannedBatch& batch) {
+        if (any) return;
+        for (const auto& record : RecordBatch::decodeRecords(batch.bytes)) {
+            const Offset  offset      = record.offsetFrom(batch.header.baseOffset);
+            const int64_t timestampMs = record.timestampFrom(batch.header.firstTimestamp);
+            if (!retain(record, offset, timestampMs, rules)) {
+                any = true;
+                return;
+            }
+        }
+    });
+    return any;
+}
+
+}  // namespace
+
 CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, Offset firstDirtyOffset,
                      int64_t nowMs) {
     CleanResult result;
     result.nextDirtyOffset = firstDirtyOffset;
 
-    // Segments entirely below the mark were cleaned by an earlier pass. Skipped
-    // rather than re-examined: their records are already the newest for their
-    // keys as far as anything below the mark is concerned.
-    vector<Log::SealedInfo> sealed;
-    for (const auto& info : log.sealedSegments())
-        if (info.nextOffset > firstDirtyOffset) sealed.push_back(info);
-
+    const auto sealed = log.sealedSegments();
     if (sealed.empty()) return result;
 
-    result.nextDirtyOffset = sealed.front().baseOffset;
-
-    // Phase one: map every dirty segment, oldest first, before rewriting any of
-    // them. A key written early and again late has to lose its early copy, and a
-    // map built one segment at a time would never see the later write.
+    // Phase one: map the DIRTY range — the segments written since the last pass.
+    // Segments below the mark were mapped before and their keys are already
+    // reflected in what survived, so remapping them would only cost time.
     KeyOffsetMap map(cleaner.maxKeyMapEntries);
-    size_t       mappable = 0;
+    Offset       mappedThrough = firstDirtyOffset;
 
     for (const auto& info : sealed) {
+        if (info.nextOffset <= firstDirtyOffset) continue;
+
         bool refused = false;
         scanSegment(info.logFile, [&](const ScannedBatch& batch) {
             if (refused) return;
@@ -203,25 +222,39 @@ CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, Offset firstDirtyOf
         });
 
         // The budget filling is a NORMAL outcome, not a failure. This pass cleans
-        // what it managed to map and the next one starts where this stopped — a
-        // cleaner that gave up here would stop compacting exactly the partitions
-        // with the most keys.
+        // what it managed to map and the next starts where it stopped — a cleaner
+        // that gave up here would stop compacting exactly the partitions with the
+        // most keys.
         if (refused) {
             result.mapFilled = true;
             break;
         }
 
-        ++mappable;
-        result.nextDirtyOffset = info.nextOffset;
+        mappedThrough = info.nextOffset;
     }
 
-    result.keysMapped = map.size();
+    result.keysMapped      = map.size();
+    result.nextDirtyOffset = mappedThrough;
 
-    // Phase two: rewrite the segments that were fully mapped.
+    if (map.size() == 0) return result;
+
+    // Phase two: rewrite every sealed segment from the LOG START through the end
+    // of the mapped range — not just the dirty part.
+    //
+    // This is the half that is easy to get wrong, and did get wrong. A key written
+    // at offset 10 and again at offset 2,000 has its newer copy in the dirty range
+    // and its older copy in a segment that was cleaned passes ago. Rewriting only
+    // the dirty segments leaves that older copy on disk forever, and the partition
+    // settles at one record per key PER PASS rather than one record per key.
+    //
+    // The cost is re-reading segments that have nothing to lose, which is why each
+    // one is asked first.
     const RetainRules rules{&map, nowMs, log.config().compaction.deleteRetentionMs};
 
-    for (size_t i = 0; i < mappable; ++i) {
-        const auto& info = sealed[i];
+    for (const auto& info : sealed) {
+        if (info.baseOffset >= mappedThrough) break;
+
+        if (!wouldDropAnything(info.logFile, rules)) continue;
 
         const CleanedSegment cleaned =
             rewriteSegment(info.logFile, info.baseOffset, log.config().roll, rules);
@@ -230,8 +263,8 @@ CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, Offset firstDirtyOf
         result.recordsDropped += cleaned.recordsDropped;
 
         if (cleaned.empty()) {
-            // Every record in the segment lost. Keeping an empty one would leave
-            // a file that decodes to nothing and a base offset that no longer
+            // Every record in the segment lost. Keeping an empty one would leave a
+            // file that decodes to nothing and a base offset that no longer
             // describes anything — and a compacted log is allowed the gap.
             error_code ec;
             filesystem::remove(cleaned.logFile, ec);
