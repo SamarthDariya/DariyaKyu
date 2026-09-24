@@ -1,14 +1,21 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include "common/types.hpp"
 #include "storage/key_offset_map.hpp"
 #include "storage/log.hpp"
+#include "storage/log_manager.hpp"
 #include "storage/record_batch.hpp"
 #include "storage/segment.hpp"
 
@@ -139,6 +146,94 @@ struct CleanerConfig {
 //
 // The active segment is never touched. It is being appended to, and every
 // invariant in this codebase depends on it having exactly one writer.
-CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, std::int64_t nowMs);
+// `firstDirtyOffset` is where the last pass stopped. Segments entirely below it
+// were cleaned already and are skipped — which is what stops a cleaner rewriting
+// the same untouched bytes every fifteen seconds forever.
+CleanResult cleanLog(Log& log, const CleanerConfig& cleaner, Offset firstDirtyOffset,
+                     std::int64_t nowMs);
+
+// How much of a log's sealed bytes have not been cleaned since they were written.
+//
+// The number the cleaner schedules on. Without a floor under it, a partition
+// whose last pass left it spotless would be rewritten in full to remove the
+// handful of records written since — I/O proportional to the log for a saving
+// proportional to nothing.
+//
+// Only sealed segments count, on both sides of the fraction. The active segment
+// is neither cleanable nor countable-against: including it would make a busy
+// partition look permanently dirty and a quiet one permanently clean, which is
+// the opposite of what the ratio is for.
+double dirtyRatio(const Log& log, Offset firstDirtyOffset);
+
+// The background cleaner: which partition to compact next, and how far each one
+// has been compacted already.
+//
+// # Why the marks live here rather than on disk
+//
+// firstDirtyOffset is CLEANER state, not log state — it records what this process
+// has done, not what the partition contains. Kafka checkpoints it to a
+// cleaner-offset-checkpoint file so a restart does not redo work. This keeps it
+// in memory, so a restart re-cleans from the beginning: wasteful, never wrong,
+// and it means there is no checkpoint file to be out of step with the segments
+// it describes. The checkpoint is banked, not forgotten.
+//
+// # Why one partition at a time
+//
+// A pass holds a whole key map, and the map is the memory bound. Cleaning two
+// partitions at once would double that for no gain a single thread can collect —
+// the work is disk-bound, not CPU-bound.
+class LogCleaner {
+public:
+    explicit LogCleaner(LogManager& logs, CleanerConfig config = {});
+
+    // The compacted partition most worth cleaning, or nothing if none is dirty
+    // enough. Dirtiest first, so a partition that is mostly garbage is not
+    // starved by one that is mostly fresh.
+    std::optional<TopicPartition> pickDirtiest() const;
+
+    // One pass over one partition, if it is worth a pass.
+    //
+    // Returns nothing when the partition is not compacted, is not dirty enough,
+    // or is no longer hosted here. The last is not an error: an administrator can
+    // delete a topic between the pick and the pass.
+    std::optional<CleanResult> cleanOnce(const TopicPartition& tp, std::int64_t nowMs);
+
+    // Picks and cleans in one step. What the thread calls.
+    std::optional<CleanResult> runOnce(std::int64_t nowMs);
+
+    void startCleaning();
+    void stopCleaning();
+
+    std::uint64_t passCount() const { return passes_.load(std::memory_order_acquire); }
+    std::uint64_t failureCount() const { return failures_.load(std::memory_order_acquire); }
+    std::uint64_t recordsDropped() const { return dropped_.load(std::memory_order_acquire); }
+
+    Offset firstDirtyOffset(const TopicPartition& tp) const;
+
+    const CleanerConfig& config() const { return config_; }
+
+    ~LogCleaner();
+
+    LogCleaner(const LogCleaner&)            = delete;
+    LogCleaner& operator=(const LogCleaner&) = delete;
+
+private:
+    LogManager&   logs_;
+    CleanerConfig config_;
+
+    // Guards the marks and the thread's own state. Deliberately never held while
+    // a pass runs: a pass rewrites files and can take a long time, and a lock held
+    // across it would make stopping the cleaner wait for it.
+    mutable std::mutex                        mutex_;
+    std::map<TopicPartition, Offset>          firstDirty_;
+
+    std::thread             thread_;
+    std::condition_variable wake_;
+    bool                    stopRequested_ = false;
+
+    std::atomic<std::uint64_t> passes_{0};
+    std::atomic<std::uint64_t> failures_{0};
+    std::atomic<std::uint64_t> dropped_{0};
+};
 
 }  // namespace dariyakyu::storage
