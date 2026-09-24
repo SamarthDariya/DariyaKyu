@@ -45,6 +45,7 @@ struct Options {
     bool    follow    = false;
     string  group;
     string  strategy  = "range";
+    bool    compact   = false;
 };
 
 string valueOf(const vector<string>& args, const string& name, const string& fallback) {
@@ -73,6 +74,7 @@ Options parseOptions(const vector<string>& args) {
     options.follow     = hasFlag(args, "--follow");
     options.group      = valueOf(args, "--group", "");
     options.strategy   = valueOf(args, "--strategy", "range");
+    options.compact    = hasFlag(args, "--compact");
     return options;
 }
 
@@ -90,8 +92,15 @@ bool reportError(ErrorCode error, const string& what) {
 }
 
 int doCreate(cli::Client& client, const string& topic, const Options& options) {
+    CreateTopicRequest::Topic asked;
+    asked.name           = topic;
+    asked.partitionCount = options.partitions;
+    // Only sent when asked for, so a create with no flag keeps the broker's
+    // default rather than pinning every topic to whatever this build thinks it is.
+    if (options.compact) asked.compact = true;
+
     CreateTopicRequest request;
-    request.topics.push_back({topic, options.partitions, {}, {}, {}});
+    request.topics.push_back(std::move(asked));
 
     const auto   body = client.call(ApiKey::CreateTopic, encodedBody(request, encodeCreateTopicRequest));
     BufferReader in(body);
@@ -99,7 +108,8 @@ int doCreate(cli::Client& client, const string& topic, const Options& options) {
 
     for (const auto& answer : response.topics) {
         if (reportError(answer.error, "create " + answer.name)) return 1;
-        printf("created %s with %d partition(s)\n", answer.name.c_str(), options.partitions);
+        printf("created %s with %d partition(s)%s\n", answer.name.c_str(), options.partitions,
+               options.compact ? ", compacted" : "");
     }
     return 0;
 }
@@ -384,7 +394,8 @@ int doConsumeGroup(cli::Client& client, const string& topic, const Options& opti
 void usage() {
     fprintf(stderr,
             "usage:\n"
-            "  dariyakyu-cli create   <topic> [--partitions N] [--broker host:port]\n"
+            "  dariyakyu-cli create   <topic> [--partitions N] [--compact] "
+            "[--broker host:port]\n"
             "  dariyakyu-cli describe [topic] [--broker host:port]\n"
             "  dariyakyu-cli produce  <topic> <partition> [--broker host:port]\n"
             "  dariyakyu-cli consume  <topic> <partition> [--from earliest|latest|N] "

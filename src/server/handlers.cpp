@@ -146,6 +146,9 @@ void handleCreateTopic(RequestContext& request, Response& out) {
             config.retention.retentionBytes = static_cast<uint64_t>(*asked.retentionBytes);
         if (asked.maxSegmentBytes)
             config.roll.maxSegmentBytes = static_cast<uint64_t>(*asked.maxSegmentBytes);
+        if (asked.compact)
+            config.cleanup = *asked.compact ? storage::CleanupPolicy::Compact
+                                            : storage::CleanupPolicy::Delete;
 
         try {
             for (PartitionId p = 0; p < asked.partitionCount; ++p)

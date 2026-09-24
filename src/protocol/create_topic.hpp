@@ -29,11 +29,16 @@ struct CreateTopicRequest {
         // knobs; when there are thirty, the generic form earns itself.
         //
         // On the wire an absent override is -1, the same sentinel partition.meta
-        // uses for unlimited bytes. It is unambiguous here because none of these
-        // is meaningful at zero or below.
+        // uses for unlimited bytes. It is unambiguous for the three below because
+        // none of them is meaningful at zero.
         std::optional<std::int64_t> retentionMs;
         std::optional<std::int64_t> retentionBytes;
         std::optional<std::int64_t> maxSegmentBytes;
+
+        // Which is exactly why this one cannot share that encoding: false is a
+        // meaningful value, so "absent" and "explicitly not compacted" need to be
+        // different bytes. An int8 carrying -1, 0 or 1.
+        std::optional<bool> compact;
     };
 
     std::vector<Topic> topics;

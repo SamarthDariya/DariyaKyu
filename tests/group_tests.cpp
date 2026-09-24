@@ -792,3 +792,29 @@ TEST_CASE("A settled member that changes its subscription does rebalance") {
     CHECK(changed.error == ErrorCode::None);
     CHECK(changed.generation == first.generation + 1);
 }
+
+TEST_CASE("__offsets is created compacted, with retention disabled") {
+    TempDir            dir("offsets-compacted");
+    storage::LogManager logs(dir.file("data"), testConfig());
+    ensureOffsetsTopic(logs, 4);
+
+    const auto* log = logs.get(TopicPartition{kOffsetsTopic, 0});
+    REQUIRE(log != nullptr);
+
+    CHECK(log->config().compacted());
+
+    // Deleting by age from this topic would move a group's position backwards to
+    // whatever older commit survived — silently reprocessing, with nothing to
+    // report. So both limits are off, not merely generous.
+    CHECK(log->config().retention.retentionMs == numeric_limits<int64_t>::max());
+    CHECK_FALSE(log->config().retention.bytesLimited());
+}
+
+TEST_CASE("An ordinary topic is not compacted just because __offsets is") {
+    TempDir            dir("offsets-not-contagious");
+    storage::LogManager logs(dir.file("data"), testConfig());
+    ensureOffsetsTopic(logs, 4);
+
+    auto& orders = logs.createPartition(TopicPartition{"orders", 0});
+    CHECK(orders.config().cleanup == storage::CleanupPolicy::Delete);
+}

@@ -1,5 +1,7 @@
 #include "protocol/create_topic.hpp"
 
+#include "common/errors.hpp"
+
 #include <utility>
 
 #include "protocol/wire.hpp"
@@ -25,6 +27,19 @@ optional<int64_t> readOverride(BufferReader& in) {
     return value;
 }
 
+// A tri-state flag: absent, false, or true. See the header on why it cannot use
+// the -1 sentinel the numeric overrides share.
+void writeFlag(BufferWriter& out, const std::optional<bool>& flag) {
+    out.writeInt8(flag ? static_cast<std::int8_t>(*flag) : static_cast<std::int8_t>(-1));
+}
+
+std::optional<bool> readFlag(BufferReader& in) {
+    const std::int8_t value = in.readInt8();
+    if (value < 0) return std::nullopt;
+    if (value > 1) throw CorruptData("create topic: flag " + std::to_string(value));
+    return value == 1;
+}
+
 }  // namespace
 
 void encodeCreateTopicRequest(BufferWriter& out, const CreateTopicRequest& request) {
@@ -35,6 +50,7 @@ void encodeCreateTopicRequest(BufferWriter& out, const CreateTopicRequest& reque
         writeOverride(out, topic.retentionMs);
         writeOverride(out, topic.retentionBytes);
         writeOverride(out, topic.maxSegmentBytes);
+        writeFlag(out, topic.compact);
     }
     out.writeInt32(request.timeoutMs);
 }
@@ -52,6 +68,7 @@ CreateTopicRequest decodeCreateTopicRequest(BufferReader& in) {
         topic.retentionMs    = readOverride(in);
         topic.retentionBytes = readOverride(in);
         topic.maxSegmentBytes = readOverride(in);
+        topic.compact         = readFlag(in);
         request.topics.push_back(std::move(topic));
     }
 
