@@ -2003,3 +2003,85 @@ TEST_CASE("A batch whose CRC fails stops the scan") {
     // sealed segment that recovery has no reason to re-examine.
     CHECK(visited == 2);
 }
+
+// ===========================================================================
+// M6: what a rewrite keeps
+// ===========================================================================
+
+namespace {
+
+// One record, decoded, so the retain rules can be asked about it directly.
+vector<Record> recordsOf(const vector<uint8_t>& batch) {
+    return RecordBatch::decodeRecords(batch);
+}
+
+}  // namespace
+
+TEST_CASE("The newest record for a key is kept and the older ones are not") {
+    KeyOffsetMap map(100);
+    map.put(keyOf("alice"), Offset(40));
+
+    const auto batch   = makeKeyedBatch({{"alice", "v"}});
+    const auto records = recordsOf(batch);
+    const RetainRules rules{&map, 10'000, 1'000};
+
+    CHECK(retain(records.at(0), Offset(40), 0, rules));
+    CHECK_FALSE(retain(records.at(0), Offset(10), 0, rules));
+}
+
+TEST_CASE("An unkeyed record is kept, because nothing can replace it") {
+    KeyOffsetMap map(100);
+    const auto   batch   = makeUnstampedBatch(1000, 16);
+    const auto   records = recordsOf(batch);
+    REQUIRE_FALSE(records.at(0).key.has_value());
+
+    // Kafka treats this as a producer error on a compacted topic and discards it.
+    // Keeping it means a misconfigured producer gets a topic that does not fully
+    // compact, rather than one that silently swallows everything it writes.
+    CHECK(retain(records.at(0), Offset(1), 0, RetainRules{&map, 10'000, 1'000}));
+}
+
+TEST_CASE("A tombstone outlives its own application, then goes") {
+    KeyOffsetMap map(100);
+    map.put(keyOf("alice"), Offset(40));
+
+    const auto batch   = makeKeyedBatch({{"alice", nullopt}});
+    const auto records = recordsOf(batch);
+    REQUIRE(isTombstone(records.at(0)));
+
+    // Written at 5000, with a one-second horizon.
+    const int64_t writtenAt = 5'000;
+
+    // Still inside the window: a consumer that was behind has not necessarily
+    // seen the deletion yet, and dropping it now would leave that consumer
+    // serving a value the producer deleted.
+    CHECK(retain(records.at(0), Offset(40), writtenAt, RetainRules{&map, 5'500, 1'000}));
+
+    // Past it.
+    CHECK_FALSE(retain(records.at(0), Offset(40), writtenAt, RetainRules{&map, 6'500, 1'000}));
+}
+
+TEST_CASE("An empty value is a value, not a deletion") {
+    KeyOffsetMap map(100);
+    map.put(keyOf("alice"), Offset(40));
+
+    const auto batch   = makeKeyedBatch({{"alice", string{}}});
+    const auto records = recordsOf(batch);
+
+    // The distinction the codec keeps and a lesser one would collapse: an empty
+    // value means the key is still there and its value is zero bytes long.
+    CHECK_FALSE(isTombstone(records.at(0)));
+    CHECK(retain(records.at(0), Offset(40), 0, RetainRules{&map, 1'000'000, 1'000}));
+}
+
+TEST_CASE("A superseded tombstone goes immediately, horizon or not") {
+    KeyOffsetMap map(100);
+    map.put(keyOf("alice"), Offset(90));   // the key was written again afterwards
+
+    const auto batch   = makeKeyedBatch({{"alice", nullopt}});
+    const auto records = recordsOf(batch);
+
+    // The horizon protects a consumer's chance to SEE a deletion. A deletion that
+    // has itself been undone by a later write has nothing left to tell anyone.
+    CHECK_FALSE(retain(records.at(0), Offset(40), 5'000, RetainRules{&map, 5'100, 1'000}));
+}

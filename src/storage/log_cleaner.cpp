@@ -52,4 +52,20 @@ void scanSegment(const filesystem::path&                        logFile,
     }
 }
 
+bool retain(const Record& record, Offset offset, int64_t timestampMs,
+            const RetainRules& rules) {
+    // Unkeyed: nothing can replace it, so nothing decides against it.
+    if (!record.key) return true;
+
+    if (rules.map && !rules.map->isLatest(*record.key, offset)) return false;
+
+    if (!isTombstone(record)) return true;
+
+    // The newest record for this key, and it says the key is gone. Collecting it
+    // now would mean a consumer that was behind skips the deletion entirely and
+    // goes on serving a value that no longer exists — so it stays until every
+    // consumer has had the window to see it.
+    return rules.nowMs - timestampMs < rules.deleteRetentionMs;
+}
+
 }  // namespace dariyakyu::storage
