@@ -107,7 +107,7 @@ TEST_CASE("A client creates a topic, produces to it, and reads it back") {
     cli::Client client("127.0.0.1", broker.port());
 
     CreateTopicRequest create;
-    create.topics.push_back({"orders", 2, {}, {}, {}});
+    create.topics.push_back({"orders", 2, {}, {}, {}, {}});
     {
         const auto   response = client.call(ApiKey::CreateTopic,
                                             body(create, encodeCreateTopicRequest));
@@ -158,7 +158,7 @@ TEST_CASE("Records survive the broker being restarted") {
         cli::Client client("127.0.0.1", broker.port());
 
         CreateTopicRequest create;
-        create.topics.push_back({"orders", 1, {}, {}, {}});
+        create.topics.push_back({"orders", 1, {}, {}, {}, {}});
         client.call(ApiKey::CreateTopic, body(create, encodeCreateTopicRequest));
 
         for (int i = 0; i < 25; ++i) {

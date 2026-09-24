@@ -45,12 +45,21 @@ int32_t ensureOffsetsTopic(storage::LogManager& logs, int32_t partitions) {
         return existing;
     }
 
-    // Compacted by design, which is what keeps it bounded — once M6 can compact.
-    // Until then it grows, and the retention policy below deliberately does NOT
-    // delete from it: dropping an old commit would move a group's position
-    // backwards to whatever older commit survived.
-    storage::LogConfig config    = logs.defaults();
-    config.retention.retentionMs = numeric_limits<int64_t>::max();
+    // Compacted, which is the whole reason this topic has the shape it does.
+    //
+    // A group committing once a second writes 86,400 records a day for one key,
+    // and all but the last is garbage the moment the next one lands. Compaction
+    // keeps the newest value per key and keeps it forever, so the topic stays
+    // proportional to the number of (group, topic, partition) triples rather than
+    // to how often anybody commits.
+    //
+    // The retention policy is neutered rather than merely left alone. Deleting by
+    // age from this topic would move a group's position BACKWARDS to whatever
+    // older commit happened to survive, which is worse than losing it outright:
+    // the group would silently reprocess, and nothing would report an error.
+    storage::LogConfig config       = logs.defaults();
+    config.cleanup                  = storage::CleanupPolicy::Compact;
+    config.retention.retentionMs    = numeric_limits<int64_t>::max();
     config.retention.retentionBytes = nullopt;
 
     for (PartitionId p = 0; p < partitions; ++p)

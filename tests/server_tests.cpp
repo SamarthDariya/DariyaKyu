@@ -437,7 +437,7 @@ TEST_CASE("CreateTopic makes every partition it was asked for") {
     ServingBroker broker("handler-createtopic");
 
     CreateTopicRequest request;
-    request.topics.push_back({"orders", 4, {}, {}, {}});
+    request.topics.push_back({"orders", 4, {}, {}, {}, {}});
 
     const auto   body = broker.call(ApiKey::CreateTopic, encoded(request));
     BufferReader in(body);
@@ -477,7 +477,7 @@ TEST_CASE("Creating a topic that exists changes nothing") {
     ServingBroker broker("handler-createtopic-exists");
 
     CreateTopicRequest request;
-    request.topics.push_back({"orders", 2, {}, {}, {}});
+    request.topics.push_back({"orders", 2, {}, {}, {}, {}});
     broker.call(ApiKey::CreateTopic, encoded(request));
     REQUIRE(broker.logs.partitionCount() == 2);
 
@@ -485,7 +485,7 @@ TEST_CASE("Creating a topic that exists changes nothing") {
     // created — three of four would leave a topic that half exists, which no
     // error code describes and no client could act on.
     CreateTopicRequest again;
-    again.topics.push_back({"orders", 4, {}, {}, {}});
+    again.topics.push_back({"orders", 4, {}, {}, {}, {}});
     const auto   body = broker.call(ApiKey::CreateTopic, encoded(again));
     BufferReader in(body);
     const auto   response = decodeCreateTopicResponse(in);
@@ -498,10 +498,10 @@ TEST_CASE("A topic name that cannot be a directory name is refused") {
     ServingBroker broker("handler-createtopic-bad-name");
 
     CreateTopicRequest request;
-    request.topics.push_back({"../escape", 1, {}, {}, {}});
-    request.topics.push_back({"has space", 1, {}, {}, {}});
-    request.topics.push_back({"", 1, {}, {}, {}});
-    request.topics.push_back({"orders", 0, {}, {}, {}});   // no partitions
+    request.topics.push_back({"../escape", 1, {}, {}, {}, {}});
+    request.topics.push_back({"has space", 1, {}, {}, {}, {}});
+    request.topics.push_back({"", 1, {}, {}, {}, {}});
+    request.topics.push_back({"orders", 0, {}, {}, {}, {}});   // no partitions
 
     const auto   body = broker.call(ApiKey::CreateTopic, encoded(request));
     BufferReader in(body);
