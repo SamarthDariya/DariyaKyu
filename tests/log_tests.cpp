@@ -6,6 +6,7 @@
 #include <type_traits>
 
 #include "storage/key_offset_map.hpp"
+#include "storage/log_cleaner.hpp"
 #include "test_support.hpp"
 
 using namespace std;
@@ -1914,4 +1915,91 @@ TEST_CASE("An empty key is a key, and is not the same as any other") {
     // with no key cannot be compacted by key and is handled by the caller.
     CHECK(map.get(keyOf("")) == Offset(5));
     CHECK(map.get(keyOf("a")) == Offset(6));
+}
+
+// ===========================================================================
+// M6: scanning a segment
+// ===========================================================================
+
+TEST_CASE("Scanning a segment visits every batch in order") {
+    TempDir dir("scan-segment");
+    const filesystem::path partition = dir.file("orders-0");
+
+    LogConfig config = testConfig();
+    config.cleanup   = CleanupPolicy::Compact;
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+
+    for (int i = 0; i < 5; ++i) {
+        auto bytes = makeKeyedBatch({{"user-" + to_string(i), "value " + to_string(i)}});
+        log->append(bytes);
+    }
+
+    vector<Offset> seen;
+    vector<string> keys;
+    scanSegment(segmentLogPath(partition, Offset(0)), [&](const ScannedBatch& batch) {
+        seen.push_back(batch.header.baseOffset);
+        for (const auto& record : RecordBatch::decodeRecords(batch.bytes))
+            keys.push_back(keyText(record));
+    });
+
+    CHECK(seen == vector<Offset>{Offset(0), Offset(1), Offset(2), Offset(3), Offset(4)});
+    CHECK(keys == vector<string>{"user-0", "user-1", "user-2", "user-3", "user-4"});
+}
+
+TEST_CASE("A torn tail ends the scan rather than failing it") {
+    TempDir dir("scan-torn");
+    const filesystem::path partition = dir.file("orders-0");
+
+    LogConfig config = testConfig();
+    config.cleanup   = CleanupPolicy::Compact;
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+    for (int i = 0; i < 4; ++i) {
+        auto bytes = makeKeyedBatch({{"k" + to_string(i), "v"}});
+        log->append(bytes);
+    }
+    const auto logFile = segmentLogPath(partition, Offset(0));
+    const auto whole   = filesystem::file_size(logFile);
+    log.reset();
+
+    // Chop a few bytes off the end, which is what a crash mid-append leaves.
+    filesystem::resize_file(logFile, whole - 8);
+
+    int visited = 0;
+    scanSegment(logFile, [&](const ScannedBatch&) { ++visited; });
+
+    // Everything before the tear is complete and worth compacting. Throwing here
+    // would make the cleaner permanently unable to touch this partition — the one
+    // outcome worse than leaving the tail alone.
+    CHECK(visited == 3);
+}
+
+TEST_CASE("A batch whose CRC fails stops the scan") {
+    TempDir dir("scan-corrupt");
+    const filesystem::path partition = dir.file("orders-0");
+
+    LogConfig config = testConfig();
+    config.cleanup   = CleanupPolicy::Compact;
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+    for (int i = 0; i < 4; ++i) {
+        auto bytes = makeKeyedBatch({{"k" + to_string(i), "v"}});
+        log->append(bytes);
+    }
+    const auto logFile = segmentLogPath(partition, Offset(0));
+
+    // Find where the third batch starts, then flip a byte inside it.
+    vector<uint64_t> positions;
+    scanSegment(logFile, [&](const ScannedBatch& batch) { positions.push_back(batch.position); });
+    REQUIRE(positions.size() == 4);
+    log.reset();
+
+    auto bytes = readFile(logFile);
+    bytes[positions[2] + kBatchHeaderSize + 2] ^= 0xFF;
+    writeFile(logFile, bytes);
+
+    int visited = 0;
+    scanSegment(logFile, [&](const ScannedBatch&) { ++visited; });
+
+    // Rewriting a corrupt batch would launder the corruption into a freshly
+    // sealed segment that recovery has no reason to re-examine.
+    CHECK(visited == 2);
 }
