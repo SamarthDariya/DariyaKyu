@@ -36,6 +36,8 @@ namespace dariyakyu::storage {
 //   retentionMs          int64
 //   retentionBytes       int64    -1 for unlimited
 //   segmentDeleteDelayMs int64
+//   cleanupPolicy        int8     v2+, 0 delete / 1 compact
+//   deleteRetentionMs    int64    v2+
 //
 // Binary rather than text because it is broker state, not user configuration,
 // and it reuses the codec that already exists. `dariyakyu-dump` is the intended
@@ -50,7 +52,19 @@ namespace dariyakyu::storage {
 // optional so that "unlimited" and "keep almost nothing" cannot be confused in
 // memory; the translation happens here, at the file boundary, and nowhere else.
 struct PartitionMeta {
-    static constexpr std::int16_t kVersion  = 1;
+    // Written at kVersion; read at kVersion or anything OLDER this build still
+    // understands. The two directions are not symmetric and must not be:
+    //
+    //   older file  -> read it. A v1 file was written before compaction existed,
+    //                  so it describes a Delete topic and the missing fields take
+    //                  their defaults. Refusing it would mean every partition on
+    //                  disk becomes unreadable the day a field is added.
+    //   newer file  -> refuse. A field order or a meaning may have changed, and a
+    //                  config read wrongly is worse than one not read at all —
+    //                  misreading a retention limit silently deletes data or
+    //                  silently keeps it forever.
+    static constexpr std::int16_t kVersion        = 2;
+    static constexpr std::int16_t kOldestReadable = 1;
     static constexpr std::uint32_t kMagic   = 0x444B504D;   // "DKPM"
     static constexpr const char*  kFileName = "partition.meta";
 

@@ -12,6 +12,14 @@ using namespace std;
 
 namespace dariyakyu::storage {
 
+const char* describe(CleanupPolicy policy) {
+    switch (policy) {
+        case CleanupPolicy::Delete:  return "delete";
+        case CleanupPolicy::Compact: return "compact";
+    }
+    return "unknown";
+}
+
 namespace {
 
 // Which configuration a reopened partition should run with.

@@ -102,12 +102,43 @@ struct RetentionPolicy {
     bool bytesLimited() const { return retentionBytes.has_value(); }
 };
 
+// What a partition does with records it no longer needs to keep.
+//
+// The two are ALTERNATIVES, not a pair, and that is worth being explicit about.
+// Delete is decision 4's retention: old records go, whatever they contain.
+// Compact keeps the newest record for every key and keeps it forever. Applying an
+// age limit to a compacted topic would quietly undo the one promise it makes —
+// that a key you wrote is still readable — so a topic picks one.
+enum class CleanupPolicy : std::int8_t {
+    Delete  = 0,
+    Compact = 1,
+};
+
+const char* describe(CleanupPolicy policy);
+
+// The rules for a compacted topic.
+struct CompactionPolicy {
+    // How long a tombstone survives after the pass that could first have removed
+    // it.
+    //
+    // A tombstone is a record with a null value, meaning "this key is gone".
+    // Collecting it the moment it has been applied would mean a consumer that was
+    // behind skips over the deletion entirely and goes on serving a value that no
+    // longer exists. This window is the promise made to that consumer, and it is
+    // the only part of compaction measured in time rather than in keys.
+    std::int64_t deleteRetentionMs = 24ll * 60 * 60 * 1000;   // 1 day, as Kafka defaults
+};
+
 // Everything a partition needs to know about itself. Written to partition.meta so
 // a broker that boots while the controller is down still opens its logs with the
 // right rules rather than with whatever the defaults happen to be.
 struct LogConfig {
-    RollPolicy      roll;
-    RetentionPolicy retention;
+    RollPolicy       roll;
+    RetentionPolicy  retention;
+    CompactionPolicy compaction;
+    CleanupPolicy    cleanup = CleanupPolicy::Delete;
+
+    bool compacted() const { return cleanup == CleanupPolicy::Compact; }
 };
 
 // One partition's log: a directory of segments, and the rules for moving between
