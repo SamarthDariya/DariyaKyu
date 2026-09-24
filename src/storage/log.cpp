@@ -477,6 +477,17 @@ bool Log::replaceSegment(Offset baseOffset, const filesystem::path& cleanedLog,
     return true;
 }
 
+bool Log::removeSegment(Offset baseOffset, int64_t nowMs) {
+    unique_lock lock(segmentsMutex_);
+
+    const auto found = sealed_.find(baseOffset);
+    if (found == sealed_.end()) return false;
+
+    burySegmentLocked(std::move(found->second), nowMs);
+    sealed_.erase(found);
+    return true;
+}
+
 void Log::sweepGraveyard(int64_t nowMs) {
     unique_lock lock(segmentsMutex_);
 

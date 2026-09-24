@@ -915,6 +915,21 @@ The key map is built over **every** dirty segment before any of them is rewritte
 in segment 1 and again in segment 5 has to lose its copy in segment 1, which a segment-at-a-time
 map would never notice.
 
+**Two consequences that surprise people, and neither is a defect.**
+
+*Compaction is eventual.* The dirty range ends at the active segment, which is not cleaned and is
+not even mapped. So a key whose newest write is still in the active segment keeps its older copy
+until that segment seals. A compacted topic is the current value of every key **eventually**, not
+on the next pass.
+
+*An emptied leading segment moves the log start up.* If every record in the oldest segment loses,
+the segment goes, and `logStartOffset` advances with it — a consumer below the new start gets
+`BelowLogStart` and resets, exactly as it would after retention. This is the one promise
+compaction cannot keep: it preserves the offsets of records it KEEPS, and says nothing about the
+offsets of records it deletes. A consumer that was inside the deleted range was reading data that
+a newer write had already replaced, so what it lost was stale by construction — but it does have
+to reset to learn that.
+
 **The cleaner gets its own thread**, as the thread inventory above already promised. A pass
 rewrites files and can run long; sharing the maintenance sweeper's thread would stall retention
 behind compaction, which is the one form of cleanup that has a deadline.
