@@ -2085,3 +2085,183 @@ TEST_CASE("A superseded tombstone goes immediately, horizon or not") {
     // has itself been undone by a later write has nothing left to tell anyone.
     CHECK_FALSE(retain(records.at(0), Offset(40), 5'000, RetainRules{&map, 5'100, 1'000}));
 }
+
+// ===========================================================================
+// M6: rewriting a segment
+// ===========================================================================
+
+namespace {
+
+// A compacted partition holding one batch per call, so segment layout is
+// predictable. Returns the log, still open.
+unique_ptr<Log> keyedLog(const filesystem::path& partition,
+                         const vector<vector<pair<string, optional<string>>>>& batches,
+                         int64_t timestamp = 1000) {
+    LogConfig config = testConfig();
+    config.cleanup   = CleanupPolicy::Compact;
+
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+    for (const auto& batch : batches) {
+        auto bytes = makeKeyedBatch(batch, timestamp);
+        log->append(bytes);
+    }
+    return log;
+}
+
+// Every (offset, key, value) a segment file actually holds, read back from disk.
+struct OnDisk {
+    Offset offset{0};
+    string key;
+    string value;
+    bool   tombstone = false;
+};
+
+vector<OnDisk> contentsOf(const filesystem::path& logFile) {
+    vector<OnDisk> found;
+    scanSegment(logFile, [&](const ScannedBatch& batch) {
+        for (const auto& record : RecordBatch::decodeRecords(batch.bytes))
+            found.push_back({record.offsetFrom(batch.header.baseOffset), keyText(record),
+                             valueText(record), isTombstone(record)});
+    });
+    return found;
+}
+
+KeyOffsetMap mapOver(const filesystem::path& logFile) {
+    KeyOffsetMap map(10'000);
+    scanSegment(logFile, [&](const ScannedBatch& batch) {
+        for (const auto& record : RecordBatch::decodeRecords(batch.bytes))
+            if (record.key) map.put(*record.key, record.offsetFrom(batch.header.baseOffset));
+    });
+    return map;
+}
+
+}  // namespace
+
+TEST_CASE("A rewrite keeps the newest record per key, at its original offset") {
+    TempDir dir("rewrite-basic");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto log = keyedLog(partition, {
+        {{"a", "a1"}},
+        {{"b", "b1"}},
+        {{"a", "a2"}},
+        {{"c", "c1"}},
+        {{"b", "b2"}},
+    });
+    const auto logFile = segmentLogPath(partition, Offset(0));
+    log.reset();
+
+    const auto map = mapOver(logFile);
+    const auto cleaned = rewriteSegment(logFile, Offset(0), testPolicy(),
+                                        RetainRules{&map, 1'000'000, 1'000});
+
+    CHECK(cleaned.recordsKept == 3);
+    CHECK(cleaned.recordsDropped == 2);
+
+    const auto contents = contentsOf(cleaned.logFile);
+    REQUIRE(contents.size() == 3);
+
+    // Offsets are PRESERVED, not renumbered. a2 was written third, so it keeps
+    // offset 2 — a consumer holding it must still find it there.
+    CHECK(contents[0].offset == Offset(2));
+    CHECK(contents[0].key == "a");
+    CHECK(contents[0].value == "a2");
+    CHECK(contents[1].offset == Offset(3));
+    CHECK(contents[1].key == "c");
+    CHECK(contents[2].offset == Offset(4));
+    CHECK(contents[2].value == "b2");
+}
+
+TEST_CASE("A batch that loses its middle record keeps the holes") {
+    TempDir dir("rewrite-holes");
+    const filesystem::path partition = dir.file("orders-0");
+
+    // One batch, four records. Two of them are superseded by later ones in the
+    // SAME batch, so the survivors sit at offsets 2 and 3 of a batch based at 0.
+    auto log = keyedLog(partition, {{{"a", "a1"}, {"b", "b1"}, {"a", "a2"}, {"b", "b2"}}});
+    const auto logFile = segmentLogPath(partition, Offset(0));
+    log.reset();
+
+    const auto map     = mapOver(logFile);
+    const auto cleaned = rewriteSegment(logFile, Offset(0), testPolicy(),
+                                        RetainRules{&map, 1'000'000, 1'000});
+
+    const auto contents = contentsOf(cleaned.logFile);
+    REQUIRE(contents.size() == 2);
+    CHECK(contents[0].offset == Offset(2));
+    CHECK(contents[1].offset == Offset(3));
+}
+
+TEST_CASE("A batch that loses every record is not written at all") {
+    TempDir dir("rewrite-empty-batch");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto log = keyedLog(partition, {{{"a", "a1"}}, {{"a", "a2"}}});
+    const auto logFile = segmentLogPath(partition, Offset(0));
+    log.reset();
+
+    const auto map     = mapOver(logFile);
+    const auto cleaned = rewriteSegment(logFile, Offset(0), testPolicy(),
+                                        RetainRules{&map, 1'000'000, 1'000});
+
+    const auto contents = contentsOf(cleaned.logFile);
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0].offset == Offset(1));
+
+    // An empty batch is a 61-byte header with nothing under it. The encoder
+    // refuses to build one, and writing it would be 61 bytes that decode to
+    // nothing on every future read.
+    CHECK(cleaned.recordsKept == 1);
+}
+
+TEST_CASE("A tombstone past its horizon takes the key with it") {
+    TempDir dir("rewrite-tombstone");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto log = keyedLog(partition, {{{"a", "a1"}}, {{"b", "b1"}}, {{"a", nullopt}}}, 5'000);
+    const auto logFile = segmentLogPath(partition, Offset(0));
+    log.reset();
+
+    const auto map = mapOver(logFile);
+
+    SUBCASE("inside the horizon the tombstone stays") {
+        const auto cleaned = rewriteSegment(logFile, Offset(0), testPolicy(),
+                                            RetainRules{&map, 5'500, 1'000});
+        const auto contents = contentsOf(cleaned.logFile);
+        REQUIRE(contents.size() == 2);
+        CHECK(contents[1].key == "a");
+        CHECK(contents[1].tombstone);
+    }
+
+    SUBCASE("past it, the key is gone entirely") {
+        const auto cleaned = rewriteSegment(logFile, Offset(0), testPolicy(),
+                                            RetainRules{&map, 9'000, 1'000});
+        const auto contents = contentsOf(cleaned.logFile);
+        REQUIRE(contents.size() == 1);
+        CHECK(contents[0].key == "b");
+    }
+}
+
+TEST_CASE("A cleaned segment opens as a sealed segment and reads back") {
+    TempDir dir("rewrite-openable");
+    const filesystem::path partition = dir.file("orders-0");
+
+    auto log = keyedLog(partition, {{{"a", "a1"}}, {{"b", "b1"}}, {{"a", "a2"}}});
+    const auto logFile = segmentLogPath(partition, Offset(0));
+    log.reset();
+
+    const auto map     = mapOver(logFile);
+    const auto cleaned = rewriteSegment(logFile, Offset(0), testPolicy(),
+                                        RetainRules{&map, 1'000'000, 1'000});
+
+    // Renamed into place by hand, which is what replaceSegment does under the
+    // lock. What is being checked here is that the bytes and the index the
+    // rewrite produced are a segment at all.
+    filesystem::rename(cleaned.logFile, logFile);
+    filesystem::rename(cleaned.indexFile, segmentIndexPath(partition, Offset(0)));
+
+    auto segment = SealedSegment::open(logFile);
+    CHECK(segment->baseOffset() == Offset(0));
+    CHECK(segment->nextOffset() == Offset(3));
+    CHECK_FALSE(segment->read(Offset(1), kBigFetch).empty());
+}
