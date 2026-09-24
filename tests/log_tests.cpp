@@ -5,6 +5,7 @@
 #include <thread>
 #include <type_traits>
 
+#include "storage/key_offset_map.hpp"
 #include "test_support.hpp"
 
 using namespace std;
@@ -1815,4 +1816,102 @@ TEST_CASE("Replacing a segment retention already deleted is refused, not resurre
     // The refused work is cleaned up rather than left to accumulate.
     CHECK_FALSE(filesystem::exists(cleanedLog));
     CHECK_FALSE(filesystem::exists(cleanedIndex));
+}
+
+// ===========================================================================
+// M6: the key map
+// ===========================================================================
+
+namespace {
+
+span<const uint8_t> keyOf(const string& text) {
+    return {reinterpret_cast<const uint8_t*>(text.data()), text.size()};
+}
+
+}  // namespace
+
+TEST_CASE("The key map remembers the newest offset for a key") {
+    KeyOffsetMap map(100);
+
+    CHECK(map.put(keyOf("alice"), Offset(10)));
+    CHECK(map.put(keyOf("bob"), Offset(11)));
+    CHECK(map.put(keyOf("alice"), Offset(40)));
+
+    CHECK(map.get(keyOf("alice")) == Offset(40));
+    CHECK(map.get(keyOf("bob")) == Offset(11));
+    CHECK_FALSE(map.get(keyOf("carol")).has_value());
+    CHECK(map.size() == 2);
+}
+
+TEST_CASE("An out-of-order put never moves a key backwards") {
+    KeyOffsetMap map(100);
+    map.put(keyOf("alice"), Offset(40));
+    map.put(keyOf("alice"), Offset(10));
+
+    // Segments are mapped oldest first so this should not arise — but if it did,
+    // taking the lower offset would make the rewrite keep the older record and
+    // delete the newer one, which is the one failure compaction must not have.
+    CHECK(map.get(keyOf("alice")) == Offset(40));
+}
+
+TEST_CASE("isLatest answers the retain question, and retains what it never saw") {
+    KeyOffsetMap map(100);
+    map.put(keyOf("alice"), Offset(40));
+
+    CHECK(map.isLatest(keyOf("alice"), Offset(40)));
+    CHECK_FALSE(map.isLatest(keyOf("alice"), Offset(10)));
+
+    // Never mapped, so this pass knows nothing about the key. Retaining is the
+    // direction that cannot lose data.
+    CHECK(map.isLatest(keyOf("carol"), Offset(1)));
+}
+
+TEST_CASE("A full map takes no new keys but still updates the ones it holds") {
+    KeyOffsetMap map(2);
+
+    CHECK(map.put(keyOf("alice"), Offset(1)));
+    CHECK(map.put(keyOf("bob"), Offset(2)));
+    CHECK(map.full());
+
+    // A new key is refused, and that is a normal outcome — the caller stops
+    // mapping and cleans the range it managed to cover.
+    CHECK_FALSE(map.put(keyOf("carol"), Offset(3)));
+    CHECK(map.size() == 2);
+
+    // But a key already here is updated regardless. Refusing would leave a stale
+    // lower offset, and the rewrite would delete the newer record.
+    CHECK(map.put(keyOf("alice"), Offset(9)));
+    CHECK(map.get(keyOf("alice")) == Offset(9));
+}
+
+TEST_CASE("Distinct keys get distinct digests across a large sample") {
+    // A collision makes two keys look like one and the newer deletes the older's
+    // record, so this is worth a real sample rather than a handful of strings.
+    KeyOffsetMap map(200'000);
+
+    constexpr int kKeys = 100'000;
+    int           refused = 0;
+    for (int i = 0; i < kKeys; ++i)
+        if (!map.put(keyOf("user-" + to_string(i)), Offset(i))) ++refused;
+    CHECK(refused == 0);
+
+    // The map holding every key is itself the collision test: two keys landing on
+    // one digest would show up here as a smaller size.
+    CHECK(map.size() == kKeys);
+
+    int wrong = 0;
+    for (int i = 0; i < kKeys; ++i)
+        if (map.get(keyOf("user-" + to_string(i))) != Offset(i)) ++wrong;
+    CHECK(wrong == 0);
+}
+
+TEST_CASE("An empty key is a key, and is not the same as any other") {
+    KeyOffsetMap map(10);
+    map.put(keyOf(""), Offset(5));
+    map.put(keyOf("a"), Offset(6));
+
+    // Distinct from a null key, which never reaches this map at all — a record
+    // with no key cannot be compacted by key and is handled by the caller.
+    CHECK(map.get(keyOf("")) == Offset(5));
+    CHECK(map.get(keyOf("a")) == Offset(6));
 }
