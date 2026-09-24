@@ -62,6 +62,7 @@ add_library(dariyakyu_storage
   src/storage/offset_index.cpp
   src/storage/segment.cpp
   src/storage/key_offset_map.cpp
+  src/storage/log_cleaner.cpp
   src/storage/log.cpp
   src/storage/partition_meta.cpp
   src/storage/log_manager.cpp
