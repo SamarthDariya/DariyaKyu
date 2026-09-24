@@ -287,6 +287,41 @@ public:
     // Frees segments whose deletion delay has elapsed. Also called by the sweep.
     void sweepGraveyard(std::int64_t nowMs);
 
+    // One sealed segment, as the cleaner needs to see it.
+    struct SealedInfo {
+        Offset                baseOffset{0};
+        Offset                nextOffset{0};
+        std::filesystem::path logFile;
+        std::uint64_t         sizeBytes = 0;
+    };
+
+    // Every sealed segment, oldest first. A SNAPSHOT of names and numbers, never
+    // pointers.
+    //
+    // That is the whole reason this exists rather than the cleaner borrowing the
+    // segments: the cleaner works for a long time, outside the lock, and a
+    // SealedSegment* it held could be deleted by retention underneath it. Paths
+    // cannot dangle. The cleaner opens its own descriptors, and if retention
+    // unlinks a file while it reads, its descriptor keeps the old inode alive and
+    // its answer is simply discarded by replaceSegment below.
+    std::vector<SealedInfo> sealedSegments() const;
+
+    // Swaps a freshly cleaned segment in for the one based at `baseOffset`.
+    //
+    // The two `.cleaned` files are renamed over the originals under the exclusive
+    // lock, which is what makes the swap atomic from a reader's point of view:
+    // either it sees the old segment or the new one, and both are complete logs.
+    // Because compaction does not change a segment's base offset, the filename
+    // does not change either — so the swap is two renames and the map keeps its
+    // key.
+    //
+    // Returns false, and deletes the cleaned files, if that segment is no longer
+    // here. Retention may have deleted it while the cleaner was working, and
+    // renaming into place would then resurrect a segment the log has already
+    // forgotten.
+    bool replaceSegment(Offset baseOffset, const std::filesystem::path& cleanedLog,
+                        const std::filesystem::path& cleanedIndex, std::int64_t nowMs);
+
     // How many deleted-but-not-yet-freed segments are being held.
     std::size_t graveyardSize() const;
 

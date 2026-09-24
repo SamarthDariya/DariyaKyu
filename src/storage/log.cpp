@@ -436,6 +436,47 @@ void Log::burySegmentLocked(unique_ptr<SealedSegment> segment, int64_t nowMs) {
     graveyard_.push_back({std::move(segment), nowMs});
 }
 
+vector<Log::SealedInfo> Log::sealedSegments() const {
+    shared_lock lock(segmentsMutex_);
+
+    vector<SealedInfo> info;
+    info.reserve(sealed_.size());
+    for (const auto& [base, segment] : sealed_)
+        info.push_back({base, segment->nextOffset(), segment->logFilePath(),
+                        segment->sizeBytes()});
+    return info;
+}
+
+bool Log::replaceSegment(Offset baseOffset, const filesystem::path& cleanedLog,
+                         const filesystem::path& cleanedIndex, int64_t nowMs) {
+    unique_lock lock(segmentsMutex_);
+
+    const auto found = sealed_.find(baseOffset);
+    if (found == sealed_.end()) {
+        error_code ec;
+        filesystem::remove(cleanedLog, ec);
+        filesystem::remove(cleanedIndex, ec);
+        return false;
+    }
+
+    error_code ec;
+    filesystem::rename(cleanedLog, segmentLogPath(dir_, baseOffset), ec);
+    if (ec) throw IoError("rename", cleanedLog, ec.value());
+    filesystem::rename(cleanedIndex, segmentIndexPath(dir_, baseOffset), ec);
+    if (ec) throw IoError("rename", cleanedIndex, ec.value());
+
+    auto replacement = SealedSegment::open(segmentLogPath(dir_, baseOffset));
+
+    // Buried WITHOUT unlinking, which is the one difference from retention's
+    // path: the rename above already replaced those files, so unlinkFiles here
+    // would delete the segment that just took their place. What the graveyard is
+    // still needed for is the descriptor — a FileRange handed out a moment ago
+    // names the old inode, and closing it now would fail a send in flight.
+    graveyard_.push_back({std::move(found->second), nowMs});
+    found->second = std::move(replacement);
+    return true;
+}
+
 void Log::sweepGraveyard(int64_t nowMs) {
     unique_lock lock(segmentsMutex_);
 

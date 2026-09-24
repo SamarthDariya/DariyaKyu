@@ -376,7 +376,7 @@ TEST_CASE("A CreateTopic request round-trips with and without overrides") {
 
 TEST_CASE("A nonsensical override is read as no override at all") {
     CreateTopicRequest request;
-    request.topics.push_back({"orders", 1, {}, {}, {}});
+    request.topics.push_back({"orders", 1, {}, {}, {}, {}});
 
     BufferWriter out;
     encodeCreateTopicRequest(out, request);
@@ -425,7 +425,7 @@ TEST_CASE("An empty CreateTopic request round-trips") {
 
 TEST_CASE("A truncated CreateTopic request is refused at every length") {
     CreateTopicRequest request;
-    request.topics.push_back({"orders", 2, 1000, 2000, 3000});
+    request.topics.push_back({"orders", 2, 1000, 2000, 3000, true});
 
     BufferWriter out;
     encodeCreateTopicRequest(out, request);
@@ -1042,4 +1042,24 @@ TEST_CASE("Every group request is refused at every truncation") {
         BufferReader          in(partial);
         CHECK_THROWS_AS(decodeJoinGroupRequest(in), CorruptData);
     }
+}
+
+TEST_CASE("The compact flag survives the wire in all three states") {
+    CreateTopicRequest request;
+    request.topics.push_back({"absent", 1, {}, {}, {}, {}});
+    request.topics.push_back({"off", 1, {}, {}, {}, false});
+    request.topics.push_back({"on", 1, {}, {}, {}, true});
+
+    BufferWriter out;
+    encodeCreateTopicRequest(out, request);
+    const auto   bytes = out.take();
+    BufferReader in(bytes);
+    const auto   decoded = decodeCreateTopicRequest(in);
+
+    // Three states, not two. "Absent" has to stay distinguishable from
+    // "explicitly not compacted", or a client that never mentioned the flag would
+    // pin every topic it creates to whatever this build's default happens to be.
+    CHECK_FALSE(decoded.topics.at(0).compact.has_value());
+    CHECK(decoded.topics.at(1).compact == false);
+    CHECK(decoded.topics.at(2).compact == true);
 }

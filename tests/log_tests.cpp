@@ -1738,3 +1738,81 @@ TEST_CASE("An unrecognised cleanup policy is corruption, not a default") {
 
     CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
 }
+
+// ===========================================================================
+// M6: swapping a cleaned segment in
+// ===========================================================================
+
+namespace {
+
+// Builds a compacted log with several sealed segments, and returns it.
+unique_ptr<Log> compactedLogWithSegments(const filesystem::path& partition, int records) {
+    auto policy            = testPolicy();
+    policy.maxSegmentBytes = 400;
+
+    LogConfig config = configWith(policy);
+    config.cleanup   = CleanupPolicy::Compact;
+
+    auto log = Log::create(TopicPartition{"orders", 0}, partition, config);
+    for (int i = 0; i < records; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log->append(bytes);
+    }
+    return log;
+}
+
+}  // namespace
+
+TEST_CASE("Replacing a segment swaps it and buries the old one unlinked") {
+    TempDir dir("log-replace");
+    const filesystem::path partition = dir.file("orders-0");
+    auto log = compactedLogWithSegments(partition, 40);
+    REQUIRE(log->segmentCount() > 2);
+
+    const auto sealed = log->sealedSegments();
+    REQUIRE(!sealed.empty());
+    const auto victim = sealed.front();
+
+    // Stand in for the cleaner: copy the segment's own files to .cleaned names,
+    // so the swap is exercised without needing a cleaner that does not exist yet.
+    const auto cleanedLog   = partition / "cleaned.log";
+    const auto cleanedIndex = partition / "cleaned.index";
+    filesystem::copy_file(victim.logFile, cleanedLog);
+    filesystem::copy_file(segmentIndexPath(partition, victim.baseOffset), cleanedIndex);
+
+    const size_t before = log->graveyardSize();
+    CHECK(log->replaceSegment(victim.baseOffset, cleanedLog, cleanedIndex, 1000));
+
+    // The map keeps its key, because compaction does not change a base offset.
+    CHECK(log->segmentCount() == sealed.size() + 1);
+    CHECK(log->sealedSegments().front().baseOffset == victim.baseOffset);
+
+    // The old segment is held, not freed — a FileRange handed out a moment ago
+    // names its descriptor.
+    CHECK(log->graveyardSize() == before + 1);
+
+    // And its files are still there, because the rename replaced them. Burying
+    // with an unlink here would have deleted the segment that just arrived.
+    CHECK(filesystem::exists(victim.logFile));
+    CHECK(log->read(victim.baseOffset, kBigFetch).ok());
+}
+
+TEST_CASE("Replacing a segment retention already deleted is refused, not resurrected") {
+    TempDir dir("log-replace-gone");
+    const filesystem::path partition = dir.file("orders-0");
+    auto log = compactedLogWithSegments(partition, 40);
+
+    const auto cleanedLog   = partition / "cleaned.log";
+    const auto cleanedIndex = partition / "cleaned.index";
+    { FileHandle handle(cleanedLog, FileHandle::Mode::ReadWrite); }
+    { FileHandle handle(cleanedIndex, FileHandle::Mode::ReadWrite); }
+
+    // A base offset no segment has. The cleaner works outside the lock for a long
+    // time, so by the time it finishes its segment may be gone — and renaming into
+    // place would resurrect a segment the log has already forgotten.
+    CHECK_FALSE(log->replaceSegment(Offset(999'999), cleanedLog, cleanedIndex, 1000));
+
+    // The refused work is cleaned up rather than left to accumulate.
+    CHECK_FALSE(filesystem::exists(cleanedLog));
+    CHECK_FALSE(filesystem::exists(cleanedIndex));
+}
