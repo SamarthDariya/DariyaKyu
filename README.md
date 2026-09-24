@@ -30,13 +30,13 @@ The design is written up in full, with the reasoning and the rejected alternativ
 ## Status
 
 **Design: complete.** 23 conceptual decisions locked, structural design in progress.
-**Implementation: M5 — a broker with consumer groups.**
+**Implementation: M6 — a broker with log compaction.**
 
 | Phase | Status |
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
 | Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 5 of 6 chunks; chunks 1–2 amended in place by M2–M3 |
-| Implementation — M0…M9 | 🔸 M0–M5 complete, M6 next |
+| Implementation — M0…M9 | 🔸 M0–M6 complete, M7 next |
 
 ---
 
@@ -102,7 +102,7 @@ is merged by PR.
 - [x] `sendfile` on the read path — a response is a list of buffer and file segments
 - [x] `dariyakyu-cli` — create, produce, consume, describe, dump-segment
 - [x] **produce and consume from a terminal**
-- [x] suite green locally — 519 cases, 6996 assertions
+- [x] suite green locally — 568 cases, 10375 assertions
 - [x] green under ASan/UBSan and TSan
 
 ### M5 — Consumer groups ✅
@@ -115,10 +115,15 @@ is merged by PR.
 - [x] eager rebalance on join, leave, and heartbeat expiry
 - [x] `dariyakyu-cli consume --group` — **two consumers split a topic; one leaves, the other takes over**
 
-### M6 — Compaction ⬜
-- [ ] `LogCleaner` — key → latest offset map
-- [ ] segment rewrite and atomic swap
-- [ ] tombstones (null value) and their deletion horizon
+### M6 — Compaction ✅
+- [x] `CleanupPolicy{Delete, Compact}`, through `partition.meta` v2 (which still reads v1)
+- [x] `KeyOffsetMap` — 128-bit digests, an explicit entry budget
+- [x] segment rewrite preserving absolute offsets, and an atomic swap by rename
+- [x] tombstones (null value) and their deletion horizon
+- [x] gaps legal on a compacted log, overlap still refused
+- [x] `LogCleaner` on its own thread — dirty ratio, dirtiest-first
+- [x] `dariyakyu-cli create --compact`; `dariyakyu-dump` shows holes and tombstones
+- [x] **100 keys × 30 updates collapse to ~1 record per key, every key still readable**
 - [ ] `cleanup.policy = delete | compact`
 - [ ] `__offsets` stays bounded under sustained commits
 

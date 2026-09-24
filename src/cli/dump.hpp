@@ -18,7 +18,10 @@ void inspectPartition(const std::filesystem::path& dir);
 
 // Writes a partition full of records, for looking at. Destroys whatever was
 // there.
+// `compact` writes the partition as a compacted topic, runs one cleaner pass over
+// it, and leaves the result — so the dump below shows real holes and a real
+// tombstone rather than a description of them.
 void generatePartition(const std::filesystem::path& dir, int records,
-                       std::uint64_t segmentBytes);
+                       std::uint64_t segmentBytes, bool compact = false);
 
 }  // namespace dariyakyu::cli
