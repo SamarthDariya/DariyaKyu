@@ -1730,3 +1730,263 @@ heartbeats exist at all rather than the coordinator simply timing members out.
 - **Sticky assignment** — a client-side strategy, so it needs no broker change,
   which is the whole argument for decision 22.
 - **`DescribeGroups` / `ListGroups`** — operational, not on the path to consuming.
+
+---
+
+### 6. Replication, failover, and the cluster
+
+The last chunk, and the one that changes what every earlier chunk means. Until now a partition
+has had exactly one copy and exactly one broker; from here it has three copies, one of which is
+authoritative, and the interesting questions are all about what happens when that stops being
+true.
+
+Split across two milestones, because they fail differently:
+
+- **M7 — replication.** Leaders and followers, ISR, the high watermark, `acks`. Leadership is
+  static: whoever is configured as leader stays leader. Nothing fails over.
+- **M8 — the controller.** Heartbeats, leader election, leader epochs, truncation on rejoin.
+  This is where the distributed-systems reasoning lives, and it needs M7 working first because
+  a failover with nothing to fail over to is untestable.
+
+#### A replica is a `Log`, not a new type
+
+A follower's copy of `orders-3` is the same `Log` class holding the same segments in the same
+directory layout. There is no `ReplicaLog`. What differs is who writes to it and how:
+
+```cpp
+// The leader's path, unchanged since M2. Assigns offsets and stamps them in.
+Offset append(std::span<std::uint8_t> batchBytes);
+
+// The follower's path, new at M7. Trusts the offsets it is given.
+void appendAsFollower(Offset baseOffset, std::span<const std::uint8_t> batchBytes);
+```
+
+That second signature is the whole of replication's contract with storage, and the `const` is
+the point: a follower must not restamp. If it assigned its own offsets, two replicas of the same
+partition would hold the same records at different numbers, and every consumer position would
+mean something different depending on which replica answered. The follower's log is a **byte
+copy** of the leader's, and `appendAsFollower` refuses a `baseOffset` that is not exactly its
+current log end — a gap means a fetch response was dropped or reordered, which is a bug, not a
+condition to paper over.
+
+Everything else a follower does is what a `Log` already does. Retention runs per replica.
+Recovery runs per replica. The active segment still has exactly one appender, which is now the
+fetcher thread rather than a request handler — the invariant survives because it was about
+*count*, not identity.
+
+#### Followers fetch; the leader never pushes
+
+A follower runs a `ReplicaFetcher` that issues the same `Fetch` request a consumer does, in a
+loop, to the leader of each partition it follows.
+
+Pull rather than push, for the same reason consumers pull (decision 3): the follower knows its
+own log end offset and nothing else has to track it. A pushing leader would need per-follower
+cursors, flow control, and a retransmit story for a follower that restarted — all of which the
+fetch offset already encodes, for free, on every request.
+
+Reusing `Fetch` rather than inventing `ReplicaFetch` is a real saving: the zero-copy read path,
+the segment-list response, the partial-batch contract and the `sendfile` write are all already
+built and already tested. A follower is a consumer that happens to be a broker.
+
+It needs exactly one thing a consumer must not have, and that is the field that distinguishes
+them:
+
+```
+FetchRequest
+  replicaId  int32     -1 = a consumer, >= 0 = the follower's node id
+```
+
+A consumer may read only to the **high watermark**. A follower must read to the leader's **log
+end offset** — otherwise the high watermark could never advance, because it is defined as the
+minimum of what the followers have. So `replicaId` selects the ceiling, and a request that
+claims a replica id the controller has not assigned to that partition is rejected rather than
+served: a client that set the field by accident would be reading uncommitted records.
+
+The same request is also how a follower reports progress. A fetch at offset 400 says "I have
+everything below 400", which is all the leader needs to recompute the high watermark and ISR
+membership. There is no separate acknowledgement.
+
+#### The high watermark, concretely
+
+```
+HW = min(logEndOffset across the in-sync replica set)
+```
+
+Recomputed on the leader whenever a follower's fetch offset advances, and never on any other
+event. Held in the `atomic<Offset>` `Log` has had since M2 — one writer publishes, many readers
+consume, decision 20.
+
+Three consequences, and the third is the one that surprises people:
+
+1. **Consumers read only below it.** `Log::read` already takes a ceiling; at M7 the Fetch
+   handler passes the high watermark for a consumer and the log end offset for a follower.
+2. **Followers learn it one round trip late**, piggybacked on the fetch response. That only ever
+   makes a follower more conservative — it serves nothing, so a stale high watermark costs
+   nothing.
+3. **Replication latency is on the READ path.** Even with `acks=0`, a record is invisible until
+   every in-sync replica has it. One slow follower delays every consumer of that partition, and
+   the fix is ejecting it from the ISR rather than waiting.
+
+Reads are served by the leader only. A follower that receives a consumer fetch answers
+`NotLeaderForPartition` and the client refreshes metadata.
+
+#### ISR, and the trap `acks=all` sets
+
+The leader tracks, per follower, the last time it fetched and the offset it fetched at. A
+follower is **in sync** when it has fetched within `replicaLagTimeMaxMs` — a time, not an offset
+distance, and that distinction is load-bearing. An offset-distance rule ("no more than N records
+behind") ejects a healthy follower during a burst, precisely when the cluster is under load and
+can least afford to lose a replica. A time rule tolerates a follower that is far behind but
+catching up, and ejects one that has stopped.
+
+Shrinking the ISR is what stops one sick machine freezing every write. Which creates the trap
+decision 15 names:
+
+> `acks=all` waits for the *in-sync* replicas. If followers fall behind and are ejected, ISR
+> shrinks to `{leader}` and `acks=all` has silently become `acks=1`.
+
+So `minInsyncReplicas` is not a tuning knob, it is the thing that makes `acks=all` mean anything:
+a produce to a partition whose ISR is smaller than it is refused with `NotEnoughReplicas` rather
+than accepted under false pretenses. The configuration that is actually durable is all three
+together, and any two of them are a trap:
+
+```
+replicationFactor  = 3     three copies exist
+minInsyncReplicas  = 2     refuse writes unless two have them
+acks               = all   wait for those two
+```
+
+That is an explicit CAP choice, and it is worth saying what it costs: losing two brokers makes
+the partition **unwritable while still readable**. An error is preferred to an acknowledgement
+we might not be able to honour.
+
+#### Where an `acks=all` produce waits
+
+The handler thread blocks on a condition variable until the high watermark reaches the batch's
+last offset, or `timeoutMs` elapses and the response says `RequestTimedOut`.
+
+This is honest for M7 and bad at scale, and both halves matter. Thread-per-connection (chunk 4)
+means a blocked produce burns a thread, so a slow follower costs one thread per in-flight write
+to that partition. That is precisely the pressure M9 exists to relieve, and feeling it is the
+point — a design that parked the request instead would have hidden the cost that motivates the
+whole of M9.
+
+A timeout is **not** a failure of the write. The batch is in the leader's log and will replicate;
+the producer simply was not told in time, and retrying gives it a duplicate. Decision 23's
+idempotent producer is what makes that survivable, which is why it is banked rather than
+abandoned.
+
+#### Leader epochs: the fence, and the file
+
+M8's problem, stated once: the controller declares broker 1 dead after a GC pause and promotes
+broker 2. Broker 1 wakes up believing it still leads, with producers still pointed at it. **No
+timeout distinguishes dead from slow**, so the fix is not better detection — it is making the
+stale leader's writes harmless.
+
+Every leadership change increments a monotonic `Epoch` (already in `types.hpp`, already shared
+with the consumer group's generation id — the same fencing-token pattern). Every request carries
+one; every receiver remembers the highest it has seen; lower is rejected with
+`FencedLeaderEpoch` and higher is adopted, which is how leadership changes propagate without a
+broadcast.
+
+The subtle half is that the epoch is **written into the log**, in a `leader-epoch-checkpoint`
+file beside `partition.meta`:
+
+```
+epoch  startOffset
+0      0
+1      4096       leadership moved here
+2      9130
+```
+
+A follower rejoining after a failover must truncate the records it holds that the new leader
+never had. Truncating to the high watermark is the obvious answer and it is **wrong**: the
+follower's high watermark is itself stale, so it can truncate too much or, worse, keep records
+the new leader does not have and then diverge silently. Instead it asks the new leader "what was
+your last offset in epoch 7?" — `OffsetsForLeaderEpoch` — and truncates exactly there. Kafka
+shipped without this and had a real log-divergence bug; the checkpoint file exists because that
+bug did.
+
+Truncation deletes records a `FileRange` may already name, so it goes through M3's graveyard,
+exactly as retention and compaction do. The third caller of a mechanism built for the first is
+the one that proves it was the right mechanism.
+
+#### The controller, and what it is not
+
+Designated, not elected (decision 17, option B). One broker is configured as the controller; it
+watches heartbeats, and when a broker stops sending them it reassigns that broker's leaderships,
+bumps each affected partition's epoch, and pushes the new assignment out.
+
+It is a **single point of failure**, and this design says so rather than pretending otherwise: if
+the controller dies, the cluster keeps serving every partition it currently has but cannot fail
+anything over. That is the honest cost of not writing consensus, and Raft is banked for its own
+project rather than smuggled in here.
+
+Two new APIs carry the controller's decisions, both broker-to-broker:
+
+| API | Direction | Purpose |
+|---|---|---|
+| `LeaderAndIsr` | controller → broker | "you now lead these, follow those, at these epochs" |
+| `BrokerHeartbeat` | broker → controller | liveness, plus the partitions it believes it holds |
+
+A broker that receives `LeaderAndIsr` promoting it to leader stops its fetcher for that partition
+and starts accepting writes; one demoted to follower does the reverse, after truncating. The
+switch is not instant and does not need to be — the epoch makes every in-flight request from the
+old arrangement rejectable.
+
+#### What replication does to the two things built before it
+
+**Consumer groups.** The coordinator for a group is the leader of its `__offsets` partition
+(decision 21), so a coordinator failover is a partition failover and needs no separate mechanism
+— which was the whole argument for storing offsets in a log. The new leader must **replay that
+partition** to rebuild its in-memory offset map before answering, exactly as `OffsetStore::replay`
+already does at startup. Until it finishes, the group is told `CoordinatorNotAvailable` and
+retries. M5 built the retry path for a different reason; this is what it was really for.
+
+**Compaction.** Each replica runs its **own** cleaner, independently. This is worth stating
+plainly because it breaks an assumption the rest of this chunk encourages: replicas of a
+compacted partition are *not* byte-identical, and two replicas may have removed different records
+at any given moment. What they agree on is the surviving value of every key, which is the only
+thing a compacted topic promises. A follower must therefore never verify its log against the
+leader's by comparing bytes or sizes — only by offset — and `appendAsFollower`'s
+"must equal my log end" check remains valid because compaction never touches the active segment,
+which is where replication appends.
+
+#### New error codes
+
+| Code | Meaning |
+|---|---|
+| `NotEnoughReplicas` | ISR is smaller than `minInsyncReplicas`; the write was refused, not lost |
+| `NotEnoughReplicasAfterAppend` | it was appended, then ISR shrank before the acknowledgement |
+| `FencedLeaderEpoch` | the sender is behind; it has already been replaced |
+| `UnknownLeaderEpoch` | the sender is ahead; the receiver has not learned of the change yet |
+| `OffsetNotAvailable` | a new leader has not finished establishing its high watermark |
+
+`NotEnoughReplicasAfterAppend` looks like a nuisance and is not. The record is in the log and
+will be replicated; what failed is the *promise*, not the write. Telling the producer the write
+failed would be a lie in the other direction, and it retries into a duplicate either way — which
+is the argument for idempotence, again.
+
+#### Rejected alternatives
+
+| Alternative | Why not |
+|---|---|
+| A `ReplicaLog` type distinct from `Log` | The follower's file layout, recovery, retention and read path are identical. Two types would be one type with a flag, spelled expensively |
+| Leader pushes to followers | The fetch offset already encodes every follower's position. Pushing needs cursors, flow control and a retransmit story to re-derive it |
+| A dedicated `ReplicaFetch` API | Loses the zero-copy path, the segment-list response and the partial-batch contract, all of which are built and tested |
+| Followers assign their own offsets | Two replicas, same records, different numbers. Every consumer position becomes replica-dependent |
+| Truncate to the high watermark on rejoin | The follower's high watermark is stale. This is the log-divergence bug Kafka actually shipped |
+| Offset-distance ISR rule | Ejects healthy followers during a burst — exactly when a replica is least affordable |
+| Unclean leader election | Promoting a stale replica silently discards everything it missed. The partition stays offline instead |
+| Raft / KRaft | A project in itself, and banked as one. Decision 17 |
+
+#### Banked for later
+
+- **Rack awareness** — three copies in one rack is one power supply. Placement is the controller's
+  job and needs no new mechanism, only a constraint.
+- **Follower fetching for consumers** — reading from a near replica. Needs the high watermark to
+  be trustworthy on a follower first, which it is not until M8's epoch handling lands.
+- **Idempotent producer** — decision 23, and the answer to every retry-into-duplicate above.
+- **Reassignment of partitions between brokers while running** — the controller can already
+  express it; nothing throttles it, and an unthrottled reassignment saturates the network.
+- **A second controller** — which is Raft, which is banked.
