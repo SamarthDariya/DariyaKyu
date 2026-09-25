@@ -29,13 +29,13 @@ The design is written up in full, with the reasoning and the rejected alternativ
 
 ## Status
 
-**Design: complete.** 23 conceptual decisions locked, structural design in progress.
+**Design: complete.** 23 conceptual decisions locked, structural design complete.
 **Implementation: M6 — a broker with log compaction.**
 
 | Phase | Status |
 |---|---|
 | Conceptual design — 23 decisions, `DESIGN.md` Part I | ✅ complete |
-| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | 🔸 5 of 6 chunks; chunks 1–2 amended in place by M2–M3 |
+| Structural design — classes, ownership, hot paths, `DESIGN.md` Part II | ✅ 6 of 6 chunks; chunks 1–2 amended in place by M2–M3, chunk 1 again by M6 |
 | Implementation — M0…M9 | 🔸 M0–M6 complete, M7 next |
 
 ---
