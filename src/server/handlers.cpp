@@ -68,8 +68,16 @@ void handleMetadata(RequestContext& request, Response& out) {
     const auto       decoded = decodeMetadataRequest(request.body);
     MetadataResponse response;
 
-    response.brokers.push_back({request.broker.nodeId, request.broker.advertisedHost,
-                                request.broker.advertisedPort});
+    // Every broker in the cluster, so a client can reach a partition's leader
+    // wherever it is. This broker's own entry is the address it actually
+    // advertises — the port it really bound wins over the one it was told.
+    for (const auto& node : clusterOf(request.broker).nodes) {
+        if (node.id == request.broker.nodeId)
+            response.brokers.push_back(
+                {node.id, request.broker.advertisedHost, request.broker.advertisedPort});
+        else
+            response.brokers.push_back({node.id, node.host, node.port});
+    }
     response.controllerId = -1;   // no controller until M8
 
     // Grouped here rather than by LogManager, which stores partitions flat: a
@@ -92,8 +100,14 @@ void handleMetadata(RequestContext& request, Response& out) {
             return topic;
         }
 
-        for (const PartitionId partition : found->second)
-            topic.partitions.push_back({ErrorCode::None, partition, request.broker.nodeId});
+        for (const PartitionId partition : found->second) {
+            // The leader is the first replica partition.meta recorded. A
+            // partition with no list predates replication: one copy, here.
+            const storage::Log* log = request.broker.logs.get(TopicPartition{name, partition});
+            vector<NodeId> replicas = log ? log->config().replication.replicas : vector<NodeId>{};
+            if (replicas.empty()) replicas = {request.broker.nodeId};
+            topic.partitions.push_back({ErrorCode::None, partition, replicas.front(), replicas});
+        }
         return topic;
     };
 

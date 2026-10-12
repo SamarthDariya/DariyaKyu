@@ -46,6 +46,14 @@ struct MetadataResponse {
         // client is written against a moving target from the start rather than
         // learning about leaders later.
         NodeId leader = 0;
+
+        // Every broker holding a copy, leader first (M7). One entry — the
+        // leader — for a partition with no followers.
+        //
+        // The in-sync subset is not here yet. Nothing tracks it until the
+        // leader's replica state exists, and reporting every replica as in
+        // sync until then would be a claim nobody has checked.
+        std::vector<NodeId> replicas;
     };
 
     struct Topic {

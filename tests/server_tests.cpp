@@ -415,6 +415,38 @@ TEST_CASE("Metadata describes every partition of every topic") {
     for (const auto& partition : response.topics[0].partitions) CHECK(partition.leader == 1);
 }
 
+TEST_CASE("Metadata names every broker and each partition's real leader") {
+    ServingBroker broker("handler-metadata-cluster");
+    broker.context.cluster = cluster::parseClusterConfig("1@127.0.0.1:7001,2@10.0.0.2:9092");
+
+    // As CreateTopic would have left them: partition 0 led here, partition 1
+    // led by node 2 with a copy here.
+    storage::LogConfig led = testConfig(), following = testConfig();
+    led.replication.replicas       = {1, 2};
+    following.replication.replicas = {2, 1};
+    broker.logs.createPartition(TopicPartition{"orders", 0}, led);
+    broker.logs.createPartition(TopicPartition{"orders", 1}, following);
+
+    MetadataRequest request;
+    request.topics = {"orders"};
+    const auto   body = broker.call(ApiKey::Metadata, encoded(request));
+    BufferReader in(body);
+    const auto   response = decodeMetadataResponse(in);
+
+    // Both brokers. Our own entry is what we advertise (port 9092 here), not
+    // the 7001 the cluster list was given.
+    REQUIRE(response.brokers.size() == 2);
+    CHECK(response.brokers[0].port == 9092);
+    CHECK(response.brokers[1].nodeId == 2);
+    CHECK(response.brokers[1].host == "10.0.0.2");
+
+    const auto& partitions = response.topics.at(0).partitions;
+    REQUIRE(partitions.size() == 2);
+    CHECK(partitions[0].leader == 1);
+    CHECK(partitions[1].leader == 2);   // hosted here, led elsewhere
+    CHECK(partitions[1].replicas == vector<NodeId>{2, 1});
+}
+
 TEST_CASE("Metadata is ordered, so two identical brokers answer identically") {
     ServingBroker broker("handler-metadata-order");
     // Created out of order deliberately; LogManager stores them in a hash map.

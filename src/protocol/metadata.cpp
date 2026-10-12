@@ -49,6 +49,8 @@ void encodeMetadataResponse(BufferWriter& out, const MetadataResponse& response)
             out.writeInt16(static_cast<int16_t>(partition.error));
             out.writeInt32(partition.partition);
             out.writeInt32(partition.leader);
+            out.writeInt32(static_cast<int32_t>(partition.replicas.size()));
+            for (const NodeId node : partition.replicas) out.writeInt32(node);
         }
     }
 }
@@ -82,7 +84,10 @@ MetadataResponse decodeMetadataResponse(BufferReader& in) {
             partition.error     = static_cast<ErrorCode>(in.readInt16());
             partition.partition = in.readInt32();
             partition.leader    = in.readInt32();
-            topic.partitions.push_back(partition);
+
+            const int32_t replicaCount = readElementCount(in, "replica");
+            for (int32_t r = 0; r < replicaCount; ++r) partition.replicas.push_back(in.readInt32());
+            topic.partitions.push_back(std::move(partition));
         }
 
         response.topics.push_back(std::move(topic));

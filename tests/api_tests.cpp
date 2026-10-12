@@ -280,7 +280,7 @@ TEST_CASE("A Metadata response round-trips") {
     response.controllerId = 1;
     response.topics.push_back({ErrorCode::None,
                                "orders",
-                               {{ErrorCode::None, 0, 1}, {ErrorCode::None, 1, 1}}});
+                               {{ErrorCode::None, 0, 1, {1, 2}}, {ErrorCode::None, 1, 2, {2, 1}}}});
     response.topics.push_back({ErrorCode::UnknownTopicOrPartition, "missing", {}});
 
     const auto decoded =
@@ -298,7 +298,8 @@ TEST_CASE("A Metadata response round-trips") {
     CHECK(decoded.topics[0].error == ErrorCode::None);
     REQUIRE(decoded.topics[0].partitions.size() == 2);
     CHECK(decoded.topics[0].partitions[1].partition == 1);
-    CHECK(decoded.topics[0].partitions[1].leader == 1);
+    CHECK(decoded.topics[0].partitions[1].leader == 2);
+    CHECK(decoded.topics[0].partitions[1].replicas == vector<NodeId>{2, 1});   // order kept
 
     // A topic error sits beside the topic, so one unknown topic does not spoil
     // the answer for the others.
@@ -323,7 +324,7 @@ TEST_CASE("An unset controller round-trips as -1") {
 TEST_CASE("A truncated Metadata response is refused at every length") {
     MetadataResponse response;
     response.brokers.push_back({1, "127.0.0.1", 9092});
-    response.topics.push_back({ErrorCode::None, "orders", {{ErrorCode::None, 0, 1}}});
+    response.topics.push_back({ErrorCode::None, "orders", {{ErrorCode::None, 0, 1, {1, 2}}}});
 
     BufferWriter out;
     encodeMetadataResponse(out, response);
