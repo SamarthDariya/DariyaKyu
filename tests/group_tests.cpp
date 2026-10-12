@@ -11,6 +11,7 @@
 #include "group/group_coordinator.hpp"
 #include "group/offset_store.hpp"
 #include "group/offsets_topic.hpp"
+#include "storage/log_cleaner.hpp"
 #include "test_support.hpp"
 
 using namespace std;
@@ -808,6 +809,37 @@ TEST_CASE("__offsets is created compacted, with retention disabled") {
     // report. So both limits are off, not merely generous.
     CHECK(log->config().retention.retentionMs == numeric_limits<int64_t>::max());
     CHECK_FALSE(log->config().retention.bytesLimited());
+}
+
+TEST_CASE("__offsets stays bounded under sustained commits") {
+    StoreFixture        fixture("offsets-bounded", 1);
+    storage::LogCleaner cleaner(fixture.logs, storage::CleanerConfig{});
+    const TopicPartition tp{kOffsetsTopic, 0};
+    const auto*          log = fixture.logs.get(tp);
+    REQUIRE(log != nullptr);
+
+    // Four positions, committed over and over: the shape of a group that commits
+    // every poll. Each round writes several segments' worth; after each pass the
+    // partition must be back to roughly one segment, not one more round bigger.
+    const uint64_t bound  = 2 * testPolicy().maxSegmentBytes;
+    int64_t        offset = 0;
+    for (int round = 0; round < 6; ++round) {
+        for (int i = 0; i < 1500; ++i, ++offset)
+            fixture.store.commit({"g", "orders", i % 4}, valueAt(offset));
+
+        const auto result = cleaner.cleanOnce(tp, storage::wallClockMillis());
+        REQUIRE(result.has_value());
+        CHECK(result->recordsDropped > 0);
+        CHECK(log->totalSizeBytes() < bound);
+    }
+
+    // Bounded is worthless if it is bounded by losing positions: the last commit
+    // of every key has to come back from the compacted topic alone.
+    OffsetStore restored(fixture.logs, 1);
+    restored.replay();
+    CHECK(restored.size() == 4);
+    for (int p = 0; p < 4; ++p)
+        CHECK(restored.fetch({"g", "orders", p})->nextOffset == Offset(offset - 4 + p));
 }
 
 TEST_CASE("An ordinary topic is not compacted just because __offsets is") {
