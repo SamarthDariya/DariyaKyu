@@ -42,6 +42,7 @@ struct BareBroker {
     storage::LogManager     logs;
     group::OffsetStore      offsets;
     group::GroupCoordinator groups;
+    replication::ReplicaManager replicas{1};
     BrokerContext           context;
 
     explicit BareBroker(const string& name)
@@ -49,7 +50,7 @@ struct BareBroker {
           logs(dir.file("data"), testConfig()),
           offsets(logs, group::kDefaultOffsetsPartitions),
           context{logs, groups, offsets, group::kDefaultOffsetsPartitions, 1, "127.0.0.1",
-                  9092, {}} {}
+                  9092, {}, replicas} {}
 };
 
 // Builds a frame for `header` plus `body`, then runs it through the registry and
@@ -915,6 +916,71 @@ TEST_CASE("A replica id that is not one of the partition's followers is refused"
     }
 }
 
+namespace {
+
+// One batch for orders-0, as a producer would send it.
+ProduceRequest produceToOrders(const vector<uint8_t>& batch) {
+    ProduceRequest request;
+    request.topics.push_back({"orders", {{0, span<const uint8_t>(batch), 0}}});
+    return request;
+}
+
+FetchResponseView::Partition fetchOrders(ServingBroker& broker, Offset offset, NodeId replicaId,
+                                         vector<uint8_t>& body) {
+    body = broker.call(ApiKey::Fetch, encoded(fetchOrdersFrom(offset, replicaId)));
+    BufferReader in(body);
+    return decodeFetchResponse(in).topics[0].partitions[0];
+}
+
+}  // namespace
+
+TEST_CASE("Produced records stay invisible until the follower has fetched them") {
+    ServingBroker broker("handler-fetch-commits");
+
+    // Created the way a peer's request creates it, so it is tracked from birth.
+    CreateReplicasRequest::Topic topic;
+    topic.settings.name = "orders";
+    topic.partitions    = {{0, {1, 2}}};
+    CreateReplicasRequest create;
+    create.topics.push_back(topic);
+    broker.call(ApiKey::CreateReplicas, encoded(create));
+
+    const auto batch = makeUnstampedBatch(1000, 48);
+    for (int i = 0; i < 3; ++i) broker.call(ApiKey::Produce, encoded(produceToOrders(batch)));
+
+    // Written, but node 2 has none of it: a consumer sees nothing.
+    vector<uint8_t> body;
+    auto consumer = fetchOrders(broker, Offset(0), kConsumerReplicaId, body);
+    CHECK(consumer.highWatermark == Offset(0));
+    CHECK(consumer.records.empty());
+
+    // Node 2 fetches at 2 — it has offsets 0 and 1 — and hears the new watermark
+    // in this same response, not one round trip later.
+    const auto follower = fetchOrders(broker, Offset(2), 2, body);
+    CHECK(follower.highWatermark == Offset(2));
+
+    consumer = fetchOrders(broker, Offset(0), kConsumerReplicaId, body);
+    CHECK(consumer.highWatermark == Offset(2));
+    CHECK(consumer.records.size() == 2 * batch.size());
+}
+
+TEST_CASE("A follower claiming records the leader lacks moves nothing") {
+    ServingBroker broker("handler-fetch-overclaim");
+    CreateReplicasRequest::Topic topic;
+    topic.settings.name = "orders";
+    topic.partitions    = {{0, {1, 2}}};
+    CreateReplicasRequest create;
+    create.topics.push_back(topic);
+    broker.call(ApiKey::CreateReplicas, encoded(create));
+    const auto batch = makeUnstampedBatch(1000, 48);
+    broker.call(ApiKey::Produce, encoded(produceToOrders(batch)));
+
+    vector<uint8_t> body;
+    const auto      claim = fetchOrders(broker, Offset(9), 2, body);
+    CHECK(claim.error == ErrorCode::OffsetOutOfRange);
+    CHECK(claim.highWatermark == Offset(0));
+}
+
 TEST_CASE("A caught-up fetch is a success with no records") {
     ServingBroker broker("handler-fetch-caught-up");
     storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0});
@@ -1486,4 +1552,33 @@ TEST_CASE("Internal topics are hidden from a request for everything") {
     REQUIRE(named.topics.size() == 1);
     CHECK(named.topics[0].name == "__offsets");
     CHECK(named.topics[0].partitions.size() == group::kDefaultOffsetsPartitions);
+}
+
+TEST_CASE("A broker tracks the partitions it leads from the moment it starts") {
+    TempDir dir("broker-tracks-on-start");
+    {
+        // On disk from a previous life: led by node 1, followed by node 2.
+        storage::LogManager logs(dir.file("data"), testConfig());
+        storage::LogConfig  config  = testConfig();
+        config.replication.replicas = {1, 2};
+        logs.createPartition(TopicPartition{"orders", 0}, config);
+    }
+
+    server::Broker::Options options;
+    options.dataDir  = dir.file("data");
+    options.defaults = testConfig();
+    options.host     = "127.0.0.1";
+    options.port     = 0;
+    options.nodeId   = 1;
+    server::Broker broker(options);
+    broker.start();
+
+    // Tracked, so an append no longer commits itself: node 2 has not fetched.
+    storage::Log* log   = broker.logs().get(TopicPartition{"orders", 0});
+    auto          bytes = makeUnstampedBatch(1000);
+    REQUIRE(log != nullptr);
+    log->append(bytes);
+    CHECK(log->highWatermark() == Offset(0));
+
+    broker.stop();
 }

@@ -15,6 +15,7 @@ Broker::Broker(Options options)
       logs_(options_.dataDir, options_.defaults),
       cleaner_(logs_, options_.cleaner),
       offsets_(logs_, options_.offsetsPartitions),
+      replicas_(options_.nodeId),
       context_{logs_,
                groups_,
                offsets_,
@@ -22,7 +23,8 @@ Broker::Broker(Options options)
                options_.nodeId,
                options_.advertisedHost.empty() ? options_.host : options_.advertisedHost,
                options_.port,
-               options_.cluster} {
+               options_.cluster,
+               replicas_} {
     registerAllHandlers(registry_);
 }
 
@@ -40,6 +42,12 @@ void Broker::start() {
     // group it had never committed.
     context_.offsetsPartitions = group::ensureOffsetsTopic(logs_, options_.offsetsPartitions);
     offsets_.replay();
+
+    // Every partition this broker leads with followers, before any request can
+    // append to one: from here on, only the followers' fetches commit them.
+    const int64_t now = storage::wallClockMillis();
+    for (const auto& tp : logs_.hostedPartitions())
+        if (storage::Log* log = logs_.get(tp)) replicas_.track(*log, now);
 
     protocol::Socket listening = protocol::Socket::listenOn(options_.host, options_.port);
 

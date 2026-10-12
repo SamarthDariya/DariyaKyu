@@ -253,8 +253,9 @@ void handleCreateTopic(RequestContext& request, Response& out) {
                 // disk. The peers are told about theirs below.
                 if (!holds(partition.replicas, request.broker.nodeId)) continue;
                 config.replication.replicas = partition.replicas;
-                request.broker.logs.createPartition(TopicPartition{asked.name, partition.partition},
-                                                    config);
+                storage::Log& log = request.broker.logs.createPartition(
+                    TopicPartition{asked.name, partition.partition}, config);
+                request.broker.replicas.track(log, storage::wallClockMillis());
             }
         } catch (const Error&) {
             // A disk that filled, a permission that changed. Not the client's
@@ -312,8 +313,9 @@ void handleCreateReplicas(RequestContext& request, Response& out) {
         try {
             for (const auto* partition : ours) {
                 config.replication.replicas = partition->replicas;
-                request.broker.logs.createPartition(TopicPartition{result.name, partition->partition},
-                                                    config);
+                storage::Log& log = request.broker.logs.createPartition(
+                    TopicPartition{result.name, partition->partition}, config);
+                request.broker.replicas.track(log, storage::wallClockMillis());
             }
         } catch (const Error&) {
             result.error = ErrorCode::Unknown;
@@ -361,6 +363,8 @@ void handleProduce(RequestContext& request, Response& out) {
                     result.error = ErrorCode::CorruptMessage;
                 } else {
                     result.baseOffset = log->append(batch);
+                    // With every follower gone, this write is committed now.
+                    request.broker.replicas.logAppended(TopicPartition{topic.name, asked.partition});
                 }
             } catch (const CorruptData&) {
                 // The CLIENT's bytes did not parse. Its fault, and it should be
@@ -420,6 +424,16 @@ void handleFetch(RequestContext& request, Response& out) {
                 answer.partitions.push_back(result);
                 continue;
             }
+
+            // A follower fetching at N has everything below N — this fetch IS its
+            // acknowledgement. Recorded before the watermark below is read, so the
+            // follower learns the result in this same response. An offset past
+            // the log end is a claim to records that do not exist, and moves
+            // nothing; the read below answers it with AboveLogEnd.
+            if (isFollower && asked.fetchOffset <= log->logEndOffset())
+                request.broker.replicas.recordFetch(TopicPartition{topic.name, asked.partition},
+                                                    decoded.replicaId, asked.fetchOffset,
+                                                    storage::wallClockMillis());
 
             // Sent whether or not the read succeeded. The wire has one
             // OffsetOutOfRange code, and these two numbers are how a client tells

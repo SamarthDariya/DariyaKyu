@@ -91,6 +91,7 @@ private:
     storage::LogCleaner     cleaner_;
 
     group::OffsetStore      offsets_;
+    replication::ReplicaManager replicas_;
     group::GroupCoordinator groups_;
 
     ApiRegistry               registry_;

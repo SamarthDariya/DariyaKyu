@@ -11,6 +11,7 @@
 #include "cluster/cluster_config.hpp"
 #include "group/group_coordinator.hpp"
 #include "group/offset_store.hpp"
+#include "replication/replica_manager.hpp"
 #include "storage/log_manager.hpp"
 
 namespace dariyakyu::server {
@@ -52,6 +53,11 @@ struct BrokerContext {
     // which is a cluster of one: itself. clusterOf() below fills that in, so no
     // handler has to remember the special case.
     cluster::ClusterConfig cluster;
+
+    // The partitions this broker leads with followers, and how far each is
+    // committed (M7). A handler reports what it sees — a follower's fetch, an
+    // append — and the manager moves the high watermark.
+    replication::ReplicaManager& replicas;
 };
 
 inline cluster::ClusterConfig clusterOf(const BrokerContext& broker) {
