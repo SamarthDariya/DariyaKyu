@@ -522,7 +522,9 @@ TEST_CASE("Creating a topic that exists changes nothing") {
 
 TEST_CASE("A broker creates only the replicas it holds, and records who holds them") {
     ServingBroker broker("handler-createtopic-replicas");
-    broker.context.cluster = cluster::parseClusterConfig("1@h:1,2@h:2,3@h:3");   // we are 1
+    // We are node 1. Nodes 2 and 3 point at closed ports, so nothing answers.
+    broker.context.cluster =
+        cluster::parseClusterConfig("1@127.0.0.1:1,2@127.0.0.1:2,3@127.0.0.1:3");
 
     CreateTopicRequest        request;
     CreateTopicRequest::Topic topic;
@@ -531,9 +533,12 @@ TEST_CASE("A broker creates only the replicas it holds, and records who holds th
     topic.replicationFactor = 2;
     request.topics.push_back(topic);
 
+    // The peers cannot be told, so the client hears Unknown — but this broker's
+    // own copies were made first and stay made. A partly created topic is M7's
+    // known gap; M8's controller closes it.
     const auto   body = broker.call(ApiKey::CreateTopic, encoded(request));
     BufferReader in(body);
-    REQUIRE(decodeCreateTopicResponse(in).topics[0].error == ErrorCode::None);
+    CHECK(decodeCreateTopicResponse(in).topics[0].error == ErrorCode::Unknown);
 
     // Partition 0 is {1, 2} and partition 2 is {3, 1}: both ours. Partition 1 is
     // {2, 3}, so it belongs on other brokers and not on this disk.

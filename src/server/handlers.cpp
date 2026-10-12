@@ -5,6 +5,7 @@
 
 #include "cluster/replica_assignment.hpp"
 #include "common/errors.hpp"
+#include "protocol/client.hpp"
 #include "protocol/create_replicas.hpp"
 #include "protocol/create_topic.hpp"
 #include "group/offsets_topic.hpp"
@@ -136,6 +137,45 @@ bool holds(const vector<NodeId>& replicas, NodeId node) {
     return ranges::find(replicas, node) != replicas.end();
 }
 
+// Sends every other broker holding a replica its CreateReplicas (M7).
+//
+// The broker that received the CreateTopic does a controller's job here, for
+// this one topic, because there is no controller until M8. Every peer is told
+// even if an earlier one failed, so as many copies as possible exist; the first
+// failure is what the client hears.
+//
+// A failure leaves the topic PARTLY created — this broker's copies exist and a
+// peer's do not — and a retry answers TopicAlreadyExists. That is a real gap,
+// and it is M8's: a controller that reconciles assignments is what closes it.
+ErrorCode tellPeers(const CreateReplicasRequest::Topic& topic, const cluster::ClusterConfig& cluster,
+                    NodeId self) {
+    CreateReplicasRequest forward;
+    forward.topics.push_back(topic);
+    BufferWriter out;
+    encodeCreateReplicasRequest(out, forward);
+    const auto body = out.take();
+
+    ErrorCode first = ErrorCode::None;
+    for (const auto& node : cluster.nodes) {
+        const bool holdsAny = ranges::any_of(
+            topic.partitions, [&](const auto& partition) { return holds(partition.replicas, node.id); });
+        if (node.id == self || !holdsAny) continue;
+
+        ErrorCode error = ErrorCode::None;
+        try {
+            Client     peer(node.host, node.port, "dariyakyu-broker-" + to_string(self));
+            const auto reply = peer.call(ApiKey::CreateReplicas, body);
+            BufferReader in(reply);
+            error = decodeCreateTopicResponse(in).topics.at(0).error;
+        } catch (const Error&) {
+            // Unreachable, or it hung up. Nothing more specific is true.
+            error = ErrorCode::Unknown;
+        }
+        if (first == ErrorCode::None) first = error;
+    }
+    return first;
+}
+
 }  // namespace
 
 void handleCreateTopic(RequestContext& request, Response& out) {
@@ -177,26 +217,32 @@ void handleCreateTopic(RequestContext& request, Response& out) {
             continue;
         }
 
+        // Decided once, here, and then both used locally and sent to the peers —
+        // so this broker and every peer act on the same list.
+        CreateReplicasRequest::Topic assignment{asked, {}};
+        for (PartitionId p = 0; p < asked.partitionCount; ++p)
+            assignment.partitions.push_back(
+                {p, cluster::assignReplicas(p, asked.replicationFactor, cluster)});
+
         storage::LogConfig config = configFor(asked, request.broker.logs.defaults());
 
         try {
-            for (PartitionId p = 0; p < asked.partitionCount; ++p) {
-                // Each partition has its own replicas, so its own config. Every
-                // broker computes the same list from the same cluster (step 4).
-                config.replication.replicas =
-                    cluster::assignReplicas(p, asked.replicationFactor, cluster);
-
+            for (const auto& partition : assignment.partitions) {
                 // Only the partitions this broker holds a copy of live on its
-                // disk. Telling the other replicas is the next step's job.
-                if (!holds(config.replication.replicas, request.broker.nodeId)) continue;
-
-                request.broker.logs.createPartition(TopicPartition{asked.name, p}, config);
+                // disk. The peers are told about theirs below.
+                if (!holds(partition.replicas, request.broker.nodeId)) continue;
+                config.replication.replicas = partition.replicas;
+                request.broker.logs.createPartition(TopicPartition{asked.name, partition.partition},
+                                                    config);
             }
         } catch (const Error&) {
             // A disk that filled, a permission that changed. Not the client's
             // doing, and there is no honest code for it.
             result.error = ErrorCode::Unknown;
         }
+
+        if (result.error == ErrorCode::None)
+            result.error = tellPeers(assignment, cluster, request.broker.nodeId);
 
         response.topics.push_back(std::move(result));
     }

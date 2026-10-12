@@ -886,3 +886,52 @@ TEST_CASE("An uncompacted topic keeps every version, however many there are") {
 
     broker.stop();
 }
+
+// ===========================================================================
+// M7: a topic created on one broker reaches the others
+// ===========================================================================
+
+TEST_CASE("Creating a topic on one broker creates the other brokers' copies") {
+    TempDir dir("gate-create-replicas");
+
+    // Broker 2 first, so broker 1 can be told where it is.
+    auto second   = optionsFor(dir.file("node-2"));
+    second.nodeId = 2;
+    server::Broker node2(second);
+    node2.start();
+
+    // Broker 1's own port is never dialled — it skips itself — so any value does.
+    auto first    = optionsFor(dir.file("node-1"));
+    first.nodeId  = 1;
+    first.cluster = cluster::ClusterConfig{{{1, "127.0.0.1", 1}, {2, "127.0.0.1", node2.port()}}};
+    server::Broker node1(first);
+    node1.start();
+
+    // One copy of each of three partitions: 0 and 2 on node 1, 1 on node 2.
+    CreateTopicRequest        create;
+    CreateTopicRequest::Topic topic;
+    topic.name           = "orders";
+    topic.partitionCount = 3;
+    topic.retentionMs    = 60'000;
+    create.topics.push_back(topic);
+
+    protocol::Client client("127.0.0.1", node1.port());
+    const auto       response = client.call(ApiKey::CreateTopic, body(create, encodeCreateTopicRequest));
+    BufferReader     in(response);
+    CHECK(decodeCreateTopicResponse(in).topics.at(0).error == ErrorCode::None);
+
+    CHECK(node1.logs().get(TopicPartition{"orders", 0}) != nullptr);
+    CHECK(node1.logs().get(TopicPartition{"orders", 1}) == nullptr);
+    CHECK(node1.logs().get(TopicPartition{"orders", 2}) != nullptr);
+
+    // Broker 2 was never asked by the client, and has its copy anyway — with the
+    // replica list broker 1 decided and the retention the client asked for.
+    const storage::Log* copy = node2.logs().get(TopicPartition{"orders", 1});
+    REQUIRE(copy != nullptr);
+    CHECK(copy->config().replication.replicas == vector<NodeId>{2});
+    CHECK(copy->config().retention.retentionMs == 60'000);
+    CHECK(node2.logs().get(TopicPartition{"orders", 0}) == nullptr);
+
+    node1.stop();
+    node2.stop();
+}
