@@ -11,6 +11,7 @@ using namespace std;
 namespace dariyakyu::protocol {
 
 void encodeFetchRequest(BufferWriter& out, const FetchRequest& request) {
+    out.writeInt32(request.replicaId);
     out.writeInt32(request.maxWaitMs);
     out.writeInt32(request.minBytes);
 
@@ -28,6 +29,12 @@ void encodeFetchRequest(BufferWriter& out, const FetchRequest& request) {
 
 FetchRequest decodeFetchRequest(BufferReader& in) {
     FetchRequest request;
+
+    // -1 or a node id. Anything lower is neither, and guessing which was meant
+    // could hand a consumer records past the high watermark.
+    request.replicaId = in.readInt32();
+    if (request.replicaId < kConsumerReplicaId)
+        throw CorruptData("fetch: replica id " + to_string(request.replicaId));
 
     request.maxWaitMs = in.readInt32();
     request.minBytes  = in.readInt32();

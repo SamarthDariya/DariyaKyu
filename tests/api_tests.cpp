@@ -683,12 +683,14 @@ TEST_CASE("A Fetch request round-trips") {
     FetchRequest request;
     request.maxWaitMs = 500;
     request.minBytes  = 1;
+    request.replicaId = 2;
     request.topics.push_back({"orders", {{0, Offset(100), 1 << 20}, {1, Offset(0), 4096}}});
 
     const auto decoded =
         roundTrip([&](BufferWriter& out) { encodeFetchRequest(out, request); },
                   [](BufferReader& in) { return decodeFetchRequest(in); });
 
+    CHECK(decoded.replicaId == 2);
     CHECK(decoded.maxWaitMs == 500);
     CHECK(decoded.minBytes == 1);
     REQUIRE(decoded.topics[0].partitions.size() == 2);
@@ -697,8 +699,25 @@ TEST_CASE("A Fetch request round-trips") {
     CHECK(decoded.topics[0].partitions[1].fetchOffset == Offset(0));
 }
 
+TEST_CASE("A fetch from a consumer says so unless told otherwise") {
+    // The default matters: a client that never heard of replicas must be read
+    // as a consumer, held to the high watermark — never as a follower.
+    CHECK(FetchRequest{}.replicaId == kConsumerReplicaId);
+}
+
+TEST_CASE("A replica id below -1 is refused") {
+    FetchRequest request;
+    request.replicaId = -2;
+    BufferWriter out;
+    encodeFetchRequest(out, request);
+    const auto   body = out.take();
+    BufferReader in(body);
+    CHECK_THROWS_AS(decodeFetchRequest(in), CorruptData);
+}
+
 TEST_CASE("A negative fetch size is refused rather than clamped") {
     BufferWriter out;
+    out.writeInt32(kConsumerReplicaId);
     out.writeInt32(0);
     out.writeInt32(0);
     out.writeInt32(1);

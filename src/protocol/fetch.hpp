@@ -12,6 +12,9 @@
 
 namespace dariyakyu::protocol {
 
+// The replicaId a consumer sends: "I am not a broker".
+inline constexpr NodeId kConsumerReplicaId = -1;
+
 // "Send me records from these offsets."
 //
 // The read path, and the only API whose response cannot be one buffer.
@@ -33,6 +36,15 @@ struct FetchRequest {
     // architecture. The fields exist now so the protocol does not change then.
     std::int32_t maxWaitMs = 0;
     std::int32_t minBytes  = 0;
+
+    // Who is asking (M7): kConsumerReplicaId for a consumer, or the node id of
+    // a follower fetching to copy the log.
+    //
+    // It decides how far the read may go. A consumer stops at the high
+    // watermark, so it never sees a record that could still be lost. A follower
+    // must read to the log end, or the watermark — the minimum of what the
+    // followers have — could never move. First on the wire, as in Kafka.
+    NodeId replicaId = kConsumerReplicaId;
 
     std::vector<Topic> topics;
 };
