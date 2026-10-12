@@ -1,12 +1,17 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <thread>
+
 #include "common/errors.hpp"
 #include "replication/partition_replicas.hpp"
+#include "replication/replica_manager.hpp"
+#include "test_support.hpp"
 
 using namespace std;
 using namespace dariyakyu;
 using namespace dariyakyu::replication;
+using namespace dariyakyu::test;
 
 // ===========================================================================
 // PartitionReplicas: the high watermark
@@ -119,4 +124,111 @@ TEST_CASE("A follower that has never fetched gets a full window first") {
     PartitionReplicas replicas(1, {1, 2}, Offset(0), 1000, 100);
     CHECK(replicas.shrinkInSync(1100).empty());
     CHECK(replicas.shrinkInSync(1101) == vector<NodeId>{2});
+}
+
+// ===========================================================================
+// ReplicaManager: keeping each Log's watermark in step
+// ===========================================================================
+
+namespace {
+
+unique_ptr<storage::Log> logWithReplicas(TempDir& dir, const string& name, vector<NodeId> replicas) {
+    storage::LogConfig config   = testConfig();
+    config.replication.replicas = std::move(replicas);
+    return storage::Log::create(TopicPartition{name, 0}, dir.file(name + "-0"), config);
+}
+
+void appendRecords(storage::Log& log, int count) {
+    for (int i = 0; i < count; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        log.append(bytes);
+    }
+}
+
+}  // namespace
+
+TEST_CASE("Only partitions led here with followers are tracked") {
+    TempDir        dir("manager-track");
+    ReplicaManager manager(1);
+
+    auto alone     = logWithReplicas(dir, "alone", {});       // predates replication
+    auto following = logWithReplicas(dir, "following", {2, 1});   // node 2 leads
+    manager.track(*alone, 1000);
+    manager.track(*following, 1000);
+
+    CHECK_FALSE(manager.inSync(TopicPartition{"alone", 0}).has_value());
+    CHECK_FALSE(manager.inSync(TopicPartition{"following", 0}).has_value());
+
+    // Untracked, so they still commit on append as they always have.
+    appendRecords(*alone, 2);
+    CHECK(alone->highWatermark() == Offset(2));
+}
+
+TEST_CASE("A led partition commits what its followers have fetched") {
+    TempDir        dir("manager-fetch");
+    ReplicaManager manager(1);
+    auto           log = logWithReplicas(dir, "orders", {1, 2});
+    manager.track(*log, 1000);
+
+    // Written, not committed: node 2 has none of it yet.
+    appendRecords(*log, 3);
+    manager.logAppended(TopicPartition{"orders", 0});
+    CHECK(log->highWatermark() == Offset(0));
+
+    manager.recordFetch(TopicPartition{"orders", 0}, 2, Offset(2), 1100);
+    CHECK(log->highWatermark() == Offset(2));
+    CHECK(manager.inSync(TopicPartition{"orders", 0}) == vector<NodeId>{1, 2});
+}
+
+TEST_CASE("With every follower gone, the leader's own writes commit at once") {
+    TempDir        dir("manager-alone");
+    ReplicaManager manager(1, /*lagTimeMaxMs=*/100);
+    auto           log = logWithReplicas(dir, "orders", {1, 2});
+    manager.track(*log, 1000);
+    appendRecords(*log, 3);
+
+    // Node 2 never fetches. The timer drops it, and the watermark moves past it.
+    manager.shrinkInSync(1101);
+    CHECK(manager.inSync(TopicPartition{"orders", 0}) == vector<NodeId>{1});
+    CHECK(log->highWatermark() == Offset(3));
+
+    // From now on the leader alone is the in-sync set: an append is committed
+    // as soon as it is reported, not at the next fetch or timer.
+    appendRecords(*log, 2);
+    manager.logAppended(TopicPartition{"orders", 0});
+    CHECK(log->highWatermark() == Offset(5));
+}
+
+TEST_CASE("Fetches, appends, the timer and readers can all race on one partition") {
+    // Each runs on its own connection's thread in the broker. TSan is the real
+    // assertion here; the final check is that nothing was lost in the scramble.
+    TempDir        dir("manager-race");
+    ReplicaManager manager(1);
+    auto           log = logWithReplicas(dir, "orders", {1, 2});
+    const TopicPartition tp{"orders", 0};
+    manager.track(*log, 1000);
+
+    thread appender([&] {
+        for (int i = 0; i < 200; ++i) {
+            auto bytes = makeUnstampedBatch(i);
+            log->append(bytes);
+            manager.logAppended(tp);
+        }
+    });
+    thread follower([&] {
+        for (int i = 0; i < 200; ++i) manager.recordFetch(tp, 2, log->logEndOffset(), 1000 + i);
+    });
+    thread timerAndReader([&] {
+        for (int i = 0; i < 200; ++i) {
+            manager.shrinkInSync(1000 + i);
+            CHECK(manager.inSync(tp).has_value());
+        }
+    });
+    appender.join();
+    follower.join();
+    timerAndReader.join();
+
+    // The follower catches up for good, and the watermark lands on the end.
+    manager.recordFetch(tp, 2, log->logEndOffset(), 2000);
+    CHECK(log->highWatermark() == Offset(200));
 }
