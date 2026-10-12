@@ -19,6 +19,9 @@ void handleCreateTopic(RequestContext& request, protocol::Response& out);
 void handleProduce(RequestContext& request, protocol::Response& out);
 void handleFetch(RequestContext& request, protocol::Response& out);
 
+// Replication (M7). Broker to broker.
+void handleCreateReplicas(RequestContext& request, protocol::Response& out);
+
 // Consumer groups (M5).
 void handleFindCoordinator(RequestContext& request, protocol::Response& out);
 void handleJoinGroup(RequestContext& request, protocol::Response& out);

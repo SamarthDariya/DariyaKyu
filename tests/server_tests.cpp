@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "protocol/error_codes.hpp"
+#include "protocol/create_replicas.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/list_offsets.hpp"
 #include "protocol/fetch.hpp"
@@ -261,6 +262,31 @@ vector<uint8_t> encoded(const CreateTopicRequest& request) {
     BufferWriter out;
     encodeCreateTopicRequest(out, request);
     return out.take();
+}
+vector<uint8_t> encoded(const CreateReplicasRequest& request) {
+    BufferWriter out;
+    encodeCreateReplicasRequest(out, request);
+    return out.take();
+}
+
+// What broker 1 sends after creating "orders" with three partitions, two copies
+// each, on a three-node cluster: every partition, with its replica list.
+CreateReplicasRequest ordersFromBroker1() {
+    CreateReplicasRequest::Topic topic;
+    topic.settings.name              = "orders";
+    topic.settings.partitionCount    = 3;
+    topic.settings.retentionMs       = 60'000;
+    topic.settings.replicationFactor = 2;
+    topic.partitions                 = {{0, {1, 2}}, {1, {2, 3}}, {2, {3, 1}}};
+
+    CreateReplicasRequest request;
+    request.topics.push_back(topic);
+    return request;
+}
+
+ErrorCode firstError(const vector<uint8_t>& body) {
+    BufferReader in(body);
+    return decodeCreateTopicResponse(in).topics.at(0).error;
 }
 
 }  // namespace
@@ -539,6 +565,42 @@ TEST_CASE("A replication factor the cluster cannot hold is refused") {
               ErrorCode::InvalidReplicationFactor);
     }
     CHECK(broker.logs.partitionCount() == 0);
+}
+
+TEST_CASE("A peer's CreateReplicas makes this broker's copies with the leader's rules") {
+    ServingBroker broker("handler-createreplicas");
+    broker.context.nodeId = 2;
+
+    REQUIRE(firstError(broker.call(ApiKey::CreateReplicas, encoded(ordersFromBroker1()))) ==
+            ErrorCode::None);
+
+    // Node 2 is in {1, 2} and {2, 3}, not in {3, 1}.
+    REQUIRE(broker.logs.get(TopicPartition{"orders", 0}) != nullptr);
+    REQUIRE(broker.logs.get(TopicPartition{"orders", 1}) != nullptr);
+    CHECK(broker.logs.get(TopicPartition{"orders", 2}) == nullptr);
+
+    // The replica list as sent, and the override sent with it — not this
+    // broker's seven-day default.
+    const auto& config = broker.logs.get(TopicPartition{"orders", 1})->config();
+    CHECK(config.replication.replicas == vector<NodeId>{2, 3});
+    CHECK(config.retention.retentionMs == 60'000);
+}
+
+TEST_CASE("A CreateReplicas for copies that exist, or a bad name, changes nothing") {
+    ServingBroker broker("handler-createreplicas-refused");
+    broker.context.nodeId = 2;
+    broker.call(ApiKey::CreateReplicas, encoded(ordersFromBroker1()));
+    REQUIRE(broker.logs.partitionCount() == 2);
+
+    CHECK(firstError(broker.call(ApiKey::CreateReplicas, encoded(ordersFromBroker1()))) ==
+          ErrorCode::TopicAlreadyExists);
+
+    auto badName = ordersFromBroker1();
+    badName.topics[0].settings.name = "../escape";
+    CHECK(firstError(broker.call(ApiKey::CreateReplicas, encoded(badName))) ==
+          ErrorCode::InvalidTopic);
+
+    CHECK(broker.logs.partitionCount() == 2);
 }
 
 TEST_CASE("A topic name that cannot be a directory name is refused") {

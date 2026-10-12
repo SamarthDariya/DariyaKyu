@@ -5,6 +5,7 @@
 
 #include "cluster/replica_assignment.hpp"
 #include "common/errors.hpp"
+#include "protocol/create_replicas.hpp"
 #include "protocol/create_topic.hpp"
 #include "group/offsets_topic.hpp"
 #include "protocol/fetch.hpp"
@@ -113,6 +114,30 @@ void handleMetadata(RequestContext& request, Response& out) {
     out.append(buffer.take());
 }
 
+namespace {
+
+// A topic's settings applied over the broker's defaults. Shared by CreateTopic
+// and CreateReplicas, so a leader and its followers build a partition's rules
+// the same way from the same fields.
+storage::LogConfig configFor(const CreateTopicRequest::Topic& asked, storage::LogConfig config) {
+    if (asked.retentionMs) config.retention.retentionMs = *asked.retentionMs;
+    if (asked.retentionBytes)
+        config.retention.retentionBytes = static_cast<uint64_t>(*asked.retentionBytes);
+    if (asked.maxSegmentBytes)
+        config.roll.maxSegmentBytes = static_cast<uint64_t>(*asked.maxSegmentBytes);
+    if (asked.compact)
+        config.cleanup =
+            *asked.compact ? storage::CleanupPolicy::Compact : storage::CleanupPolicy::Delete;
+    return config;
+}
+
+// Whether `node` is one of `replicas` — whether a copy belongs on its disk.
+bool holds(const vector<NodeId>& replicas, NodeId node) {
+    return ranges::find(replicas, node) != replicas.end();
+}
+
+}  // namespace
+
 void handleCreateTopic(RequestContext& request, Response& out) {
     const auto          decoded = decodeCreateTopicRequest(request.body);
     CreateTopicResponse response;
@@ -152,15 +177,7 @@ void handleCreateTopic(RequestContext& request, Response& out) {
             continue;
         }
 
-        storage::LogConfig config = request.broker.logs.defaults();
-        if (asked.retentionMs) config.retention.retentionMs = *asked.retentionMs;
-        if (asked.retentionBytes)
-            config.retention.retentionBytes = static_cast<uint64_t>(*asked.retentionBytes);
-        if (asked.maxSegmentBytes)
-            config.roll.maxSegmentBytes = static_cast<uint64_t>(*asked.maxSegmentBytes);
-        if (asked.compact)
-            config.cleanup = *asked.compact ? storage::CleanupPolicy::Compact
-                                            : storage::CleanupPolicy::Delete;
+        storage::LogConfig config = configFor(asked, request.broker.logs.defaults());
 
         try {
             for (PartitionId p = 0; p < asked.partitionCount; ++p) {
@@ -171,8 +188,7 @@ void handleCreateTopic(RequestContext& request, Response& out) {
 
                 // Only the partitions this broker holds a copy of live on its
                 // disk. Telling the other replicas is the next step's job.
-                const auto& replicas = config.replication.replicas;
-                if (ranges::find(replicas, request.broker.nodeId) == replicas.end()) continue;
+                if (!holds(config.replication.replicas, request.broker.nodeId)) continue;
 
                 request.broker.logs.createPartition(TopicPartition{asked.name, p}, config);
             }
@@ -182,6 +198,59 @@ void handleCreateTopic(RequestContext& request, Response& out) {
             result.error = ErrorCode::Unknown;
         }
 
+        response.topics.push_back(std::move(result));
+    }
+
+    BufferWriter buffer;
+    encodeCreateTopicResponse(buffer, response);
+    out.append(buffer.take());
+}
+
+void handleCreateReplicas(RequestContext& request, Response& out) {
+    const auto          decoded = decodeCreateReplicasRequest(request.body);
+    CreateTopicResponse response;
+
+    for (const auto& topic : decoded.topics) {
+        CreateTopicResponse::Topic result;
+        result.name = topic.settings.name;
+
+        // A peer is trusted no more than a client here: the name still becomes a
+        // directory, and a broker with a bug can send a bad one as easily.
+        if (!storage::isUsableTopicName(result.name)) {
+            result.error = ErrorCode::InvalidTopic;
+            response.topics.push_back(std::move(result));
+            continue;
+        }
+
+        // Only the partitions with a copy on this broker. The sender may list
+        // them all; which ones are ours is decided by the replica lists it sent.
+        vector<const CreateReplicasRequest::Partition*> ours;
+        for (const auto& partition : topic.partitions)
+            if (holds(partition.replicas, request.broker.nodeId)) ours.push_back(&partition);
+
+        // All or nothing, for the same reason as CreateTopic.
+        const bool exists = ranges::any_of(ours, [&](const auto* partition) {
+            return request.broker.logs.get(TopicPartition{result.name, partition->partition}) !=
+                   nullptr;
+        });
+        if (exists) {
+            result.error = ErrorCode::TopicAlreadyExists;
+            response.topics.push_back(std::move(result));
+            continue;
+        }
+
+        // The replica list is taken as sent, never recomputed: the sender already
+        // decided it, and this broker's job is to agree.
+        storage::LogConfig config = configFor(topic.settings, request.broker.logs.defaults());
+        try {
+            for (const auto* partition : ours) {
+                config.replication.replicas = partition->replicas;
+                request.broker.logs.createPartition(TopicPartition{result.name, partition->partition},
+                                                    config);
+            }
+        } catch (const Error&) {
+            result.error = ErrorCode::Unknown;
+        }
         response.topics.push_back(std::move(result));
     }
 
@@ -495,6 +564,7 @@ void registerAllHandlers(ApiRegistry& registry) {
     registry.registerHandler(ApiKey::ListOffsets, 0, handleListOffsets);
     registry.registerHandler(ApiKey::Metadata, 0, handleMetadata);
     registry.registerHandler(ApiKey::CreateTopic, 0, handleCreateTopic);
+    registry.registerHandler(ApiKey::CreateReplicas, 0, handleCreateReplicas);
     registry.registerHandler(ApiKey::Produce, 0, handleProduce);
     registry.registerHandler(ApiKey::Fetch, 0, handleFetch);
 
