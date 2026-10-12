@@ -106,7 +106,17 @@ void handleMetadata(RequestContext& request, Response& out) {
             const storage::Log* log = request.broker.logs.get(TopicPartition{name, partition});
             vector<NodeId> replicas = log ? log->config().replication.replicas : vector<NodeId>{};
             if (replicas.empty()) replicas = {request.broker.nodeId};
-            topic.partitions.push_back({ErrorCode::None, partition, replicas.front(), replicas});
+
+            // Led here with followers: the manager knows. Led here alone: just
+            // us. Followed here: nobody on this broker knows, so say nothing.
+            const NodeId   leader = replicas.front();
+            vector<NodeId> isr;
+            if (auto tracked = request.broker.replicas.inSync(TopicPartition{name, partition}))
+                isr = std::move(*tracked);
+            else if (leader == request.broker.nodeId)
+                isr = {leader};
+
+            topic.partitions.push_back({ErrorCode::None, partition, leader, replicas, isr});
         }
         return topic;
     };

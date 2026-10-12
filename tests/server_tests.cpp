@@ -448,6 +448,36 @@ TEST_CASE("Metadata names every broker and each partition's real leader") {
     CHECK(partitions[1].replicas == vector<NodeId>{2, 1});
 }
 
+TEST_CASE("Metadata reports who is in sync, and only where it knows") {
+    ServingBroker broker("handler-metadata-isr");
+
+    // Partition 0 led here, followed by 2. Partition 1 led by 2, followed here.
+    CreateReplicasRequest::Topic topic;
+    topic.settings.name = "orders";
+    topic.partitions    = {{0, {1, 2}}, {1, {2, 1}}};
+    CreateReplicasRequest create;
+    create.topics.push_back(topic);
+    broker.call(ApiKey::CreateReplicas, encoded(create));
+
+    const auto describeOrders = [&] {
+        MetadataRequest request;
+        request.topics = {"orders"};
+        const auto   body = broker.call(ApiKey::Metadata, encoded(request));
+        BufferReader in(body);
+        return decodeMetadataResponse(in).topics.at(0).partitions;
+    };
+
+    auto partitions = describeOrders();
+    CHECK(partitions[0].isr == vector<NodeId>{1, 2});   // node 2 inside its first window
+    CHECK(partitions[1].isr.empty());                   // only node 2 knows
+
+    // Node 2 never fetches. Past the lag window, the timer drops it.
+    broker.replicas.shrinkInSync(storage::wallClockMillis() + 31'000);
+    partitions = describeOrders();
+    CHECK(partitions[0].isr == vector<NodeId>{1});
+    CHECK(partitions[0].replicas == vector<NodeId>{1, 2});   // still a replica, just behind
+}
+
 TEST_CASE("Metadata is ordered, so two identical brokers answer identically") {
     ServingBroker broker("handler-metadata-order");
     // Created out of order deliberately; LogManager stores them in a hash map.

@@ -49,11 +49,15 @@ struct MetadataResponse {
 
         // Every broker holding a copy, leader first (M7). One entry — the
         // leader — for a partition with no followers.
-        //
-        // The in-sync subset is not here yet. Nothing tracks it until the
-        // leader's replica state exists, and reporting every replica as in
-        // sync until then would be a claim nobody has checked.
         std::vector<NodeId> replicas;
+
+        // The replicas currently in sync, leader first: the ones an acks=all
+        // write waits for, and the ones a committed record is on.
+        //
+        // EMPTY when the answering broker is only a follower. Which followers
+        // are in sync is known to the leader alone, and a follower reporting
+        // its own guess would be a claim nobody checked. Ask the leader.
+        std::vector<NodeId> isr;
     };
 
     struct Topic {
