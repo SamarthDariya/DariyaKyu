@@ -151,6 +151,13 @@ bool holds(const vector<NodeId>& replicas, NodeId node) {
     return ranges::find(replicas, node) != replicas.end();
 }
 
+// Who leads a partition hosted here: the first replica partition.meta recorded,
+// or this broker for a partition with no list, which predates replication.
+NodeId leaderOf(const storage::Log& log, NodeId self) {
+    const auto& replicas = log.config().replication.replicas;
+    return replicas.empty() ? self : replicas.front();
+}
+
 // Sends every other broker holding a replica its CreateReplicas (M7).
 //
 // The broker that received the CreateTopic does a controller's job here, for
@@ -392,8 +399,24 @@ void handleFetch(RequestContext& request, Response& out) {
 
             storage::Log* log =
                 request.broker.logs.get(TopicPartition{topic.name, asked.partition});
-            if (log == nullptr) {
+            // Reads are served by the leader only, to consumers and followers
+            // alike. A follower's copy may be behind, and its high watermark is
+            // one round trip stale (DESIGN.md decision 16).
+            const NodeId self = request.broker.nodeId;
+            if (log == nullptr || leaderOf(*log, self) != self) {
                 result.error = ErrorCode::NotLeaderForPartition;
+                answer.partitions.push_back(result);
+                continue;
+            }
+
+            // A follower may read to the log end, so the claim has to be true. A
+            // client that set replicaId by accident would otherwise read records
+            // that could still be lost. Not NotLeaderForPartition: this broker IS
+            // the leader, and saying otherwise sends the caller back here forever.
+            const auto& replicas   = log->config().replication.replicas;
+            const bool  isFollower = decoded.replicaId != kConsumerReplicaId;
+            if (isFollower && (decoded.replicaId == self || !holds(replicas, decoded.replicaId))) {
+                result.error = ErrorCode::UnknownTopicOrPartition;
                 answer.partitions.push_back(result);
                 continue;
             }
@@ -405,8 +428,14 @@ void handleFetch(RequestContext& request, Response& out) {
             result.logStartOffset = log->logStartOffset();
 
             try {
+                // A consumer stops at the high watermark, so it never acts on a
+                // record a failover could take back. A follower reads to the log
+                // end — the watermark is the minimum of what followers have, so
+                // holding them to it would mean it could never move.
+                const auto maxBytes = static_cast<size_t>(asked.maxBytes);
                 const storage::ReadResult read =
-                    log->read(asked.fetchOffset, static_cast<size_t>(asked.maxBytes));
+                    isFollower ? log->read(asked.fetchOffset, maxBytes)
+                               : log->read(asked.fetchOffset, maxBytes, log->highWatermark());
 
                 result.error = errorCodeFor(read.error);
 

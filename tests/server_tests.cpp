@@ -843,6 +843,78 @@ TEST_CASE("Fetch returns records as file segments") {
     CHECK(storage::RecordBatch::parseHeader(partition.records).baseOffset == Offset(0));
 }
 
+namespace {
+
+// A partition on node 1 replicated to `replicas`, holding three one-record
+// batches, of which only offset 0 is committed.
+storage::Log& replicatedOrders(ServingBroker& broker, vector<NodeId> replicas) {
+    storage::LogConfig config  = testConfig();
+    config.replication.replicas = std::move(replicas);
+    storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0}, config);
+    log.setHighWatermarkTracksLogEnd(false);
+    for (int i = 0; i < 3; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i, 48);
+        log.append(bytes);
+    }
+    log.setHighWatermark(Offset(1));
+    return log;
+}
+
+FetchRequest fetchOrdersFrom(Offset offset, NodeId replicaId) {
+    FetchRequest request;
+    request.replicaId = replicaId;
+    request.topics.push_back({"orders", {{0, offset, 1 << 20}}});
+    return request;
+}
+
+}  // namespace
+
+TEST_CASE("A consumer reads to the high watermark, a follower to the log end") {
+    ServingBroker broker("handler-fetch-ceiling");
+    replicatedOrders(broker, {1, 2});
+    const size_t batch = makeUnstampedBatch(1000, 48).size();
+
+    const auto   asConsumer = broker.call(ApiKey::Fetch, encoded(fetchOrdersFrom(Offset(0), -1)));
+    BufferReader consumerIn(asConsumer);
+    const auto   consumer = decodeFetchResponse(consumerIn).topics[0].partitions[0];
+    CHECK(consumer.error == ErrorCode::None);
+    CHECK(consumer.highWatermark == Offset(1));
+    CHECK(consumer.records.size() == batch);   // offset 0 only
+
+    const auto   asFollower = broker.call(ApiKey::Fetch, encoded(fetchOrdersFrom(Offset(0), 2)));
+    BufferReader followerIn(asFollower);
+    const auto   follower = decodeFetchResponse(followerIn).topics[0].partitions[0];
+    CHECK(follower.error == ErrorCode::None);
+    CHECK(follower.records.size() == 3 * batch);   // everything, committed or not
+}
+
+TEST_CASE("A follower's copy is not served, to consumers or to other followers") {
+    ServingBroker broker("handler-fetch-not-leader");
+    replicatedOrders(broker, {2, 1});   // node 2 leads; we only hold a copy
+
+    for (const NodeId replicaId : {-1, 3}) {
+        const auto   body = broker.call(ApiKey::Fetch, encoded(fetchOrdersFrom(Offset(0), replicaId)));
+        BufferReader in(body);
+        CHECK(decodeFetchResponse(in).topics[0].partitions[0].error ==
+              ErrorCode::NotLeaderForPartition);
+    }
+}
+
+TEST_CASE("A replica id that is not one of the partition's followers is refused") {
+    ServingBroker broker("handler-fetch-stranger");
+    replicatedOrders(broker, {1, 2});
+
+    // Node 3 holds no copy, and node 1 is the leader itself. Either would read
+    // past the high watermark if believed.
+    for (const NodeId replicaId : {3, 1}) {
+        const auto   body = broker.call(ApiKey::Fetch, encoded(fetchOrdersFrom(Offset(0), replicaId)));
+        BufferReader in(body);
+        const auto   partition = decodeFetchResponse(in).topics[0].partitions[0];
+        CHECK(partition.error == ErrorCode::UnknownTopicOrPartition);
+        CHECK(partition.records.empty());
+    }
+}
+
 TEST_CASE("A caught-up fetch is a success with no records") {
     ServingBroker broker("handler-fetch-caught-up");
     storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0});
