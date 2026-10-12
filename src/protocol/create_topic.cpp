@@ -51,6 +51,7 @@ void encodeCreateTopicRequest(BufferWriter& out, const CreateTopicRequest& reque
         writeOverride(out, topic.retentionBytes);
         writeOverride(out, topic.maxSegmentBytes);
         writeFlag(out, topic.compact);
+        out.writeInt32(topic.replicationFactor);
     }
     out.writeInt32(request.timeoutMs);
 }
@@ -69,6 +70,7 @@ CreateTopicRequest decodeCreateTopicRequest(BufferReader& in) {
         topic.retentionBytes = readOverride(in);
         topic.maxSegmentBytes = readOverride(in);
         topic.compact         = readFlag(in);
+        topic.replicationFactor = in.readInt32();
         request.topics.push_back(std::move(topic));
     }
 

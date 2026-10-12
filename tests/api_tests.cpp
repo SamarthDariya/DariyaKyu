@@ -352,6 +352,7 @@ TEST_CASE("A CreateTopic request round-trips with and without overrides") {
     configured.partitionCount  = 1;
     configured.retentionMs     = 3'600'000;
     configured.maxSegmentBytes = 1u << 20;
+    configured.replicationFactor = 3;
 
     request.topics = {plain, configured};
 
@@ -364,6 +365,8 @@ TEST_CASE("A CreateTopic request round-trips with and without overrides") {
 
     CHECK(decoded.topics[0].name == "orders");
     CHECK(decoded.topics[0].partitionCount == 4);
+    CHECK(decoded.topics[0].replicationFactor == 1);   // the default, not a sentinel
+    CHECK(decoded.topics[1].replicationFactor == 3);
     CHECK_FALSE(decoded.topics[0].retentionMs.has_value());
     CHECK_FALSE(decoded.topics[0].retentionBytes.has_value());
     CHECK_FALSE(decoded.topics[0].maxSegmentBytes.has_value());

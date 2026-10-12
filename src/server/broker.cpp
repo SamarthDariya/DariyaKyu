@@ -21,7 +21,8 @@ Broker::Broker(Options options)
                options_.offsetsPartitions,
                options_.nodeId,
                options_.advertisedHost.empty() ? options_.host : options_.advertisedHost,
-               options_.port} {
+               options_.port,
+               options_.cluster} {
     registerAllHandlers(registry_);
 }
 

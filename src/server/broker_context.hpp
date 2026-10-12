@@ -8,6 +8,7 @@
 #include "common/types.hpp"
 #include "protocol/request_header.hpp"
 #include "protocol/response.hpp"
+#include "cluster/cluster_config.hpp"
 #include "group/group_coordinator.hpp"
 #include "group/offset_store.hpp"
 #include "storage/log_manager.hpp"
@@ -46,7 +47,17 @@ struct BrokerContext {
     // a client cannot connect to it.
     std::string  advertisedHost = "127.0.0.1";
     std::int32_t advertisedPort = 0;
+
+    // Every broker in the cluster (M7). Empty for a broker started without one,
+    // which is a cluster of one: itself. clusterOf() below fills that in, so no
+    // handler has to remember the special case.
+    cluster::ClusterConfig cluster;
 };
+
+inline cluster::ClusterConfig clusterOf(const BrokerContext& broker) {
+    if (!broker.cluster.nodes.empty()) return broker.cluster;
+    return cluster::ClusterConfig{{{broker.nodeId, broker.advertisedHost, broker.advertisedPort}}};
+}
 
 // One request, as a handler sees it.
 struct RequestContext {

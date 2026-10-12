@@ -48,7 +48,7 @@ struct BareBroker {
           logs(dir.file("data"), testConfig()),
           offsets(logs, group::kDefaultOffsetsPartitions),
           context{logs, groups, offsets, group::kDefaultOffsetsPartitions, 1, "127.0.0.1",
-                  9092} {}
+                  9092, {}} {}
 };
 
 // Builds a frame for `header` plus `body`, then runs it through the registry and
@@ -492,6 +492,53 @@ TEST_CASE("Creating a topic that exists changes nothing") {
 
     CHECK(response.topics[0].error == ErrorCode::TopicAlreadyExists);
     CHECK(broker.logs.partitionCount() == 2);
+}
+
+TEST_CASE("A broker creates only the replicas it holds, and records who holds them") {
+    ServingBroker broker("handler-createtopic-replicas");
+    broker.context.cluster = cluster::parseClusterConfig("1@h:1,2@h:2,3@h:3");   // we are 1
+
+    CreateTopicRequest        request;
+    CreateTopicRequest::Topic topic;
+    topic.name              = "orders";
+    topic.partitionCount    = 3;
+    topic.replicationFactor = 2;
+    request.topics.push_back(topic);
+
+    const auto   body = broker.call(ApiKey::CreateTopic, encoded(request));
+    BufferReader in(body);
+    REQUIRE(decodeCreateTopicResponse(in).topics[0].error == ErrorCode::None);
+
+    // Partition 0 is {1, 2} and partition 2 is {3, 1}: both ours. Partition 1 is
+    // {2, 3}, so it belongs on other brokers and not on this disk.
+    REQUIRE(broker.logs.get(TopicPartition{"orders", 0}) != nullptr);
+    REQUIRE(broker.logs.get(TopicPartition{"orders", 2}) != nullptr);
+    CHECK(broker.logs.get(TopicPartition{"orders", 1}) == nullptr);
+
+    CHECK(broker.logs.get(TopicPartition{"orders", 0})->config().replication.replicas ==
+          vector<NodeId>{1, 2});
+    CHECK(storage::readPartitionMeta(broker.logs.dataDir() / "orders-2",
+                                     TopicPartition{"orders", 2})
+              .config.replication.replicas == vector<NodeId>{3, 1});
+}
+
+TEST_CASE("A replication factor the cluster cannot hold is refused") {
+    ServingBroker broker("handler-createtopic-bad-rf");
+    broker.context.cluster = cluster::parseClusterConfig("1@h:1,2@h:2");
+
+    for (const int32_t factor : {0, 3}) {
+        CreateTopicRequest        request;
+        CreateTopicRequest::Topic topic;
+        topic.name              = "orders";
+        topic.replicationFactor = factor;
+        request.topics.push_back(topic);
+
+        const auto   body = broker.call(ApiKey::CreateTopic, encoded(request));
+        BufferReader in(body);
+        CHECK(decodeCreateTopicResponse(in).topics[0].error ==
+              ErrorCode::InvalidReplicationFactor);
+    }
+    CHECK(broker.logs.partitionCount() == 0);
 }
 
 TEST_CASE("A topic name that cannot be a directory name is refused") {

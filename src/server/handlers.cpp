@@ -1,7 +1,9 @@
 #include "server/handlers.hpp"
 
+#include <algorithm>
 #include <utility>
 
+#include "cluster/replica_assignment.hpp"
 #include "common/errors.hpp"
 #include "protocol/create_topic.hpp"
 #include "group/offsets_topic.hpp"
@@ -127,6 +129,16 @@ void handleCreateTopic(RequestContext& request, Response& out) {
             continue;
         }
 
+        // More copies than brokers would put two replicas on one machine, which is
+        // one copy counted twice. Refused before anything exists, like the name.
+        const cluster::ClusterConfig cluster = clusterOf(request.broker);
+        if (asked.replicationFactor < 1 ||
+            asked.replicationFactor > static_cast<int32_t>(cluster.nodes.size())) {
+            result.error = ErrorCode::InvalidReplicationFactor;
+            response.topics.push_back(std::move(result));
+            continue;
+        }
+
         // Checked for EVERY partition first. Creating three of four and then
         // failing would leave a topic that half exists, which no error code
         // describes and no client could act on.
@@ -151,8 +163,19 @@ void handleCreateTopic(RequestContext& request, Response& out) {
                                             : storage::CleanupPolicy::Delete;
 
         try {
-            for (PartitionId p = 0; p < asked.partitionCount; ++p)
+            for (PartitionId p = 0; p < asked.partitionCount; ++p) {
+                // Each partition has its own replicas, so its own config. Every
+                // broker computes the same list from the same cluster (step 4).
+                config.replication.replicas =
+                    cluster::assignReplicas(p, asked.replicationFactor, cluster);
+
+                // Only the partitions this broker holds a copy of live on its
+                // disk. Telling the other replicas is the next step's job.
+                const auto& replicas = config.replication.replicas;
+                if (ranges::find(replicas, request.broker.nodeId) == replicas.end()) continue;
+
                 request.broker.logs.createPartition(TopicPartition{asked.name, p}, config);
+            }
         } catch (const Error&) {
             // A disk that filled, a permission that changed. Not the client's
             // doing, and there is no honest code for it.

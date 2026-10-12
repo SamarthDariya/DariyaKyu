@@ -40,6 +40,10 @@ public:
         NodeId       nodeId              = 1;
         std::int64_t maintenanceIntervalMs = 30'000;
 
+        // Every broker in the cluster, this one included (M7). Empty means a
+        // cluster of one — see clusterOf in broker_context.hpp.
+        cluster::ClusterConfig cluster;
+
         // Partitions of __offsets, and therefore the number of possible
         // coordinators. Immutable once the topic exists — see offsets_topic.hpp.
         std::int32_t offsetsPartitions = group::kDefaultOffsetsPartitions;

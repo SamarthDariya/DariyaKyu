@@ -39,6 +39,11 @@ struct CreateTopicRequest {
         // meaningful value, so "absent" and "explicitly not compacted" need to be
         // different bytes. An int8 carrying -1, 0 or 1.
         std::optional<bool> compact;
+
+        // How many brokers hold a copy of each partition (M7). Plain int32, no
+        // sentinel: 1 is both the default and a real answer, and anything below
+        // it is refused by the handler with InvalidReplicationFactor.
+        std::int32_t replicationFactor = 1;
     };
 
     std::vector<Topic> topics;
