@@ -217,6 +217,38 @@ TEST_CASE("Stamping does not disturb the checksum") {
     CHECK(position == bytes.size());
 }
 
+TEST_CASE("A follower append keeps the leader's offsets and leaves the watermark") {
+    TempDir dir("log-follower-append");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
+
+    // Batches as the leader wrote them: already stamped, four records then three.
+    auto first  = makeBatch(Offset(0), 1000, 16, 4);
+    auto second = makeBatch(Offset(4), 2000, 16, 3);
+    log->appendAsFollower(Offset(0), first);
+    log->appendAsFollower(Offset(4), second);
+
+    CHECK(log->logEndOffset() == Offset(7));
+    // Committed is the leader's call, not the follower's.
+    CHECK(log->highWatermark() == Offset(0));
+}
+
+TEST_CASE("A follower append that does not start at the log end is refused") {
+    TempDir dir("log-follower-gap");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
+    auto    first = makeBatch(Offset(0), 1000);
+    log->appendAsFollower(Offset(0), first);
+
+    auto ahead = makeBatch(Offset(5), 2000);   // a gap: offsets 1-4 never arrived
+    auto again = makeBatch(Offset(0), 2000);   // an overlap: offset 0 twice
+    CHECK_THROWS_AS(log->appendAsFollower(Offset(5), ahead), OffsetInvariantViolated);
+    CHECK_THROWS_AS(log->appendAsFollower(Offset(0), again), OffsetInvariantViolated);
+
+    // A batch nobody stamped: the header says 0, the caller says 1.
+    auto unstamped = makeUnstampedBatch(3000);
+    CHECK_THROWS_AS(log->appendAsFollower(Offset(1), unstamped), OffsetInvariantViolated);
+    CHECK(log->logEndOffset() == Offset(1));
+}
+
 TEST_CASE("Append overwrites whatever base offset the producer sent") {
     TempDir dir("log-append-overwrite");
     const filesystem::path partition = dir.file("orders-0");

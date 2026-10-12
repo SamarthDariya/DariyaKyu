@@ -221,6 +221,27 @@ Offset Log::append(span<uint8_t> batchBytes) {
     return base;
 }
 
+void Log::appendAsFollower(Offset baseOffset, span<const uint8_t> batchBytes) {
+    // The same two locks as append(), in the same order: one appender at a time,
+    // and no roll swapping active_ out from under the write.
+    lock_guard appendLock(appendMutex_);
+    maybeRoll(wallClockMillis());
+
+    // The segment would catch a mismatch too, but only as "a gap in Log's
+    // bookkeeping". Checking here names the real cause.
+    const Offset end = logEndOffset_.load(memory_order_relaxed);
+    if (baseOffset != end)
+        throw OffsetInvariantViolated("follower append: batch starts at " +
+                                      baseOffset.toString() + " but the log ends at " +
+                                      end.toString() + " — a fetch response was lost or reordered");
+
+    // No stamp. The segment checks the header already says baseOffset, so a
+    // batch the leader never stamped is refused rather than written.
+    shared_lock lock(segmentsMutex_);
+    active_->append(baseOffset, batchBytes);
+    logEndOffset_.store(active_->nextOffset(), memory_order_release);
+}
+
 ReadResult Log::read(Offset offset, size_t maxBytes) const {
     // Shared, so any number of readers proceed at once. Held across the whole
     // call, including the segment's forward scan — which does read the file, but

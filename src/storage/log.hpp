@@ -229,6 +229,19 @@ public:
     // all its own comments ever needed.
     Offset append(std::span<std::uint8_t> batchBytes);
 
+    // The follower's write path (M7): one batch, copied from the leader's log.
+    //
+    // The bytes are const because a follower must not restamp. The leader
+    // already assigned the offsets, and the follower's log is a byte copy of the
+    // leader's — if it numbered records itself, two replicas would hold the same
+    // records at different offsets.
+    //
+    // `baseOffset` must equal this log's end exactly. Anything else means a fetch
+    // response was dropped or reordered, which is a bug, so it throws.
+    //
+    // Leaves the high watermark alone. A follower learns that from the leader.
+    void appendAsFollower(Offset baseOffset, std::span<const std::uint8_t> batchBytes);
+
     // Where the bytes for `offset` live, or why there are none.
     //
     // Resolves a location only — the blocking read happens later, on an I/O
