@@ -149,6 +149,20 @@ target_link_libraries(dariyakyu_cluster PUBLIC dariyakyu_common)
 target_compile_options(dariyakyu_cluster PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
+# Library: replication
+# ---------------------------------------------------------------------------
+#
+# The leader's view of its followers and, later, the follower's fetcher (M7).
+# Depends only on common for now; the server links it, not the reverse.
+
+add_library(dariyakyu_replication
+  src/replication/partition_replicas.cpp
+)
+
+target_link_libraries(dariyakyu_replication PUBLIC dariyakyu_common)
+target_compile_options(dariyakyu_replication PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------------------
 # Library: server
 # ---------------------------------------------------------------------------
 #
@@ -163,7 +177,8 @@ add_library(dariyakyu_server
   src/server/broker.cpp
 )
 
-target_link_libraries(dariyakyu_server PUBLIC dariyakyu_protocol dariyakyu_group dariyakyu_cluster)
+target_link_libraries(dariyakyu_server PUBLIC dariyakyu_protocol dariyakyu_group dariyakyu_cluster
+                      dariyakyu_replication)
 target_compile_options(dariyakyu_server PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
@@ -229,7 +244,7 @@ add_test(NAME codec_tests COMMAND codec_tests)
 # The storage suites share tests/test_support.hpp, so each needs tests/ on its
 # include path. Split by layer rather than kept as one file: a single 4,000-line
 # suite meant every change rebuilt and reran all of it.
-foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests server_tests cli_tests group_tests cluster_tests)
+foreach(suite index_tests segment_tests log_tests manager_tests protocol_tests api_tests server_tests cli_tests group_tests cluster_tests replication_tests)
   add_executable(${suite} tests/${suite}.cpp)
   target_link_libraries(${suite} PRIVATE dariyakyu_server dariyakyu_cli doctest::doctest)
   target_include_directories(${suite} PRIVATE tests)
