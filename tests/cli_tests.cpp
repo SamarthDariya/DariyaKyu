@@ -736,37 +736,58 @@ Offset produceKeyed(protocol::Client& client, const string& topic, PartitionId p
     return answer.baseOffset;
 }
 
+// Reads a partition's segment files while the cleaner may be running.
+//
+// The cleaner can swap or delete a segment between the directory listing and
+// the open — that is it working, not a bug — and the open then fails with
+// ENOENT. So a vanished file means: list again and read again from scratch.
+// Only IoError is retried. Bytes that do not parse are a real failure.
+template <typename Read>
+auto readWhileCleaning(Read read) {
+    for (int attempt = 1;; ++attempt) {
+        try {
+            return read();
+        } catch (const IoError&) {
+            if (attempt == 20) throw;
+        }
+    }
+}
+
 // Every (key, value) currently in a partition, read back from disk.
 map<string, string> liveValues(const filesystem::path& partition) {
-    map<string, filesystem::path> logs;
-    for (const auto& entry : filesystem::directory_iterator(partition))
-        if (entry.path().extension() == ".log")
-            logs[entry.path().filename().string()] = entry.path();
+    return readWhileCleaning([&] {
+        map<string, filesystem::path> logs;
+        for (const auto& entry : filesystem::directory_iterator(partition))
+            if (entry.path().extension() == ".log")
+                logs[entry.path().filename().string()] = entry.path();
 
-    map<string, string> values;
-    for (const auto& [name, path] : logs)
-        storage::scanSegment(path, [&](const storage::ScannedBatch& batch) {
-            for (const auto& record : RecordBatch::decodeRecords(batch.bytes)) {
-                const string key = keyText(record);
-                if (storage::isTombstone(record)) values.erase(key);
-                else values[key] = valueText(record);
-            }
-        });
-    return values;
+        map<string, string> values;
+        for (const auto& [name, path] : logs)
+            storage::scanSegment(path, [&](const storage::ScannedBatch& batch) {
+                for (const auto& record : RecordBatch::decodeRecords(batch.bytes)) {
+                    const string key = keyText(record);
+                    if (storage::isTombstone(record)) values.erase(key);
+                    else values[key] = valueText(record);
+                }
+            });
+        return values;
+    });
 }
 
 size_t recordsOnDisk(const filesystem::path& partition) {
-    map<string, filesystem::path> logs;
-    for (const auto& entry : filesystem::directory_iterator(partition))
-        if (entry.path().extension() == ".log")
-            logs[entry.path().filename().string()] = entry.path();
+    return readWhileCleaning([&] {
+        map<string, filesystem::path> logs;
+        for (const auto& entry : filesystem::directory_iterator(partition))
+            if (entry.path().extension() == ".log")
+                logs[entry.path().filename().string()] = entry.path();
 
-    size_t count = 0;
-    for (const auto& [name, path] : logs)
-        storage::scanSegment(path, [&](const storage::ScannedBatch& batch) {
-            count += RecordBatch::decodeRecords(batch.bytes).size();
-        });
-    return count;
+        size_t count = 0;
+        for (const auto& [name, path] : logs)
+            storage::scanSegment(path, [&](const storage::ScannedBatch& batch) {
+                count += RecordBatch::decodeRecords(batch.bytes).size();
+            });
+        return count;
+    });
 }
 
 }  // namespace
