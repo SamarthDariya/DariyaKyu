@@ -38,6 +38,9 @@ namespace dariyakyu::storage {
 //   segmentDeleteDelayMs int64
 //   cleanupPolicy        int8     v2+, 0 delete / 1 compact
 //   deleteRetentionMs    int64    v2+
+//   replicaCount         int32    v3+, 0 = this broker only
+//   replicas             int32 x replicaCount, leader first
+//   minInsyncReplicas    int32    v3+
 //
 // Binary rather than text because it is broker state, not user configuration,
 // and it reuses the codec that already exists. `dariyakyu-dump` is the intended
@@ -63,7 +66,7 @@ struct PartitionMeta {
     //                  config read wrongly is worse than one not read at all —
     //                  misreading a retention limit silently deletes data or
     //                  silently keeps it forever.
-    static constexpr std::int16_t kVersion        = 2;
+    static constexpr std::int16_t kVersion        = 3;
     static constexpr std::int16_t kOldestReadable = 1;
     static constexpr std::uint32_t kMagic   = 0x444B504D;   // "DKPM"
     static constexpr const char*  kFileName = "partition.meta";

@@ -129,14 +129,33 @@ struct CompactionPolicy {
     std::int64_t deleteRetentionMs = 24ll * 60 * 60 * 1000;   // 1 day, as Kafka defaults
 };
 
+// Which brokers hold copies of a partition, and how many must have a write
+// before an acks=all producer is told it succeeded (M7).
+struct ReplicationPolicy {
+    // Every broker holding a copy, leader first, as assignReplicas produced it.
+    //
+    // EMPTY means "this broker only" — a partition from before replication, or
+    // a single-node broker. That is exactly what a v1 or v2 partition.meta
+    // describes, so an old file needs no guessing.
+    std::vector<NodeId> replicas;
+
+    // The fewest in-sync replicas an acks=all write will accept. Below it the
+    // write is refused with NotEnoughReplicas, because "all" of one replica is a
+    // promise nobody can keep.
+    std::int32_t minInsyncReplicas = 1;
+
+    bool replicated() const { return replicas.size() > 1; }
+};
+
 // Everything a partition needs to know about itself. Written to partition.meta so
 // a broker that boots while the controller is down still opens its logs with the
 // right rules rather than with whatever the defaults happen to be.
 struct LogConfig {
-    RollPolicy       roll;
-    RetentionPolicy  retention;
-    CompactionPolicy compaction;
-    CleanupPolicy    cleanup = CleanupPolicy::Delete;
+    RollPolicy        roll;
+    RetentionPolicy   retention;
+    CompactionPolicy  compaction;
+    CleanupPolicy     cleanup = CleanupPolicy::Delete;
+    ReplicationPolicy replication;
 
     bool compacted() const { return cleanup == CleanupPolicy::Compact; }
 };

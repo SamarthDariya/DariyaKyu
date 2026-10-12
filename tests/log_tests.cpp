@@ -1768,9 +1768,10 @@ TEST_CASE("A meta file written before compaction existed still opens") {
     // older version is read, and the fields it predates take their defaults.
     auto v2 = encodePartitionMeta(sampleMeta());
 
-    // Truncate the two v2 fields off the end and stamp the version back to 1,
-    // which is byte-for-byte what the M3 encoder produced.
-    vector<uint8_t> v1(v2.begin(), v2.end() - (1 + 8));
+    // Truncate the v3 fields (an empty replica count and minInsyncReplicas) and
+    // the two v2 fields off the end, and stamp the version back to 1 — which is
+    // byte-for-byte what the M3 encoder produced.
+    vector<uint8_t> v1(v2.begin(), v2.end() - (4 + 4) - (1 + 8));
     v1[5] = 1;
 
     const auto decoded = decodePartitionMeta(v1);
@@ -1778,6 +1779,48 @@ TEST_CASE("A meta file written before compaction existed still opens") {
     CHECK(decoded.config.compaction.deleteRetentionMs ==
           CompactionPolicy{}.deleteRetentionMs);
     CHECK(decoded.tp == sampleMeta().tp);
+}
+
+TEST_CASE("Replicas and minInsyncReplicas survive the meta file round trip") {
+    PartitionMeta meta = sampleMeta();
+    meta.config.replication.replicas          = {2, 3, 1};
+    meta.config.replication.minInsyncReplicas = 2;
+
+    const auto decoded = decodePartitionMeta(encodePartitionMeta(meta));
+
+    // Order kept: the first replica is the leader.
+    CHECK(decoded.config.replication.replicas == vector<NodeId>{2, 3, 1});
+    CHECK(decoded.config.replication.minInsyncReplicas == 2);
+    CHECK(decoded.config.replication.replicated());
+}
+
+TEST_CASE("A meta file written before replication existed is one copy, here") {
+    // Drop the v3 fields and stamp version 2: what the M6 encoder produced.
+    auto            v3 = encodePartitionMeta(sampleMeta());
+    vector<uint8_t> v2(v3.begin(), v3.end() - (4 + 4));
+    v2[5] = 2;
+
+    const auto decoded = decodePartitionMeta(v2);
+    CHECK(decoded.config.replication.replicas.empty());
+    CHECK(decoded.config.replication.minInsyncReplicas == 1);
+    CHECK_FALSE(decoded.config.replication.replicated());
+}
+
+TEST_CASE("Impossible replication settings in a meta file are corruption") {
+    PartitionMeta meta = sampleMeta();
+    meta.config.replication.replicas = {1, 2};
+
+    // minInsyncReplicas is the last field. Zero, or more than there are replicas.
+    for (const int32_t bad : {0, 3}) {
+        meta.config.replication.minInsyncReplicas = bad;
+        CHECK_THROWS_AS(decodePartitionMeta(encodePartitionMeta(meta)), CorruptData);
+    }
+
+    // A replica count far larger than the bytes that follow.
+    meta.config.replication.minInsyncReplicas = 1;
+    auto bytes = encodePartitionMeta(meta);
+    bytes[bytes.size() - 4 - 8 - 4] = 0x7F;   // high byte of the count
+    CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
 }
 
 TEST_CASE("A meta file from a newer broker is refused, not guessed at") {
@@ -1791,8 +1834,9 @@ TEST_CASE("A meta file from a newer broker is refused, not guessed at") {
 }
 
 TEST_CASE("An unrecognised cleanup policy is corruption, not a default") {
+    // The policy byte sits before deleteRetentionMs (8) and the v3 fields (4 + 4).
     auto bytes = encodePartitionMeta(sampleMeta());
-    bytes[bytes.size() - 9] = 7;
+    bytes[bytes.size() - 17] = 7;
 
     CHECK_THROWS_AS(decodePartitionMeta(bytes), CorruptData);
 }

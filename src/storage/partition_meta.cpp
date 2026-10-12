@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <optional>
 #include <string>
@@ -67,6 +68,12 @@ vector<uint8_t> encodePartitionMeta(const PartitionMeta& meta) {
     out.writeInt8(static_cast<int8_t>(meta.config.cleanup));
     out.writeInt64(meta.config.compaction.deleteRetentionMs);
 
+    // v3 and later. A count, then that many node ids.
+    const auto& replication = meta.config.replication;
+    out.writeInt32(static_cast<int32_t>(replication.replicas.size()));
+    for (const NodeId node : replication.replicas) out.writeInt32(node);
+    out.writeInt32(replication.minInsyncReplicas);
+
     return out.take();
 }
 
@@ -123,6 +130,30 @@ PartitionMeta decodePartitionMeta(span<const uint8_t> bytes) {
         meta.config.cleanup = static_cast<CleanupPolicy>(cleanup);
 
         meta.config.compaction.deleteRetentionMs = in.readInt64();
+    }
+
+    // A v1 or v2 file predates replication: one copy, on this broker. That is
+    // what an empty replica list already means, so again nothing is guessed.
+    if (version >= 3) {
+        auto& replication = meta.config.replication;
+
+        // Checked before reserving, so a corrupt count cannot ask for gigabytes.
+        const int32_t count = in.readInt32();
+        if (count < 0 || static_cast<size_t>(count) * 4 > in.remaining())
+            throw CorruptData("partition.meta: replica count " + to_string(count));
+        for (int32_t i = 0; i < count; ++i) {
+            const NodeId node = in.readInt32();
+            if (node < 0) throw CorruptData("partition.meta: replica id " + to_string(node));
+            replication.replicas.push_back(node);
+        }
+
+        // At least one, and no more than there are replicas to be in sync.
+        replication.minInsyncReplicas = in.readInt32();
+        const auto copies = max<int32_t>(count, 1);
+        if (replication.minInsyncReplicas < 1 || replication.minInsyncReplicas > copies)
+            throw CorruptData("partition.meta: minInsyncReplicas " +
+                              to_string(replication.minInsyncReplicas) + " with " +
+                              to_string(copies) + " replica(s)");
     }
 
     // Bytes left over mean this is not the file it claims to be — most likely
