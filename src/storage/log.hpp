@@ -278,6 +278,19 @@ public:
     Offset highWatermark() const { return highWatermark_.load(std::memory_order_acquire); }
     void   setHighWatermark(Offset offset);
 
+    // Whether append() moves the high watermark up to the new log end.
+    //
+    // On by default, which is right for a partition with one replica: what the
+    // leader has, everyone has. A leader with followers turns it off, and from
+    // then on only setHighWatermark moves it — called when the followers have
+    // caught up.
+    //
+    // Not in partition.meta. Who commits is a fact about the cluster right now,
+    // not about the bytes on disk, and M8 flips it on failover.
+    void setHighWatermarkTracksLogEnd(bool tracks) {
+        hwTracksLogEnd_.store(tracks, std::memory_order_release);
+    }
+
     // Discards every record at or after `offset`, so the log ends there.
     //
     // This is failover truncation (M8). When a broker rejoins and discovers its
@@ -416,6 +429,7 @@ private:
 
     std::atomic<Offset> logEndOffset_{Offset{0}};
     std::atomic<Offset> highWatermark_{Offset{0}};
+    std::atomic<bool>   hwTracksLogEnd_{true};
 
     // mutable, so const readers can take a shared lock. Guards the map and the
     // active_ pointer — not the bytes either of them describes.

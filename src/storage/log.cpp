@@ -212,11 +212,11 @@ Offset Log::append(span<uint8_t> batchBytes) {
     // and the segment state behind it.
     logEndOffset_.store(next, memory_order_release);
 
-    // Single node: nothing is replicated, so everything written is immediately
-    // committed and visible. M7 is where this stops being a copy of the log end
-    // offset and becomes the minimum across in-sync replicas — the point of it
-    // being a separate number at all.
-    highWatermark_.store(next, memory_order_release);
+    // Single replica: nothing to wait for, so everything written is committed
+    // and visible at once. A leader with followers has switched this off, and
+    // its watermark moves only when they catch up — the point of it being a
+    // separate number at all.
+    if (hwTracksLogEnd_.load(memory_order_acquire)) highWatermark_.store(next, memory_order_release);
 
     return base;
 }

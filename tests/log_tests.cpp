@@ -249,6 +249,29 @@ TEST_CASE("A follower append that does not start at the log end is refused") {
     CHECK(log->logEndOffset() == Offset(1));
 }
 
+TEST_CASE("A leader with followers commits only when told to") {
+    TempDir dir("log-hwm-replicated");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
+
+    // One record while unreplicated: committed as soon as it is written.
+    auto first = makeUnstampedBatch(1000);
+    log->append(first);
+    REQUIRE(log->highWatermark() == Offset(1));
+
+    // Followers attached. Writes land, but nobody else has them yet.
+    log->setHighWatermarkTracksLogEnd(false);
+    for (int i = 0; i < 3; ++i) {
+        auto bytes = makeUnstampedBatch(2000 + i);
+        log->append(bytes);
+    }
+    CHECK(log->logEndOffset() == Offset(4));
+    CHECK(log->highWatermark() == Offset(1));
+
+    // A follower reports it has everything below 3.
+    log->setHighWatermark(Offset(3));
+    CHECK(log->highWatermark() == Offset(3));
+}
+
 TEST_CASE("Append overwrites whatever base offset the producer sent") {
     TempDir dir("log-append-overwrite");
     const filesystem::path partition = dir.file("orders-0");
