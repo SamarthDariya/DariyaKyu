@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -266,13 +267,21 @@ public:
     // Resolves a location only — the blocking read happens later, on an I/O
     // thread, when the network layer hands this range to sendfile.
     //
-    // Bounded by the LOG END OFFSET, not the high watermark. On a single node
-    // they are equal so it makes no difference, but the distinction matters at
-    // M7: a follower fetching for replication must be able to read right up to
-    // the leader's log end, while a consumer must not see past the high
-    // watermark. So the watermark clamp belongs to the caller that knows which
-    // of the two it is serving, not here.
-    ReadResult read(Offset offset, std::size_t maxBytes) const;
+    // Bounded by the log end offset, and by `ceiling` if that is lower (M7).
+    // A consumer passes the high watermark, so it never sees a record that could
+    // still be lost; a follower passes nothing, and reads to the log end. Which
+    // of the two is being served is the caller's knowledge, not the log's.
+    //
+    // An offset at or past the ceiling is a SUCCESS with no bytes — the records
+    // exist, they are just not committed yet — exactly like a caught-up read.
+    // Only past the log end is AboveLogEnd.
+    //
+    // The range is cut at the start of the batch holding the ceiling, so a batch
+    // is never half sent. If the ceiling falls INSIDE the batch being read, that
+    // batch is withheld whole until the ceiling passes its end. A follower only
+    // ever reports batch boundaries, so a real high watermark sits on one.
+    ReadResult read(Offset offset, std::size_t maxBytes,
+                    Offset ceiling = Offset{std::numeric_limits<std::int64_t>::max()}) const;
 
     // Seals the active segment and starts a new one, if the roll policy says so.
     //
@@ -430,6 +439,10 @@ private:
         std::unique_ptr<SealedSegment> segment;
         std::int64_t                   unlinkedAtMs = 0;
     };
+
+    // `range`, shortened so it ends before the batch holding `stop`. A read's
+    // ceiling, applied. Assumes segmentsMutex_ is held, shared or exclusive.
+    static FileRange cutAt(const SegmentBase& segment, FileRange range, Offset stop, Offset end);
 
     // Assumes segmentsMutex_ is held exclusively.
     void burySegmentLocked(std::unique_ptr<SealedSegment> segment, std::int64_t nowMs);

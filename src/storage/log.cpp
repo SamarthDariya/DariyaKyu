@@ -242,7 +242,7 @@ void Log::appendAsFollower(Offset baseOffset, span<const uint8_t> batchBytes) {
     logEndOffset_.store(active_->nextOffset(), memory_order_release);
 }
 
-ReadResult Log::read(Offset offset, size_t maxBytes) const {
+ReadResult Log::read(Offset offset, size_t maxBytes, Offset ceiling) const {
     // Shared, so any number of readers proceed at once. Held across the whole
     // call, including the segment's forward scan — which does read the file, but
     // only batch headers, and only within one index interval. What the lock
@@ -257,15 +257,17 @@ ReadResult Log::read(Offset offset, size_t maxBytes) const {
     // ordinary lag, so it must stay distinguishable from BelowLogStart.
     if (offset > end) return {ReadError::AboveLogEnd, {}};
 
-    // Caught up. The most common read in the system, and a success: no error, no
-    // bytes. Note this is checked before any segment is consulted, so the
-    // ordinary case costs one atomic load and nothing else.
-    if (offset == end) return {ReadError::None, {}};
+    // Caught up — with the log, or with what this caller may see of it. The most
+    // common read in the system, and a success: no error, no bytes. Checked
+    // before any segment is consulted, so the ordinary case costs one atomic
+    // load and nothing else.
+    const Offset stop = min(ceiling, end);
+    if (offset >= stop) return {ReadError::None, {}};
 
     // In the active segment. Checked first because it is where reads cluster —
     // consumers are usually near the head of the log.
     if (offset >= active_->baseOffset())
-        return {ReadError::None, active_->read(offset, maxBytes)};
+        return {ReadError::None, cutAt(*active_, active_->read(offset, maxBytes), stop, end)};
 
     // Otherwise find the sealed segment holding it. upper_bound gives the first
     // base offset GREATER than the target, so stepping back one gives the
@@ -280,7 +282,20 @@ ReadResult Log::read(Offset offset, size_t maxBytes) const {
     if (it == sealed_.begin()) return {ReadError::BelowLogStart, {}};
 
     --it;
-    return {ReadError::None, it->second->read(offset, maxBytes)};
+    return {ReadError::None, cutAt(*it->second, it->second->read(offset, maxBytes), stop, end)};
+}
+
+FileRange Log::cutAt(const SegmentBase& segment, FileRange range, Offset stop, Offset end) {
+    // Nothing to cut: the reader may see the whole log, or the stop lies in a
+    // later segment than this range, which never crosses out of its own.
+    if (stop >= end || !segment.contains(stop)) return range;
+
+    // Where the batch holding `stop` begins. The segment's own lookup finds it;
+    // the fetch size is irrelevant, only the position is used.
+    const uint64_t cut = segment.read(stop, 0).position;
+    if (cut <= range.position) return FileRange{range.fd, range.position, 0};
+    range.length = min<size_t>(range.length, static_cast<size_t>(cut - range.position));
+    return range;
 }
 
 void Log::maybeRoll(int64_t nowMs) {

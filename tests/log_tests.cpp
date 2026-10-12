@@ -272,6 +272,83 @@ TEST_CASE("A leader with followers commits only when told to") {
     CHECK(log->highWatermark() == Offset(3));
 }
 
+TEST_CASE("A read ceiling stops at the batch where it falls") {
+    TempDir dir("log-read-ceiling");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
+
+    // Three one-record batches of identical size, at offsets 0, 1 and 2.
+    size_t batchSize = 0;
+    for (int i = 0; i < 3; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        batchSize  = bytes.size();
+        log->append(bytes);
+    }
+
+    // No ceiling: all three. Ceiling 2: the first two, ending exactly where
+    // batch 2 begins.
+    CHECK(log->read(Offset(0), kBigFetch).range.length == 3 * batchSize);
+    const auto capped = log->read(Offset(0), kBigFetch, Offset(2));
+    CHECK(capped.ok());
+    CHECK(capped.range.length == 2 * batchSize);
+
+    // Reading from the middle, the cut still lands on the same boundary.
+    CHECK(log->read(Offset(1), kBigFetch, Offset(2)).range.length == batchSize);
+}
+
+TEST_CASE("At the ceiling is caught up; past the log end is still an error") {
+    TempDir dir("log-read-ceiling-edges");
+    auto    log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
+    for (int i = 0; i < 3; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        log->append(bytes);
+    }
+
+    // Offsets 1 and 2 exist but are not committed: success, nothing to send.
+    // A consumer there is waiting, not lost.
+    for (const Offset offset : {Offset(1), Offset(2)}) {
+        const auto result = log->read(offset, kBigFetch, Offset(1));
+        CHECK(result.ok());
+        CHECK(result.range.empty());
+    }
+
+    // Past the log end is the future, ceiling or not.
+    CHECK(log->read(Offset(4), kBigFetch, Offset(1)).error == ReadError::AboveLogEnd);
+}
+
+TEST_CASE("A ceiling inside a batch withholds that whole batch") {
+    TempDir dir("log-read-ceiling-mid-batch");
+    auto    log  = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), testConfig());
+    auto    four = makeUnstampedBatch(1000, 16, 4);   // offsets 0-3, one batch
+    log->append(four);
+
+    // Offsets 0 and 1 are below the ceiling, but they share a batch with 2 and
+    // 3, which are not. Half a batch cannot be sent, so none of it is — until
+    // the ceiling reaches the batch's end.
+    const auto withheld = log->read(Offset(0), kBigFetch, Offset(2));
+    CHECK(withheld.ok());
+    CHECK(withheld.range.empty());
+    CHECK(log->read(Offset(0), kBigFetch, Offset(4)).range.length == four.size());
+}
+
+TEST_CASE("A ceiling in a later segment cuts nothing from this one") {
+    TempDir    dir("log-read-ceiling-later-segment");
+    RollPolicy roll       = testPolicy();
+    roll.maxSegmentBytes  = 1;   // every append after the first rolls first
+    auto log = Log::create(TopicPartition{"orders", 0}, dir.file("orders-0"), configWith(roll));
+
+    size_t batchSize = 0;
+    for (int i = 0; i < 3; ++i) {
+        auto bytes = makeUnstampedBatch(1000 + i);
+        batchSize  = bytes.size();
+        log->append(bytes);
+    }
+    REQUIRE(log->segmentCount() == 3);
+
+    // A read covers one segment at most. The ceiling sits in the last one, so
+    // the first segment's batch goes out whole.
+    CHECK(log->read(Offset(0), kBigFetch, Offset(2)).range.length == batchSize);
+}
+
 TEST_CASE("Append overwrites whatever base offset the producer sent") {
     TempDir dir("log-append-overwrite");
     const filesystem::path partition = dir.file("orders-0");
