@@ -141,6 +141,7 @@ target_compile_options(dariyakyu_group PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(dariyakyu_cluster
   src/cluster/cluster_config.cpp
+  src/cluster/replica_assignment.cpp
 )
 
 target_link_libraries(dariyakyu_cluster PUBLIC dariyakyu_common)
