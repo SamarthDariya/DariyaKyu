@@ -9,7 +9,7 @@
 #include <set>
 
 #include "cli/assignor.hpp"
-#include "cli/client.hpp"
+#include "protocol/client.hpp"
 #include "cli/group_consumer.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/fetch.hpp"
@@ -51,7 +51,7 @@ vector<uint8_t> body(const Request& request, Encoder encoder) {
 }
 
 // Everything the CLI does to send one line, minus the terminal.
-Offset produceLine(cli::Client& client, const string& topic, PartitionId partition,
+Offset produceLine(protocol::Client& client, const string& topic, PartitionId partition,
                    const string& line) {
     storage::RecordBatchBuilder builder;
     builder.append(storage::wallClockMillis(), nullopt,
@@ -70,7 +70,7 @@ Offset produceLine(cli::Client& client, const string& topic, PartitionId partiti
 }
 
 // And everything it does to print them back.
-vector<string> consumeFrom(cli::Client& client, const string& topic, PartitionId partition,
+vector<string> consumeFrom(protocol::Client& client, const string& topic, PartitionId partition,
                            Offset from) {
     FetchRequest request;
     request.topics.push_back({topic, {{partition, from, 1 << 20}}});
@@ -105,7 +105,7 @@ TEST_CASE("A client creates a topic, produces to it, and reads it back") {
     server::Broker broker(optionsFor(dir.file("data")));
     broker.start();
 
-    cli::Client client("127.0.0.1", broker.port());
+    protocol::Client client("127.0.0.1", broker.port());
 
     CreateTopicRequest create;
     create.topics.push_back({"orders", 2, {}, {}, {}, {}});
@@ -138,7 +138,7 @@ TEST_CASE("A caught-up consumer gets an answer with nothing in it") {
     broker.start();
     broker.logs().createPartition(TopicPartition{"orders", 0});
 
-    cli::Client client("127.0.0.1", broker.port());
+    protocol::Client client("127.0.0.1", broker.port());
     produceLine(client, "orders", 0, "one");
 
     // The most common fetch in the system, over a real socket: success, no bytes,
@@ -156,7 +156,7 @@ TEST_CASE("Records survive the broker being restarted") {
     {
         server::Broker broker(options);
         broker.start();
-        cli::Client client("127.0.0.1", broker.port());
+        protocol::Client client("127.0.0.1", broker.port());
 
         CreateTopicRequest create;
         create.topics.push_back({"orders", 1, {}, {}, {}, {}});
@@ -176,7 +176,7 @@ TEST_CASE("Records survive the broker being restarted") {
     // segments while scanning only the newest.
     server::Broker restarted(options);
     restarted.start();
-    cli::Client client("127.0.0.1", restarted.port());
+    protocol::Client client("127.0.0.1", restarted.port());
 
     CHECK(consumeFrom(client, "orders", 0, Offset(0)) == expected);
 
@@ -192,7 +192,7 @@ TEST_CASE("A client is told where the log begins and ends") {
     broker.start();
     broker.logs().createPartition(TopicPartition{"orders", 0});
 
-    cli::Client client("127.0.0.1", broker.port());
+    protocol::Client client("127.0.0.1", broker.port());
     for (int i = 0; i < 4; ++i) produceLine(client, "orders", 0, "record " + to_string(i));
 
     ListOffsetsRequest request;
@@ -216,7 +216,7 @@ TEST_CASE("Metadata names every partition, and a topic that is not there") {
     for (PartitionId p = 0; p < 3; ++p)
         broker.logs().createPartition(TopicPartition{"orders", p});
 
-    cli::Client     client("127.0.0.1", broker.port());
+    protocol::Client     client("127.0.0.1", broker.port());
     MetadataRequest request;
     request.topics = {"orders", "missing"};
 
@@ -237,7 +237,7 @@ TEST_CASE("One client's requests stay matched to its own responses") {
     broker.start();
     broker.logs().createPartition(TopicPartition{"orders", 0});
 
-    cli::Client client("127.0.0.1", broker.port());
+    protocol::Client client("127.0.0.1", broker.port());
 
     // Fifty requests down one connection. Client::call checks the correlation id
     // rather than assuming — a mismatch means the stream desynchronised, and
@@ -260,14 +260,14 @@ TEST_CASE("Several clients share one broker") {
     vector<thread> clients;
     for (PartitionId p = 0; p < 4; ++p) {
         clients.emplace_back([&, p] {
-            cli::Client client("127.0.0.1", broker.port());
+            protocol::Client client("127.0.0.1", broker.port());
             for (int i = 0; i < 20; ++i)
                 produceLine(client, "orders", p, "p" + to_string(p) + " r" + to_string(i));
         });
     }
     for (auto& client : clients) client.join();
 
-    cli::Client reader("127.0.0.1", broker.port());
+    protocol::Client reader("127.0.0.1", broker.port());
     for (PartitionId p = 0; p < 4; ++p) {
         const auto values = consumeFrom(reader, "orders", p, Offset(0));
         REQUIRE(values.size() == 20);
@@ -481,7 +481,7 @@ TEST_CASE("One consumer in a group gets every partition") {
     for (PartitionId p = 0; p < 4; ++p)
         broker.logs().createPartition(TopicPartition{"orders", p});
 
-    cli::Client   client("127.0.0.1", broker.port());
+    protocol::Client   client("127.0.0.1", broker.port());
     GroupConsumer consumer(client, "g", {"orders"});
 
     const auto assigned = consumer.join();
@@ -500,8 +500,8 @@ TEST_CASE("Two consumers split a topic between them, exclusively") {
     for (PartitionId p = 0; p < 4; ++p)
         broker.logs().createPartition(TopicPartition{"orders", p});
 
-    cli::Client clientA("127.0.0.1", broker.port());
-    cli::Client clientB("127.0.0.1", broker.port());
+    protocol::Client clientA("127.0.0.1", broker.port());
+    protocol::Client clientB("127.0.0.1", broker.port());
 
     GroupConsumer a(clientA, "g", {"orders"});
     GroupConsumer b(clientB, "g", {"orders"});
@@ -538,8 +538,8 @@ TEST_CASE("When one consumer leaves, the other takes over its partitions") {
     for (PartitionId p = 0; p < 4; ++p)
         broker.logs().createPartition(TopicPartition{"orders", p});
 
-    cli::Client clientA("127.0.0.1", broker.port());
-    cli::Client clientB("127.0.0.1", broker.port());
+    protocol::Client clientA("127.0.0.1", broker.port());
+    protocol::Client clientB("127.0.0.1", broker.port());
 
     GroupConsumer a(clientA, "g", {"orders"});
     GroupConsumer b(clientB, "g", {"orders"});
@@ -577,7 +577,7 @@ TEST_CASE("A group's position survives a restart") {
         broker.start();
         broker.logs().createPartition(TopicPartition{"orders", 0});
 
-        cli::Client   client("127.0.0.1", broker.port());
+        protocol::Client   client("127.0.0.1", broker.port());
         GroupConsumer consumer(client, "g", {"orders"});
         consumer.join();
 
@@ -596,7 +596,7 @@ TEST_CASE("A group's position survives a restart") {
     server::Broker restarted(options);
     restarted.start();
 
-    cli::Client   client("127.0.0.1", restarted.port());
+    protocol::Client   client("127.0.0.1", restarted.port());
     GroupConsumer consumer(client, "g", {"orders"});
     consumer.join();
 
@@ -610,8 +610,8 @@ TEST_CASE("Two groups reading one topic keep separate positions") {
     broker.start();
     broker.logs().createPartition(TopicPartition{"orders", 0});
 
-    cli::Client clientA("127.0.0.1", broker.port());
-    cli::Client clientB("127.0.0.1", broker.port());
+    protocol::Client clientA("127.0.0.1", broker.port());
+    protocol::Client clientB("127.0.0.1", broker.port());
 
     GroupConsumer a(clientA, "analytics", {"orders"});
     GroupConsumer b(clientB, "billing", {"orders"});
@@ -635,8 +635,8 @@ TEST_CASE("A stale member cannot commit over a live one") {
     broker.start();
     broker.logs().createPartition(TopicPartition{"orders", 0});
 
-    cli::Client clientA("127.0.0.1", broker.port());
-    cli::Client clientB("127.0.0.1", broker.port());
+    protocol::Client clientA("127.0.0.1", broker.port());
+    protocol::Client clientB("127.0.0.1", broker.port());
 
     GroupConsumer a(clientA, "g", {"orders"});
     a.join();
@@ -678,13 +678,13 @@ TEST_CASE("A group produces and consumes what it was assigned") {
     for (PartitionId p = 0; p < 2; ++p)
         broker.logs().createPartition(TopicPartition{"orders", p});
 
-    cli::Client producer("127.0.0.1", broker.port());
+    protocol::Client producer("127.0.0.1", broker.port());
     for (int i = 0; i < 6; ++i) {
         produceLine(producer, "orders", 0, "p0 line " + to_string(i));
         produceLine(producer, "orders", 1, "p1 line " + to_string(i));
     }
 
-    cli::Client   client("127.0.0.1", broker.port());
+    protocol::Client   client("127.0.0.1", broker.port());
     GroupConsumer consumer(client, "g", {"orders"});
     const auto    assigned = consumer.join();
     REQUIRE(assigned.size() == 2);
@@ -713,7 +713,7 @@ TEST_CASE("A group produces and consumes what it was assigned") {
 namespace {
 
 // Produces one keyed record and returns the offset it landed at.
-Offset produceKeyed(cli::Client& client, const string& topic, PartitionId partition,
+Offset produceKeyed(protocol::Client& client, const string& topic, PartitionId partition,
                     const string& key, optional<string> value) {
     RecordBatchBuilder builder;
     const span<const uint8_t> keyBytes{reinterpret_cast<const uint8_t*>(key.data()), key.size()};
@@ -785,7 +785,7 @@ TEST_CASE("A compacted topic collapses many updates to one record per key") {
     compacted.cleanup            = storage::CleanupPolicy::Compact;
     broker.logs().createPartition(TopicPartition{"profiles", 0}, compacted);
 
-    cli::Client client("127.0.0.1", broker.port());
+    protocol::Client client("127.0.0.1", broker.port());
 
     // 100 keys, 30 updates each. Every key's final value is "v29".
     constexpr int kKeys    = 100;
@@ -835,7 +835,7 @@ TEST_CASE("A tombstoned key disappears from a compacted topic") {
     compacted.cleanup            = storage::CleanupPolicy::Compact;
     broker.logs().createPartition(TopicPartition{"profiles", 0}, compacted);
 
-    cli::Client client("127.0.0.1", broker.port());
+    protocol::Client client("127.0.0.1", broker.port());
 
     produceKeyed(client, "profiles", 0, "doomed", "here");
     produceKeyed(client, "profiles", 0, "keeper", "stays");
@@ -872,7 +872,7 @@ TEST_CASE("An uncompacted topic keeps every version, however many there are") {
     broker.start();
     broker.logs().createPartition(TopicPartition{"events", 0});
 
-    cli::Client client("127.0.0.1", broker.port());
+    protocol::Client client("127.0.0.1", broker.port());
     for (int i = 0; i < 60; ++i)
         produceKeyed(client, "events", 0, "same-key", "v" + to_string(i));
 

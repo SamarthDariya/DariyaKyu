@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-#include "cli/client.hpp"
+#include "protocol/client.hpp"
 #include "cli/dump.hpp"
 #include "cli/group_consumer.hpp"
 #include "common/errors.hpp"
@@ -91,7 +91,7 @@ bool reportError(ErrorCode error, const string& what) {
     return true;
 }
 
-int doCreate(cli::Client& client, const string& topic, const Options& options) {
+int doCreate(protocol::Client& client, const string& topic, const Options& options) {
     CreateTopicRequest::Topic asked;
     asked.name           = topic;
     asked.partitionCount = options.partitions;
@@ -114,7 +114,7 @@ int doCreate(cli::Client& client, const string& topic, const Options& options) {
     return 0;
 }
 
-int doDescribe(cli::Client& client, const string& topic) {
+int doDescribe(protocol::Client& client, const string& topic) {
     MetadataRequest request;
     if (topic.empty()) request.allTopics = true;
     else request.topics.push_back(topic);
@@ -181,7 +181,7 @@ int doDescribe(cli::Client& client, const string& topic) {
     return 0;
 }
 
-int doProduce(cli::Client& client, const string& topic, PartitionId partition) {
+int doProduce(protocol::Client& client, const string& topic, PartitionId partition) {
     string line;
     int    sent = 0;
 
@@ -214,7 +214,7 @@ int doProduce(cli::Client& client, const string& topic, PartitionId partition) {
     return 0;
 }
 
-Offset resolveStart(cli::Client& client, const string& topic, PartitionId partition,
+Offset resolveStart(protocol::Client& client, const string& topic, PartitionId partition,
                     const string& from) {
     if (from != "earliest" && from != "latest") return Offset{stoll(from)};
 
@@ -271,7 +271,7 @@ size_t printBatches(span<const uint8_t> records, Offset& offset, const string& p
     return printed;
 }
 
-int doConsume(cli::Client& client, const string& topic, PartitionId partition,
+int doConsume(protocol::Client& client, const string& topic, PartitionId partition,
               const Options& options) {
     Offset offset = resolveStart(client, topic, partition, options.from);
 
@@ -314,7 +314,7 @@ int doConsume(cli::Client& client, const string& topic, PartitionId partition,
 // Reads one partition once, from `position`, and prints what came back.
 // Returns how many records, or -1 if the partition said something we cannot
 // continue past.
-long fetchOnce(cli::Client& client, const TopicPartition& tp, Offset& position) {
+long fetchOnce(protocol::Client& client, const TopicPartition& tp, Offset& position) {
     FetchRequest request;
     request.topics.push_back({tp.topic, {{tp.partition, position, 1 << 20}}});
 
@@ -345,7 +345,7 @@ long fetchOnce(cli::Client& client, const TopicPartition& tp, Offset& position) 
 // --from is ignored here, and that is the point of a group: where to start is
 // the group's committed offset, not a flag. A group that has never committed
 // starts at the beginning.
-int doConsumeGroup(cli::Client& client, const string& topic, const Options& options) {
+int doConsumeGroup(protocol::Client& client, const string& topic, const Options& options) {
     cli::GroupConsumer consumer(client, options.group, {topic}, options.strategy);
 
     while (true) {
@@ -426,7 +426,7 @@ int main(int argc, char** argv) {
         }
 
         const Options options = parseOptions(args);
-        cli::Client   client(options.host, options.port);
+        protocol::Client   client(options.host, options.port);
 
         if (command == "create") {
             if (args.size() < 2) { usage(); return 2; }

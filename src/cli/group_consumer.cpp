@@ -29,7 +29,7 @@ vector<uint8_t> body(const Request& request, Encoder encoder) {
 
 }  // namespace
 
-GroupConsumer::GroupConsumer(Client& client, string groupId, vector<string> topics,
+GroupConsumer::GroupConsumer(protocol::Client& client, string groupId, vector<string> topics,
                              string strategy, int32_t sessionTimeoutMs)
     : client_(client),
       groupId_(std::move(groupId)),

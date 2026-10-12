@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "cli/client.hpp"
+#include "protocol/client.hpp"
 #include "common/types.hpp"
 #include "protocol/error_codes.hpp"
 
@@ -18,7 +18,7 @@ namespace dariyakyu::cli {
 // that does.
 class GroupConsumer {
 public:
-    GroupConsumer(Client& client, std::string groupId, std::vector<std::string> topics,
+    GroupConsumer(protocol::Client& client, std::string groupId, std::vector<std::string> topics,
                   std::string strategy = "range", std::int32_t sessionTimeoutMs = 10'000);
 
     // Joins or rejoins, and returns what this member now owns.
@@ -69,7 +69,7 @@ private:
     // drop its id, or the coordinator would keep rejecting an id it has forgotten.
     void forgetIfExpired(protocol::ErrorCode error);
 
-    Client&                  client_;
+    protocol::Client&        client_;
     std::string              groupId_;
     std::vector<std::string> topics_;
     std::string              strategy_;

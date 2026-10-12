@@ -1,4 +1,4 @@
-#include "cli/client.hpp"
+#include "protocol/client.hpp"
 
 #include <utility>
 
@@ -8,7 +8,7 @@
 
 using namespace std;
 
-namespace dariyakyu::cli {
+namespace dariyakyu::protocol {
 
 Client::Client(const string& host, int32_t port, string clientId)
     : socket_(protocol::Socket::connectTo(host, port)), clientId_(std::move(clientId)) {}
@@ -44,4 +44,4 @@ vector<uint8_t> Client::call(protocol::ApiKey key, const vector<uint8_t>& body) 
     return vector<uint8_t>(rest.begin(), rest.end());
 }
 
-}  // namespace dariyakyu::cli
+}  // namespace dariyakyu::protocol

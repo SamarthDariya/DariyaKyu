@@ -93,6 +93,7 @@ add_library(dariyakyu_protocol
   src/protocol/produce.cpp
   src/protocol/fetch.cpp
   src/protocol/socket.cpp
+  src/protocol/client.cpp
   src/protocol/group_apis.cpp
 )
 
@@ -107,7 +108,6 @@ target_compile_options(dariyakyu_protocol PRIVATE -Wall -Wextra -Wpedantic)
 # that could reach a request handler would stop being a client.
 
 add_library(dariyakyu_cli
-  src/cli/client.cpp
   src/cli/dump.cpp
   src/cli/assignor.cpp
   src/cli/group_consumer.cpp
