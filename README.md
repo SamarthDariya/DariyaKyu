@@ -124,8 +124,8 @@ is merged by PR.
 - [x] `LogCleaner` on its own thread — dirty ratio, dirtiest-first
 - [x] `dariyakyu-cli create --compact`; `dariyakyu-dump` shows holes and tombstones
 - [x] **100 keys × 30 updates collapse to ~1 record per key, every key still readable**
-- [ ] `cleanup.policy = delete | compact`
-- [ ] `__offsets` stays bounded under sustained commits
+- [x] `cleanup.policy = delete | compact`
+- [x] `__offsets` stays bounded under sustained commits
 
 ### M7 — Replication ⬜
 - [ ] `ReplicaFetcher` — followers reuse the consumer `Fetch` API
