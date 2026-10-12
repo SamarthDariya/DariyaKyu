@@ -31,6 +31,10 @@ const char* describe(ErrorCode code) {
         case ErrorCode::UnknownMemberId: return "unknown member id";
         case ErrorCode::RebalanceInProgress: return "rebalance in progress — rejoin";
         case ErrorCode::InvalidGroupId: return "invalid group id";
+        case ErrorCode::NotEnoughReplicas: return "not enough in-sync replicas — write refused";
+        case ErrorCode::NotEnoughReplicasAfterAppend:
+            return "written, but in-sync replicas fell below the minimum before it was confirmed";
+        case ErrorCode::InvalidReplicationFactor: return "replication factor exceeds the brokers available";
     }
     // Reached only for a code off the wire that this build does not know, which a
     // client of a newer broker can genuinely produce.

@@ -45,6 +45,14 @@ TEST_CASE("Every code has a distinct number") {
     CHECK(seen.size() == kAllErrorCodes.size());
 }
 
+TEST_CASE("The replication codes keep their numbers") {
+    // Pinned because they are on the wire: renumbering one would make an older
+    // client read "refused" as some other failure entirely.
+    CHECK(static_cast<int16_t>(ErrorCode::NotEnoughReplicas) == 16);
+    CHECK(static_cast<int16_t>(ErrorCode::NotEnoughReplicasAfterAppend) == 17);
+    CHECK(static_cast<int16_t>(ErrorCode::InvalidReplicationFactor) == 18);
+}
+
 TEST_CASE("Every code has a description") {
     // kAllErrorCodes exists so this cannot silently skip a newly added code.
     for (const ErrorCode code : kAllErrorCodes) {

@@ -42,6 +42,11 @@ enum class ErrorCode : std::int16_t {
     UnknownMemberId         = 13,   // expired, or never joined
     RebalanceInProgress     = 14,   // rejoin — see below
     InvalidGroupId          = 15,
+
+    // Replication (M7).
+    NotEnoughReplicas            = 16,   // ISR below minInsyncReplicas; refused, not written
+    NotEnoughReplicasAfterAppend = 17,   // written, but ISR shrank before it was confirmed
+    InvalidReplicationFactor     = 18,   // more copies than the cluster has brokers
 };
 
 static_assert(std::is_same_v<std::underlying_type_t<ErrorCode>, std::int16_t>,
@@ -49,14 +54,23 @@ static_assert(std::is_same_v<std::underlying_type_t<ErrorCode>, std::int16_t>,
 
 // Every code, for exhaustive switches and for tests that must not silently skip
 // a newly added one.
-inline constexpr std::array<ErrorCode, 16> kAllErrorCodes{
+inline constexpr std::array<ErrorCode, 19> kAllErrorCodes{
     ErrorCode::None,          ErrorCode::Unknown,                 ErrorCode::OffsetOutOfRange,
     ErrorCode::CorruptMessage, ErrorCode::NotLeaderForPartition,  ErrorCode::UnknownTopicOrPartition,
     ErrorCode::TopicAlreadyExists, ErrorCode::InvalidTopic,       ErrorCode::RequestTimedOut,
     ErrorCode::UnsupportedVersion,
     ErrorCode::CoordinatorNotAvailable, ErrorCode::NotCoordinator, ErrorCode::IllegalGeneration,
     ErrorCode::UnknownMemberId, ErrorCode::RebalanceInProgress,   ErrorCode::InvalidGroupId,
+    ErrorCode::NotEnoughReplicas, ErrorCode::NotEnoughReplicasAfterAppend,
+    ErrorCode::InvalidReplicationFactor,
 };
+
+// NotEnoughReplicasAfterAppend is not a lost write.
+//
+// The batch is in the leader's log and will still replicate. What failed is the
+// promise that enough replicas had it when the producer was answered. Reporting
+// the write as failed would be wrong the other way, and a producer that retries
+// writes a duplicate either way — the case the idempotent producer exists for.
 
 // RebalanceInProgress is not a failure.
 //
