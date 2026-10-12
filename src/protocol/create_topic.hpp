@@ -64,6 +64,12 @@ struct CreateTopicResponse {
     std::vector<Topic> topics;
 };
 
+// One topic's settings, as CreateTopic carries them. Public because the
+// broker-to-broker CreateReplicas request (M7) carries exactly the same thing:
+// a follower's copy must be created with the leader's rules, not its own defaults.
+void                      writeTopicSettings(BufferWriter& out, const CreateTopicRequest::Topic& topic);
+CreateTopicRequest::Topic readTopicSettings(BufferReader& in);
+
 void               encodeCreateTopicRequest(BufferWriter& out, const CreateTopicRequest& request);
 CreateTopicRequest decodeCreateTopicRequest(BufferReader& in);
 

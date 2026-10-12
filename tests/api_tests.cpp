@@ -7,6 +7,7 @@
 #include "protocol/fetch.hpp"
 #include "protocol/group_apis.hpp"
 #include "protocol/list_offsets.hpp"
+#include "protocol/create_replicas.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/metadata.hpp"
 #include "protocol/produce.hpp"
@@ -424,6 +425,60 @@ TEST_CASE("An empty CreateTopic request round-trips") {
                   [](BufferReader& in) { return decodeCreateTopicRequest(in); });
     CHECK(decoded.topics.empty());
     CHECK(decoded.timeoutMs == 0);
+}
+
+namespace {
+
+// Two partitions of a compacted, replicated topic, as broker 1 would send them.
+CreateReplicasRequest sampleCreateReplicas() {
+    CreateReplicasRequest::Topic topic;
+    topic.settings.name              = "orders";
+    topic.settings.partitionCount    = 3;
+    topic.settings.retentionMs       = 60'000;
+    topic.settings.compact           = true;
+    topic.settings.replicationFactor = 2;
+    topic.partitions = {{1, {2, 3}}, {2, {3, 1}}};
+
+    CreateReplicasRequest request;
+    request.topics.push_back(topic);
+    return request;
+}
+
+}  // namespace
+
+TEST_CASE("A CreateReplicas request round-trips settings and replicas") {
+    const auto request = sampleCreateReplicas();
+    const auto decoded =
+        roundTrip([&](BufferWriter& out) { encodeCreateReplicasRequest(out, request); },
+                  [](BufferReader& in) { return decodeCreateReplicasRequest(in); });
+
+    REQUIRE(decoded.topics.size() == 1);
+    const auto& topic = decoded.topics[0];
+
+    // The leader's rules, so the follower's copy is not built from its defaults.
+    CHECK(topic.settings.name == "orders");
+    CHECK(topic.settings.retentionMs == 60'000);
+    CHECK(topic.settings.compact == true);
+    CHECK(topic.settings.replicationFactor == 2);
+
+    // Replicas in order: the first is the leader.
+    REQUIRE(topic.partitions.size() == 2);
+    CHECK(topic.partitions[0].partition == 1);
+    CHECK(topic.partitions[0].replicas == vector<NodeId>{2, 3});
+    CHECK(topic.partitions[1].partition == 2);
+    CHECK(topic.partitions[1].replicas == vector<NodeId>{3, 1});
+}
+
+TEST_CASE("A truncated CreateReplicas request is refused at every length") {
+    BufferWriter out;
+    encodeCreateReplicasRequest(out, sampleCreateReplicas());
+    const auto full = out.take();
+
+    for (size_t length = 0; length < full.size(); ++length) {
+        const vector<uint8_t> partial(full.begin(), full.begin() + static_cast<long>(length));
+        BufferReader          in(partial);
+        CHECK_THROWS_AS(decodeCreateReplicasRequest(in), CorruptData);
+    }
 }
 
 TEST_CASE("A truncated CreateTopic request is refused at every length") {

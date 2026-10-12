@@ -89,6 +89,7 @@ add_library(dariyakyu_protocol
   src/protocol/list_offsets.cpp
   src/protocol/metadata.cpp
   src/protocol/create_topic.cpp
+  src/protocol/create_replicas.cpp
   src/protocol/produce.cpp
   src/protocol/fetch.cpp
   src/protocol/socket.cpp

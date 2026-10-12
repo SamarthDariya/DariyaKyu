@@ -116,6 +116,7 @@ TEST_CASE("Api keys use Kafka's own numbers") {
     CHECK(static_cast<int16_t>(ApiKey::ListOffsets) == 2);
     CHECK(static_cast<int16_t>(ApiKey::Metadata) == 3);
     CHECK(static_cast<int16_t>(ApiKey::CreateTopic) == 19);
+    CHECK(static_cast<int16_t>(ApiKey::CreateReplicas) == 1000);
 }
 
 TEST_CASE("Every api key is known and described") {

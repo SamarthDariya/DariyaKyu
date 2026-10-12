@@ -42,17 +42,31 @@ std::optional<bool> readFlag(BufferReader& in) {
 
 }  // namespace
 
+void writeTopicSettings(BufferWriter& out, const CreateTopicRequest::Topic& topic) {
+    writeString(out, topic.name);
+    out.writeInt32(topic.partitionCount);
+    writeOverride(out, topic.retentionMs);
+    writeOverride(out, topic.retentionBytes);
+    writeOverride(out, topic.maxSegmentBytes);
+    writeFlag(out, topic.compact);
+    out.writeInt32(topic.replicationFactor);
+}
+
+CreateTopicRequest::Topic readTopicSettings(BufferReader& in) {
+    CreateTopicRequest::Topic topic;
+    topic.name              = readString(in);
+    topic.partitionCount    = in.readInt32();
+    topic.retentionMs       = readOverride(in);
+    topic.retentionBytes    = readOverride(in);
+    topic.maxSegmentBytes   = readOverride(in);
+    topic.compact           = readFlag(in);
+    topic.replicationFactor = in.readInt32();
+    return topic;
+}
+
 void encodeCreateTopicRequest(BufferWriter& out, const CreateTopicRequest& request) {
     out.writeInt32(static_cast<int32_t>(request.topics.size()));
-    for (const auto& topic : request.topics) {
-        writeString(out, topic.name);
-        out.writeInt32(topic.partitionCount);
-        writeOverride(out, topic.retentionMs);
-        writeOverride(out, topic.retentionBytes);
-        writeOverride(out, topic.maxSegmentBytes);
-        writeFlag(out, topic.compact);
-        out.writeInt32(topic.replicationFactor);
-    }
+    for (const auto& topic : request.topics) writeTopicSettings(out, topic);
     out.writeInt32(request.timeoutMs);
 }
 
@@ -62,17 +76,7 @@ CreateTopicRequest decodeCreateTopicRequest(BufferReader& in) {
     const int32_t count = readElementCount(in, "topic");
     request.topics.reserve(static_cast<size_t>(count));
 
-    for (int32_t i = 0; i < count; ++i) {
-        CreateTopicRequest::Topic topic;
-        topic.name           = readString(in);
-        topic.partitionCount = in.readInt32();
-        topic.retentionMs    = readOverride(in);
-        topic.retentionBytes = readOverride(in);
-        topic.maxSegmentBytes = readOverride(in);
-        topic.compact         = readFlag(in);
-        topic.replicationFactor = in.readInt32();
-        request.topics.push_back(std::move(topic));
-    }
+    for (int32_t i = 0; i < count; ++i) request.topics.push_back(readTopicSettings(in));
 
     request.timeoutMs = in.readInt32();
     return request;

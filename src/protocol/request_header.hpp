@@ -30,13 +30,18 @@ enum class ApiKey : std::int16_t {
     SyncGroup       = 14,
 
     CreateTopic     = 19,
+
+    // Broker to broker (M7). Far outside Kafka's numbering on purpose: it is
+    // ours, temporary, and M8's LeaderAndIsr — which does have a Kafka number —
+    // replaces it.
+    CreateReplicas  = 1000,
 };
 
-inline constexpr std::array<ApiKey, 12> kAllApiKeys{
+inline constexpr std::array<ApiKey, 13> kAllApiKeys{
     ApiKey::Produce,      ApiKey::Fetch,       ApiKey::ListOffsets, ApiKey::Metadata,
     ApiKey::OffsetCommit, ApiKey::OffsetFetch, ApiKey::FindCoordinator,
     ApiKey::JoinGroup,    ApiKey::Heartbeat,   ApiKey::LeaveGroup,  ApiKey::SyncGroup,
-    ApiKey::CreateTopic,
+    ApiKey::CreateTopic,  ApiKey::CreateReplicas,
 };
 
 // Whether this build has a handler for `key` at all.

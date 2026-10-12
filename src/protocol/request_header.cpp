@@ -23,6 +23,7 @@ bool isKnown(ApiKey key) {
 const char* describe(ApiKey key) {
     switch (key) {
         case ApiKey::Produce: return "Produce";
+        case ApiKey::CreateReplicas: return "CreateReplicas";
         case ApiKey::Fetch: return "Fetch";
         case ApiKey::ListOffsets: return "ListOffsets";
         case ApiKey::Metadata: return "Metadata";
