@@ -15,7 +15,7 @@ Broker::Broker(Options options)
       logs_(options_.dataDir, options_.defaults),
       cleaner_(logs_, options_.cleaner),
       offsets_(logs_, options_.offsetsPartitions),
-      replicas_(options_.nodeId),
+      replicas_(options_.nodeId, options_.replicaLagTimeMaxMs),
       context_{logs_,
                groups_,
                offsets_,
@@ -63,23 +63,33 @@ void Broker::start() {
     logs_.startMaintenance(options_.maintenanceIntervalMs);
     cleaner_.startCleaning();
 
-    sweepThread_ = thread([this] { sweepGroups(); });
+    sweepThread_ = thread([this] { sweep(); });
 }
 
-void Broker::sweepGroups() {
+void Broker::sweep() {
     unique_lock lock(sweepMutex_);
     while (true) {
-        if (sweepWake_.wait_for(lock, chrono::milliseconds(options_.groupSweepIntervalMs),
+        if (sweepWake_.wait_for(lock, chrono::milliseconds(options_.sweepIntervalMs),
                                 [this] { return sweepStopping_; }))
             return;
 
         lock.unlock();
+        const int64_t now = storage::wallClockMillis();
         try {
-            groups_.expire(storage::wallClockMillis());
+            groups_.expire(now);
         } catch (...) {
             // One bad group must not stop every other being swept, and a sweep
             // that died silently would leave partitions assigned to members that
             // no longer exist.
+        }
+        try {
+            // A dead follower never fetches, so only a timer can notice it. Until
+            // it is dropped, every consumer of its partitions is frozen at
+            // whatever it last copied.
+            replicas_.shrinkInSync(now);
+        } catch (...) {
+            // Separately caught: a failure here must not stop groups expiring,
+            // and the reverse.
         }
         lock.lock();
     }

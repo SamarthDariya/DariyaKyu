@@ -1612,3 +1612,40 @@ TEST_CASE("A broker tracks the partitions it leads from the moment it starts") {
 
     broker.stop();
 }
+
+TEST_CASE("A follower that never fetches is dropped by the sweep, not by a test") {
+    TempDir dir("broker-sweeps-isr");
+    {
+        storage::LogManager logs(dir.file("data"), testConfig());
+        storage::LogConfig  config  = testConfig();
+        config.replication.replicas = {1, 2};
+        logs.createPartition(TopicPartition{"orders", 0}, config);
+    }
+
+    server::Broker::Options options;
+    options.dataDir             = dir.file("data");
+    options.defaults            = testConfig();
+    options.host                = "127.0.0.1";
+    options.port                = 0;
+    options.nodeId              = 1;
+    options.sweepIntervalMs     = 10;
+    options.replicaLagTimeMaxMs = 50;
+    server::Broker broker(options);
+    broker.start();
+
+    storage::Log* log   = broker.logs().get(TopicPartition{"orders", 0});
+    auto          bytes = makeUnstampedBatch(1000);
+    REQUIRE(log != nullptr);
+    log->append(bytes);
+    REQUIRE(log->highWatermark() == Offset(0));   // node 2 has not fetched
+
+    // Node 2 never does. Once its window runs out, the broker's own sweep drops
+    // it, and the record it was holding back is committed. Nothing here calls
+    // shrinkInSync: if the sweep did not, this would wait out the full two
+    // seconds and fail.
+    for (int waited = 0; waited < 200 && log->highWatermark() < Offset(1); ++waited)
+        this_thread::sleep_for(chrono::milliseconds(10));
+    CHECK(log->highWatermark() == Offset(1));
+
+    broker.stop();
+}

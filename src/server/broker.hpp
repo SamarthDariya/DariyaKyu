@@ -48,9 +48,18 @@ public:
         // coordinators. Immutable once the topic exists — see offsets_topic.hpp.
         std::int32_t offsetsPartitions = group::kDefaultOffsetsPartitions;
 
-        // How often expired members are swept. Shorter than a session timeout,
-        // or a member could be gone for two timeouts before anyone notices.
-        std::int64_t groupSweepIntervalMs = 1'000;
+        // How often the sweep runs. It does two jobs, and both need a timer
+        // because the thing they detect is an ABSENCE — nothing arrives to
+        // trigger them:
+        //   - expiring consumer-group members whose session ran out
+        //   - dropping followers that stopped fetching from the in-sync set
+        // Shorter than either timeout, or something could be gone for two
+        // timeouts before anyone notices.
+        std::int64_t sweepIntervalMs = 1'000;
+
+        // How long a follower may go without fetching before it leaves the
+        // in-sync set (M7). See PartitionReplicas.
+        std::int64_t replicaLagTimeMaxMs = replication::PartitionReplicas::kDefaultLagTimeMaxMs;
 
         // Compaction. Its own settings rather than per-topic, because they are
         // memory and scheduling — which belong to the process, not the data.
@@ -77,7 +86,7 @@ public:
     storage::LogCleaner& cleaner() { return cleaner_; }
 
 private:
-    void sweepGroups();
+    void sweep();
 
     Options             options_;
 
