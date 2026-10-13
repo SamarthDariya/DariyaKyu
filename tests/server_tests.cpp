@@ -1014,6 +1014,24 @@ TEST_CASE("A follower claiming records the leader lacks moves nothing") {
     CHECK(claim.highWatermark == Offset(0));
 }
 
+TEST_CASE("A follower's copy refuses writes, and stays exactly as it was") {
+    ServingBroker broker("handler-produce-follower");
+    storage::LogConfig config   = testConfig();
+    config.replication.replicas = {2, 1};   // node 2 leads; we only hold a copy
+    storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0}, config);
+
+    const auto   batch = makeUnstampedBatch(1000, 48);
+    const auto   body  = broker.call(ApiKey::Produce, encoded(produceToOrders(batch)));
+    BufferReader in(body);
+    const auto   result = decodeProduceResponse(in).topics[0].partitions[0];
+
+    // The client refreshes metadata and finds node 2. Had this been accepted,
+    // offset 0 here would hold a record the leader never had.
+    CHECK(result.error == ErrorCode::NotLeaderForPartition);
+    CHECK(result.baseOffset == kUnknownOffset);
+    CHECK(log.logEndOffset() == Offset(0));
+}
+
 TEST_CASE("A caught-up fetch is a success with no records") {
     ServingBroker broker("handler-fetch-caught-up");
     storage::Log& log = broker.logs.createPartition(TopicPartition{"orders", 0});

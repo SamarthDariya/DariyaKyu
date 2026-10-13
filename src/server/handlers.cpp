@@ -356,9 +356,13 @@ void handleProduce(RequestContext& request, Response& out) {
             result.partition  = asked.partition;
             result.baseOffset = kUnknownOffset;
 
+            // Only the leader takes writes. A follower's copy has exactly one
+            // appender — its fetcher — and a produce landing there would claim
+            // the same offsets the leader is about to hand out, so the next
+            // fetched batch would be refused and the copy would stop following.
             storage::Log* log =
                 request.broker.logs.get(TopicPartition{topic.name, asked.partition});
-            if (log == nullptr) {
+            if (log == nullptr || leaderOf(*log, request.broker.nodeId) != request.broker.nodeId) {
                 result.error = ErrorCode::NotLeaderForPartition;
                 answer.partitions.push_back(result);
                 continue;
