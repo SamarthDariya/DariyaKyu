@@ -1,11 +1,14 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <fstream>
 #include <thread>
 
 #include "common/errors.hpp"
 #include "replication/partition_replicas.hpp"
+#include "replication/replica_fetcher.hpp"
 #include "replication/replica_manager.hpp"
+#include "server/broker.hpp"
 #include "test_support.hpp"
 
 using namespace std;
@@ -231,4 +234,124 @@ TEST_CASE("Fetches, appends, the timer and readers can all race on one partition
     // The follower catches up for good, and the watermark lands on the end.
     manager.recordFetch(tp, 2, log->logEndOffset(), 2000);
     CHECK(log->highWatermark() == Offset(200));
+}
+
+// ===========================================================================
+// fetchOnce: one round of following, against a real leader
+// ===========================================================================
+
+namespace {
+
+// Broker 1 leading orders-0, followed by node 2, with `batches` one-record
+// batches already written. Node 2 has fetched nothing, so none is committed.
+struct LeaderAndFollower {
+    TempDir                   dir;
+    unique_ptr<server::Broker> leader;
+    unique_ptr<storage::Log>   follower;   // node 2's copy, on its own disk
+
+    LeaderAndFollower(const string& name, int batches) : dir(name) {
+        storage::LogConfig config   = testConfig();
+        config.replication.replicas = {1, 2};
+        {
+            storage::LogManager logs(dir.file("leader"), testConfig());
+            logs.createPartition(TopicPartition{"orders", 0}, config);
+        }
+
+        server::Broker::Options options;
+        options.dataDir  = dir.file("leader");
+        options.defaults = testConfig();
+        options.host     = "127.0.0.1";
+        options.port     = 0;
+        options.nodeId   = 1;
+        leader           = make_unique<server::Broker>(options);
+        leader->start();
+
+        for (int i = 0; i < batches; ++i) {
+            auto bytes = makeUnstampedBatch(1000 + i, 48);
+            leaderLog().append(bytes);
+        }
+        follower = storage::Log::create(TopicPartition{"orders", 0}, dir.file("follower/orders-0"),
+                                        config);
+    }
+    ~LeaderAndFollower() { leader->stop(); }
+
+    storage::Log&    leaderLog() { return *leader->logs().get(TopicPartition{"orders", 0}); }
+    protocol::Client connect() { return protocol::Client("127.0.0.1", leader->port()); }
+};
+
+}  // namespace
+
+TEST_CASE("A follower copies the leader's batches, byte for byte, at the same offsets") {
+    LeaderAndFollower cluster("fetch-once-copies", 3);
+    auto              client = cluster.connect();
+
+    const auto round = fetchOnce(client, *cluster.follower, 2);
+    CHECK(round.error == protocol::ErrorCode::None);
+    CHECK(round.batches == 3);
+    CHECK(cluster.follower->logEndOffset() == Offset(3));
+
+    // The same bytes: what a consumer would read from either is identical.
+    const auto onLeader   = pullRange(cluster.leaderLog().read(Offset(0), kBigFetch).range);
+    const auto onFollower = pullRange(cluster.follower->read(Offset(0), kBigFetch).range);
+    CHECK(onLeader == onFollower);
+}
+
+TEST_CASE("The watermark reaches the follower one round after it reaches the leader") {
+    LeaderAndFollower cluster("fetch-once-watermark", 3);
+    auto              client = cluster.connect();
+
+    // Round one fetches at 0: the leader learns nothing new, commits nothing.
+    fetchOnce(client, *cluster.follower, 2);
+    CHECK(cluster.leaderLog().highWatermark() == Offset(0));
+    CHECK(cluster.follower->highWatermark() == Offset(0));
+
+    // Round two fetches at 3: the leader commits 3 and says so in the reply.
+    const auto round = fetchOnce(client, *cluster.follower, 2);
+    CHECK(round.batches == 0);   // nothing new to copy
+    CHECK(cluster.leaderLog().highWatermark() == Offset(3));
+    CHECK(cluster.follower->highWatermark() == Offset(3));
+}
+
+TEST_CASE("A response cut mid-batch leaves the partial batch for the next round") {
+    LeaderAndFollower cluster("fetch-once-partial", 3);
+    auto              client = cluster.connect();
+    const auto        batch  = static_cast<int32_t>(makeUnstampedBatch(1000, 48).size());
+
+    // One and a half batches' worth: the second arrives cut short.
+    CHECK(fetchOnce(client, *cluster.follower, 2, batch + batch / 2).batches == 1);
+    CHECK(cluster.follower->logEndOffset() == Offset(1));
+
+    // Nothing lost: the next round starts at 1 and gets the rest whole.
+    CHECK(fetchOnce(client, *cluster.follower, 2).batches == 2);
+    CHECK(cluster.follower->logEndOffset() == Offset(3));
+}
+
+TEST_CASE("A leader's refusal comes back as an error, and writes nothing") {
+    LeaderAndFollower cluster("fetch-once-refused", 2);
+    auto              client = cluster.connect();
+
+    // Node 3 holds no copy, so the leader will not let it read past the
+    // watermark — the follower's log must stay exactly as it was.
+    const auto round = fetchOnce(client, *cluster.follower, 3);
+    CHECK(round.error == protocol::ErrorCode::UnknownTopicOrPartition);
+    CHECK(round.batches == 0);
+    CHECK(cluster.follower->logEndOffset() == Offset(0));
+}
+
+TEST_CASE("A batch that fails its checksum in transit is refused, not copied") {
+    LeaderAndFollower cluster("fetch-once-corrupt", 1);
+
+    // Damage the record body on the leader's disk. The leader serves file bytes
+    // without reading them, so the follower is the first to look — and the last
+    // chance before those bytes would be served to consumers after a failover.
+    const auto segment = segmentLogPath(cluster.dir.file("leader") / "orders-0", Offset(0));
+    {
+        fstream file(segment, ios::in | ios::out | ios::binary);
+        file.seekp(-1, ios::end);
+        file.put('\x5A');
+    }
+
+    auto client = cluster.connect();
+    CHECK_THROWS_AS(fetchOnce(client, *cluster.follower, 2), CorruptData);
+    CHECK(cluster.follower->logEndOffset() == Offset(0));
 }

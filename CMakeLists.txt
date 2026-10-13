@@ -153,15 +153,17 @@ target_compile_options(dariyakyu_cluster PRIVATE -Wall -Wextra -Wpedantic)
 # ---------------------------------------------------------------------------
 #
 # The leader's view of its followers and, later, the follower's fetcher (M7).
-# Depends on storage, whose logs it moves the watermarks of; the server links
-# it, not the reverse.
+# Depends on protocol — a follower fetches with the same client and Fetch
+# request a consumer uses — and through it on storage. The server links it, not
+# the reverse.
 
 add_library(dariyakyu_replication
   src/replication/partition_replicas.cpp
   src/replication/replica_manager.cpp
+  src/replication/replica_fetcher.cpp
 )
 
-target_link_libraries(dariyakyu_replication PUBLIC dariyakyu_storage)
+target_link_libraries(dariyakyu_replication PUBLIC dariyakyu_protocol)
 target_compile_options(dariyakyu_replication PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
