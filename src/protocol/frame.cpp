@@ -28,6 +28,11 @@ bool readExactly(int fd, span<uint8_t> out) {
             // makes a broker that dies whenever anything sends it a signal.
             if (errno == EINTR) continue;
 
+            // A receive timeout (Socket::connectTo with one set) surfaces as
+            // EAGAIN, whose message — "resource temporarily unavailable" — hides
+            // what happened. Say it timed out.
+            if (errno == EAGAIN || errno == EWOULDBLOCK) throw IoError("read", "socket", ETIMEDOUT);
+
             // A reset is the peer going away, and it is treated exactly like a
             // clean close below.
             //
@@ -58,6 +63,7 @@ void writeAll(int fd, span<const uint8_t> bytes) {
         const ssize_t wrote = ::write(fd, bytes.data() + sent, bytes.size() - sent);
         if (wrote < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) throw IoError("write", "socket", ETIMEDOUT);
             throw IoError("write", "socket", errno);
         }
         sent += static_cast<size_t>(wrote);

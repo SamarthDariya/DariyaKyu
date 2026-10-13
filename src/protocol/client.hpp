@@ -23,8 +23,15 @@ namespace dariyakyu::protocol {
 // is worth finding out about immediately rather than three responses later.
 class Client {
 public:
+    // `timeoutMs` bounds connecting and each call; 0, the CLI's choice, waits
+    // as long as it takes. See Socket::connectTo.
+    //
+    // After ANY exception from call(), discard the client. A timed-out request
+    // may still be answered later, and that late reply would be read as the
+    // answer to the next request — the correlation check would catch it, but
+    // only after the connection was already useless.
     Client(const std::string& host, std::int32_t port,
-           std::string clientId = "dariyakyu-cli");
+           std::string clientId = "dariyakyu-cli", int timeoutMs = 0);
 
     // Sends `body` under `key` and returns the response body, positioned past the
     // correlation id.

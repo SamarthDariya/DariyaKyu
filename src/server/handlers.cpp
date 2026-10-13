@@ -178,6 +178,10 @@ NodeId leaderOf(const storage::Log& log, NodeId self) {
 // A failure leaves the topic PARTLY created — this broker's copies exist and a
 // peer's do not — and a retry answers TopicAlreadyExists. That is a real gap,
 // and it is M8's: a controller that reconciles assignments is what closes it.
+// How long a broker waits on a peer before giving up on it. Without a limit, a
+// peer that accepts and never answers would hang the client's CreateTopic.
+constexpr int kPeerTimeoutMs = 5'000;
+
 ErrorCode tellPeers(const CreateReplicasRequest::Topic& topic, const cluster::ClusterConfig& cluster,
                     NodeId self) {
     CreateReplicasRequest forward;
@@ -194,12 +198,13 @@ ErrorCode tellPeers(const CreateReplicasRequest::Topic& topic, const cluster::Cl
 
         ErrorCode error = ErrorCode::None;
         try {
-            Client     peer(node.host, node.port, "dariyakyu-broker-" + to_string(self));
+            Client     peer(node.host, node.port, "dariyakyu-broker-" + to_string(self),
+                            kPeerTimeoutMs);
             const auto reply = peer.call(ApiKey::CreateReplicas, body);
             BufferReader in(reply);
             error = decodeCreateTopicResponse(in).topics.at(0).error;
         } catch (const Error&) {
-            // Unreachable, or it hung up. Nothing more specific is true.
+            // Unreachable, hung up, or too slow. Nothing more specific is true.
             error = ErrorCode::Unknown;
         }
         if (first == ErrorCode::None) first = error;

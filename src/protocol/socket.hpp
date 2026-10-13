@@ -39,7 +39,13 @@ public:
     // see Acceptor.
     Socket accept() const;
 
-    static Socket connectTo(const std::string& host, std::int32_t port);
+    // Connects, failing with IoError(ETIMEDOUT) rather than waiting forever.
+    //
+    // `timeoutMs` bounds the connect AND every later read and write on the
+    // socket; 0 means no limit, which is what the CLI wants. A broker talking to
+    // a peer must set one: a peer that accepts and then never answers would
+    // otherwise hang the thread asking — a request handler, or a fetcher.
+    static Socket connectTo(const std::string& host, std::int32_t port, int timeoutMs = 0);
 
     // What the OS actually bound to, which is the only way to learn the port
     // after asking for 0.

@@ -5,6 +5,9 @@
 #include <vector>
 
 #include "protocol/error_codes.hpp"
+#include <cerrno>
+
+#include "protocol/client.hpp"
 #include "protocol/create_replicas.hpp"
 #include "protocol/create_topic.hpp"
 #include "protocol/list_offsets.hpp"
@@ -1186,6 +1189,41 @@ TEST_CASE("Connecting to nothing fails rather than hanging") {
     const_cast<Socket&>(listening).close();
 
     CHECK_THROWS_AS(Socket::connectTo("127.0.0.1", port), IoError);
+}
+
+TEST_CASE("A timed connect to a closed port is refused at once, not timed out") {
+    Socket        listening = Socket::listenOn("127.0.0.1", 0);
+    const int32_t port      = listening.localPort();
+    listening.close();
+
+    // Through the non-blocking path: connect, poll, then SO_ERROR says why.
+    const auto start = chrono::steady_clock::now();
+    try {
+        Socket::connectTo("127.0.0.1", port, 2'000);
+        FAIL("connected to a closed port");
+    } catch (const IoError& error) {
+        CHECK(error.errnoValue() == ECONNREFUSED);
+    }
+    CHECK(chrono::steady_clock::now() - start < chrono::milliseconds(1'000));
+}
+
+TEST_CASE("A call to a broker that never answers times out instead of hanging") {
+    // The kernel completes the handshake from the listen backlog, so the
+    // connect succeeds — and then nothing ever reads the request or replies.
+    // A peer in a long GC pause looks exactly like this.
+    const Socket silent = Socket::listenOn("127.0.0.1", 0);
+    protocol::Client client("127.0.0.1", silent.localPort(), "test", /*timeoutMs=*/100);
+
+    const auto start = chrono::steady_clock::now();
+    try {
+        client.call(ApiKey::Metadata, {});
+        FAIL("a broker that never answered was heard from");
+    } catch (const IoError& error) {
+        CHECK(error.errnoValue() == ETIMEDOUT);
+    }
+    const auto waited = chrono::steady_clock::now() - start;
+    CHECK(waited >= chrono::milliseconds(90));
+    CHECK(waited < chrono::milliseconds(2'000));
 }
 
 TEST_CASE("A connection serves requests until the client goes away") {

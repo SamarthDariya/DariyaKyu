@@ -1,6 +1,8 @@
 #include "protocol/socket.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -85,13 +87,42 @@ Socket Socket::accept() const {
     return Socket(accepted);
 }
 
-Socket Socket::connectTo(const string& host, int32_t port) {
+Socket Socket::connectTo(const string& host, int32_t port, int timeoutMs) {
     Socket socket(::socket(AF_INET, SOCK_STREAM, 0));
     if (!socket.isOpen()) throw IoError("socket", host, errno);
 
     const sockaddr_in address = addressFor(host, port);
-    if (::connect(socket.fd(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) < 0)
-        throw IoError("connect", host + ":" + to_string(port), errno);
+    const string      where   = host + ":" + to_string(port);
+
+    if (timeoutMs <= 0) {
+        if (::connect(socket.fd(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) < 0)
+            throw IoError("connect", where, errno);
+    } else {
+        // connect() itself has no timeout, and on macOS ignores SO_SNDTIMEO. So:
+        // start it non-blocking, wait for it with poll, then read how it ended.
+        const int flags = ::fcntl(socket.fd(), F_GETFL);
+        ::fcntl(socket.fd(), F_SETFL, flags | O_NONBLOCK);
+        if (::connect(socket.fd(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) < 0) {
+            if (errno != EINPROGRESS) throw IoError("connect", where, errno);
+
+            pollfd waiting{socket.fd(), POLLOUT, 0};
+            const int ready = ::poll(&waiting, 1, timeoutMs);
+            if (ready == 0) throw IoError("connect", where, ETIMEDOUT);
+            if (ready < 0) throw IoError("poll", where, errno);
+
+            int       failure = 0;
+            socklen_t length  = sizeof(failure);
+            ::getsockopt(socket.fd(), SOL_SOCKET, SO_ERROR, &failure, &length);
+            if (failure != 0) throw IoError("connect", where, failure);
+        }
+        ::fcntl(socket.fd(), F_SETFL, flags);   // blocking again, for the frame code
+
+        // Then every read and write: past this, they fail with EAGAIN, which the
+        // frame code reports as a timeout.
+        const timeval limit{timeoutMs / 1000, static_cast<suseconds_t>((timeoutMs % 1000) * 1000)};
+        ::setsockopt(socket.fd(), SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
+        ::setsockopt(socket.fd(), SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof(limit));
+    }
 
     const int on = 1;
     ::setsockopt(socket.fd(), IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
