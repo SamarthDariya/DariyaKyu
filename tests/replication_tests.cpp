@@ -249,7 +249,9 @@ struct LeaderAndFollower {
     unique_ptr<server::Broker> leader;
     unique_ptr<storage::Log>   follower;   // node 2's copy, on its own disk
 
-    LeaderAndFollower(const string& name, int batches) : dir(name) {
+    // `port` 0 lets the OS pick; a fixed one lets a test start a leader where a
+    // fetcher was already looking for one.
+    LeaderAndFollower(const string& name, int batches, int32_t port = 0) : dir(name) {
         storage::LogConfig config   = testConfig();
         config.replication.replicas = {1, 2};
         {
@@ -261,7 +263,7 @@ struct LeaderAndFollower {
         options.dataDir  = dir.file("leader");
         options.defaults = testConfig();
         options.host     = "127.0.0.1";
-        options.port     = 0;
+        options.port     = port;
         options.nodeId   = 1;
         leader           = make_unique<server::Broker>(options);
         leader->start();
@@ -354,4 +356,92 @@ TEST_CASE("A batch that fails its checksum in transit is refused, not copied") {
     auto client = cluster.connect();
     CHECK_THROWS_AS(fetchOnce(client, *cluster.follower, 2), CorruptData);
     CHECK(cluster.follower->logEndOffset() == Offset(0));
+}
+
+// ===========================================================================
+// ReplicaFetcher: the thread
+// ===========================================================================
+
+namespace {
+
+// Polls `done` every 10 ms for up to two seconds.
+template <typename Done>
+bool eventually(Done done) {
+    for (int waited = 0; waited < 200; ++waited) {
+        if (done()) return true;
+        this_thread::sleep_for(chrono::milliseconds(10));
+    }
+    return done();
+}
+
+ReplicaFetcher::Options followNode1(int32_t port) {
+    ReplicaFetcher::Options options;
+    options.self       = 2;
+    options.leaderHost = "127.0.0.1";
+    options.leaderPort = port;
+    options.timeoutMs  = 500;
+    options.idleWaitMs = 10;
+    options.backoffMs  = 20;
+    return options;
+}
+
+}  // namespace
+
+TEST_CASE("A fetcher catches up, commits, and keeps up as the leader writes") {
+    LeaderAndFollower cluster("fetcher-keeps-up", 3);
+    ReplicaFetcher    fetcher(followNode1(cluster.leader->port()), {cluster.follower.get()});
+    fetcher.start();
+
+    // Copied, then committed on both sides: the second pass tells the leader the
+    // follower has all 3, and the reply tells the follower they are committed.
+    CHECK(eventually([&] { return cluster.follower->highWatermark() == Offset(3); }));
+    CHECK(cluster.leaderLog().highWatermark() == Offset(3));
+
+    for (int i = 0; i < 2; ++i) {
+        auto bytes = makeUnstampedBatch(5000 + i, 48);
+        cluster.leaderLog().append(bytes);
+    }
+    CHECK(eventually([&] { return cluster.follower->highWatermark() == Offset(5); }));
+    CHECK(fetcher.failures() == 0);
+
+    fetcher.stop();
+}
+
+TEST_CASE("A fetcher stops promptly, even in the middle of a long wait") {
+    LeaderAndFollower cluster("fetcher-stops", 1);
+    auto              options = followNode1(cluster.leader->port());
+    options.idleWaitMs        = 10'000;
+    ReplicaFetcher fetcher(options, {cluster.follower.get()});
+    fetcher.start();
+    REQUIRE(eventually([&] { return cluster.follower->logEndOffset() == Offset(1); }));
+
+    // Caught up, so it is now sitting in a ten-second idle wait.
+    const auto start = chrono::steady_clock::now();
+    fetcher.stop();
+    CHECK(chrono::steady_clock::now() - start < chrono::milliseconds(1'000));
+}
+
+TEST_CASE("A fetcher backs off while the leader is gone, and catches up when it returns") {
+    // A port with nothing on it — yet.
+    int32_t port = 0;
+    {
+        protocol::Socket probe = protocol::Socket::listenOn("127.0.0.1", 0);
+        port                   = probe.localPort();
+    }
+
+    TempDir                 followerDir("fetcher-waits-follower");
+    storage::LogConfig      config   = testConfig();
+    config.replication.replicas      = {1, 2};
+    auto follower = storage::Log::create(TopicPartition{"orders", 0},
+                                         followerDir.file("orders-0"), config);
+
+    ReplicaFetcher fetcher(followNode1(port), {follower.get()});
+    fetcher.start();
+    CHECK(eventually([&] { return fetcher.failures() >= 2; }));   // refused, backing off
+
+    // The leader comes up on that port with records the follower never saw.
+    LeaderAndFollower cluster("fetcher-waits-leader", 3, port);
+    CHECK(eventually([&] { return follower->logEndOffset() == Offset(3); }));
+
+    fetcher.stop();
 }
