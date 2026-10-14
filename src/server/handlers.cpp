@@ -270,7 +270,7 @@ void handleCreateTopic(RequestContext& request, Response& out) {
                 config.replication.replicas = partition.replicas;
                 storage::Log& log = request.broker.logs.createPartition(
                     TopicPartition{asked.name, partition.partition}, config);
-                request.broker.replicas.track(log, storage::wallClockMillis());
+                adopt(request.broker, log);
             }
         } catch (const Error&) {
             // A disk that filled, a permission that changed. Not the client's
@@ -311,6 +311,20 @@ void handleCreateReplicas(RequestContext& request, Response& out) {
         for (const auto& partition : topic.partitions)
             if (holds(partition.replicas, request.broker.nodeId)) ours.push_back(&partition);
 
+        // Every leader must be one this broker can reach, checked before anything
+        // is created — adopt() would refuse it after the first partition, leaving
+        // the topic half made. A sender whose cluster list disagrees with ours is
+        // a misconfiguration, not something to guess around.
+        const cluster::ClusterConfig cluster = clusterOf(request.broker);
+        const bool leadersKnown = ranges::all_of(ours, [&](const auto* partition) {
+            return cluster.find(partition->replicas.front()) != nullptr;
+        });
+        if (!leadersKnown) {
+            result.error = ErrorCode::Unknown;
+            response.topics.push_back(std::move(result));
+            continue;
+        }
+
         // All or nothing, for the same reason as CreateTopic.
         const bool exists = ranges::any_of(ours, [&](const auto* partition) {
             return request.broker.logs.get(TopicPartition{result.name, partition->partition}) !=
@@ -330,7 +344,7 @@ void handleCreateReplicas(RequestContext& request, Response& out) {
                 config.replication.replicas = partition->replicas;
                 storage::Log& log = request.broker.logs.createPartition(
                     TopicPartition{result.name, partition->partition}, config);
-                request.broker.replicas.track(log, storage::wallClockMillis());
+                adopt(request.broker, log);
             }
         } catch (const Error&) {
             result.error = ErrorCode::Unknown;

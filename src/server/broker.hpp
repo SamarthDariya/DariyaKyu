@@ -101,6 +101,9 @@ private:
 
     group::OffsetStore      offsets_;
     replication::ReplicaManager replicas_;
+
+    // After logs_, so destroyed before it: these threads write to those logs.
+    replication::ReplicaFetchers fetchers_;
     group::GroupCoordinator groups_;
 
     ApiRegistry               registry_;

@@ -16,6 +16,11 @@ Broker::Broker(Options options)
       cleaner_(logs_, options_.cleaner),
       offsets_(logs_, options_.offsetsPartitions),
       replicas_(options_.nodeId, options_.replicaLagTimeMaxMs),
+      fetchers_([this] {
+          replication::ReplicaFetcher::Options fetching;
+          fetching.self = options_.nodeId;
+          return fetching;
+      }()),
       context_{logs_,
                groups_,
                offsets_,
@@ -24,7 +29,8 @@ Broker::Broker(Options options)
                options_.advertisedHost.empty() ? options_.host : options_.advertisedHost,
                options_.port,
                options_.cluster,
-               replicas_} {
+               replicas_,
+               fetchers_} {
     registerAllHandlers(registry_);
 }
 
@@ -43,11 +49,11 @@ void Broker::start() {
     context_.offsetsPartitions = group::ensureOffsetsTopic(logs_, options_.offsetsPartitions);
     offsets_.replay();
 
-    // Every partition this broker leads with followers, before any request can
-    // append to one: from here on, only the followers' fetches commit them.
-    const int64_t now = storage::wallClockMillis();
+    // Every partition already on disk, before any request can reach one: those
+    // led here with followers are tracked, so only their followers' fetches
+    // commit them; those followed here start being copied from their leader.
     for (const auto& tp : logs_.hostedPartitions())
-        if (storage::Log* log = logs_.get(tp)) replicas_.track(*log, now);
+        if (storage::Log* log = logs_.get(tp)) adopt(context_, *log);
 
     protocol::Socket listening = protocol::Socket::listenOn(options_.host, options_.port);
 
@@ -101,6 +107,10 @@ void Broker::stop() {
         acceptor_->stop();
         acceptor_.reset();
     }
+
+    // Then the threads copying from other brokers: they append to logs, and the
+    // logs must still be open while a fetch in flight finishes.
+    fetchers_.stop();
 
     {
         lock_guard lock(sweepMutex_);

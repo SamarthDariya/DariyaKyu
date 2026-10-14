@@ -956,3 +956,60 @@ TEST_CASE("Creating a topic on one broker creates the other brokers' copies") {
     node1.stop();
     node2.stop();
 }
+
+TEST_CASE("A topic created on one broker is copied to the other and committed by it") {
+    // Both brokers must know both addresses before either starts, so reserve
+    // two free ports first. Held open together, so the OS cannot hand out one
+    // port twice.
+    int32_t port1 = 0, port2 = 0;
+    {
+        auto probe1 = protocol::Socket::listenOn("127.0.0.1", 0);
+        auto probe2 = protocol::Socket::listenOn("127.0.0.1", 0);
+        port1       = probe1.localPort();
+        port2       = probe2.localPort();
+    }
+    const auto cluster = cluster::parseClusterConfig("1@127.0.0.1:" + to_string(port1) +
+                                                     ",2@127.0.0.1:" + to_string(port2));
+
+    TempDir dir("gate-replicated-topic");
+    auto    options1    = optionsFor(dir.file("node-1"));
+    options1.nodeId     = 1;
+    options1.port       = port1;
+    options1.cluster    = cluster;
+    auto options2       = optionsFor(dir.file("node-2"));
+    options2.nodeId     = 2;
+    options2.port       = port2;
+    options2.cluster    = cluster;
+    server::Broker node1(options1), node2(options2);
+    node1.start();
+    node2.start();
+
+    // Two copies of one partition: led by node 1, followed by node 2.
+    protocol::Client          client("127.0.0.1", port1);
+    CreateTopicRequest        create;
+    CreateTopicRequest::Topic topic;
+    topic.name              = "orders";
+    topic.replicationFactor = 2;
+    create.topics.push_back(topic);
+    const auto   created = client.call(ApiKey::CreateTopic, body(create, encodeCreateTopicRequest));
+    BufferReader in(created);
+    REQUIRE(decodeCreateTopicResponse(in).topics.at(0).error == ErrorCode::None);
+
+    for (const char* line : {"first", "second", "third"}) produceLine(client, "orders", 0, line);
+
+    // Nobody calls a fetch here. Node 2's own fetcher copies the records, and
+    // its fetches are what commit them on node 1.
+    const storage::Log* copy   = node2.logs().get(TopicPartition{"orders", 0});
+    const storage::Log* leader = node1.logs().get(TopicPartition{"orders", 0});
+    REQUIRE(copy != nullptr);
+    for (int waited = 0; waited < 300 && leader->highWatermark() < Offset(3); ++waited)
+        this_thread::sleep_for(chrono::milliseconds(10));
+
+    CHECK(copy->logEndOffset() == Offset(3));
+    CHECK(leader->highWatermark() == Offset(3));
+    CHECK(consumeFrom(client, "orders", 0, Offset(0)) ==
+          vector<string>{"first", "second", "third"});
+
+    node1.stop();
+    node2.stop();
+}

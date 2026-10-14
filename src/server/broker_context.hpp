@@ -5,12 +5,14 @@
 #include <string>
 
 #include "common/buffer.hpp"
+#include "common/errors.hpp"
 #include "common/types.hpp"
 #include "protocol/request_header.hpp"
 #include "protocol/response.hpp"
 #include "cluster/cluster_config.hpp"
 #include "group/group_coordinator.hpp"
 #include "group/offset_store.hpp"
+#include "replication/replica_fetcher.hpp"
 #include "replication/replica_manager.hpp"
 #include "storage/log_manager.hpp"
 
@@ -58,6 +60,9 @@ struct BrokerContext {
     // committed (M7). A handler reports what it sees — a follower's fetch, an
     // append — and the manager moves the high watermark.
     replication::ReplicaManager& replicas;
+
+    // The threads copying this broker's follower replicas from their leaders.
+    replication::ReplicaFetchers& fetchers;
 };
 
 inline cluster::ClusterConfig clusterOf(const BrokerContext& broker) {
@@ -83,5 +88,27 @@ struct RequestContext {
 
     BrokerContext& broker;
 };
+
+// Everything a newly hosted log needs before it serves anything (M7): tracked if
+// this broker leads it with followers, followed if this broker holds a
+// follower's copy. One function, called wherever a log appears — startup,
+// CreateTopic, CreateReplicas — so those paths cannot drift apart.
+//
+// Throws Error when the leader is not in this broker's cluster. At startup that
+// stops the broker: one that misread the cluster agrees with nobody about who
+// leads what, so refusing to start is the only safe answer.
+inline void adopt(BrokerContext& broker, storage::Log& log) {
+    broker.replicas.track(log, storage::wallClockMillis());
+
+    const auto& replicas = log.config().replication.replicas;
+    if (!log.config().replication.replicated() || replicas.front() == broker.nodeId) return;
+
+    const cluster::ClusterConfig cluster = clusterOf(broker);
+    const cluster::NodeAddress*  leader  = cluster.find(replicas.front());
+    if (leader == nullptr)
+        throw Error(log.topicPartition().toString() + " is led by node " +
+                    std::to_string(replicas.front()) + ", which is not in this broker's cluster");
+    broker.fetchers.follow(log, *leader);
+}
 
 }  // namespace dariyakyu::server

@@ -45,15 +45,20 @@ struct BareBroker {
     storage::LogManager     logs;
     group::OffsetStore      offsets;
     group::GroupCoordinator groups;
-    replication::ReplicaManager replicas{1};
-    BrokerContext           context;
+    replication::ReplicaManager  replicas{1};
+    replication::ReplicaFetchers fetchers{[] {
+        replication::ReplicaFetcher::Options fetching;
+        fetching.self = 1;
+        return fetching;
+    }()};
+    BrokerContext                context;
 
     explicit BareBroker(const string& name)
         : dir(name),
           logs(dir.file("data"), testConfig()),
           offsets(logs, group::kDefaultOffsetsPartitions),
           context{logs, groups, offsets, group::kDefaultOffsetsPartitions, 1, "127.0.0.1",
-                  9092, {}, replicas} {}
+                  9092, {}, replicas, fetchers} {}
 };
 
 // Builds a frame for `header` plus `body`, then runs it through the registry and
@@ -453,6 +458,7 @@ TEST_CASE("Metadata names every broker and each partition's real leader") {
 
 TEST_CASE("Metadata reports who is in sync, and only where it knows") {
     ServingBroker broker("handler-metadata-isr");
+    broker.context.cluster = cluster::parseClusterConfig("1@127.0.0.1:1,2@127.0.0.1:2");
 
     // Partition 0 led here, followed by 2. Partition 1 led by 2, followed here.
     CreateReplicasRequest::Topic topic;
@@ -471,6 +477,7 @@ TEST_CASE("Metadata reports who is in sync, and only where it knows") {
     };
 
     auto partitions = describeOrders();
+    REQUIRE(partitions.size() == 2);
     CHECK(partitions[0].isr == vector<NodeId>{1, 2});   // node 2 inside its first window
     CHECK(partitions[1].isr.empty());                   // only node 2 knows
 
@@ -640,7 +647,8 @@ TEST_CASE("A replication factor the cluster cannot hold is refused") {
 
 TEST_CASE("A peer's CreateReplicas makes this broker's copies with the leader's rules") {
     ServingBroker broker("handler-createreplicas");
-    broker.context.nodeId = 2;
+    broker.context.nodeId  = 2;
+    broker.context.cluster = cluster::parseClusterConfig("1@127.0.0.1:1,2@127.0.0.1:2,3@127.0.0.1:3");
 
     REQUIRE(firstError(broker.call(ApiKey::CreateReplicas, encoded(ordersFromBroker1()))) ==
             ErrorCode::None);
@@ -657,9 +665,20 @@ TEST_CASE("A peer's CreateReplicas makes this broker's copies with the leader's 
     CHECK(config.retention.retentionMs == 60'000);
 }
 
+TEST_CASE("A CreateReplicas naming a leader this broker cannot reach creates nothing") {
+    ServingBroker broker("handler-createreplicas-unknown-leader");
+    broker.context.nodeId = 2;   // and no cluster: node 1 is a stranger here
+
+    // Refused before the first partition is made, not after it.
+    CHECK(firstError(broker.call(ApiKey::CreateReplicas, encoded(ordersFromBroker1()))) ==
+          ErrorCode::Unknown);
+    CHECK(broker.logs.partitionCount() == 0);
+}
+
 TEST_CASE("A CreateReplicas for copies that exist, or a bad name, changes nothing") {
     ServingBroker broker("handler-createreplicas-refused");
-    broker.context.nodeId = 2;
+    broker.context.nodeId  = 2;
+    broker.context.cluster = cluster::parseClusterConfig("1@127.0.0.1:1,2@127.0.0.1:2,3@127.0.0.1:3");
     broker.call(ApiKey::CreateReplicas, encoded(ordersFromBroker1()));
     REQUIRE(broker.logs.partitionCount() == 2);
 
