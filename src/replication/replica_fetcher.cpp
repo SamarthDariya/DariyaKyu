@@ -64,6 +64,11 @@ FetchRound fetchOnce(protocol::Client& leader, storage::Log& log, NodeId self, i
 ReplicaFetcher::ReplicaFetcher(Options options, vector<storage::Log*> partitions)
     : options_(std::move(options)), partitions_(std::move(partitions)) {}
 
+void ReplicaFetcher::follow(storage::Log* log) {
+    lock_guard lock(mutex_);
+    partitions_.push_back(log);
+}
+
 ReplicaFetcher::~ReplicaFetcher() {
     stop();
 }
@@ -97,7 +102,14 @@ void ReplicaFetcher::run() {
             if (!leader)
                 leader.emplace(options_.leaderHost, options_.leaderPort, clientId, options_.timeoutMs);
 
-            for (storage::Log* log : partitions_) {
+            // A copy of the list, so follow() can add to it mid-pass without
+            // this loop holding the lock across network calls.
+            vector<storage::Log*> partitions;
+            {
+                lock_guard lock(mutex_);
+                partitions = partitions_;
+            }
+            for (storage::Log* log : partitions) {
                 const FetchRound round = fetchOnce(*leader, *log, options_.self);
                 if (round.error != protocol::ErrorCode::None) failed = true;
                 if (round.batches > 0) copied = true;
@@ -115,6 +127,40 @@ void ReplicaFetcher::run() {
         const int64_t wait = failed ? options_.backoffMs : copied ? 0 : options_.idleWaitMs;
         if (waitFor(wait)) return;
     }
+}
+
+ReplicaFetchers::ReplicaFetchers(ReplicaFetcher::Options defaults) : defaults_(std::move(defaults)) {}
+
+ReplicaFetchers::~ReplicaFetchers() {
+    stop();
+}
+
+void ReplicaFetchers::follow(storage::Log& log, const cluster::NodeAddress& leader) {
+    lock_guard lock(mutex_);
+    if (stopped_) return;
+
+    auto& fetcher = byLeader_[leader.id];
+    if (fetcher) {
+        fetcher->follow(&log);
+        return;
+    }
+    ReplicaFetcher::Options options = defaults_;
+    options.leaderHost              = leader.host;
+    options.leaderPort              = leader.port;
+    fetcher = make_unique<ReplicaFetcher>(options, vector<storage::Log*>{&log});
+    fetcher->start();
+}
+
+void ReplicaFetchers::stop() {
+    // Taken out under the lock, stopped outside it: stopping joins a thread that
+    // may be mid-fetch for up to a timeout, and follow() should not wait on that.
+    map<NodeId, unique_ptr<ReplicaFetcher>> stopping;
+    {
+        lock_guard lock(mutex_);
+        stopped_ = true;
+        stopping = std::move(byLeader_);
+    }
+    for (auto& [leader, fetcher] : stopping) fetcher->stop();
 }
 
 }  // namespace dariyakyu::replication

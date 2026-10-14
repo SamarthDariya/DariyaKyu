@@ -163,7 +163,7 @@ add_library(dariyakyu_replication
   src/replication/replica_fetcher.cpp
 )
 
-target_link_libraries(dariyakyu_replication PUBLIC dariyakyu_protocol)
+target_link_libraries(dariyakyu_replication PUBLIC dariyakyu_protocol dariyakyu_cluster)
 target_compile_options(dariyakyu_replication PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------

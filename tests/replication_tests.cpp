@@ -445,3 +445,53 @@ TEST_CASE("A fetcher backs off while the leader is gone, and catches up when it 
 
     fetcher.stop();
 }
+
+// ===========================================================================
+// ReplicaFetchers: one fetcher per leader, partitions added as they appear
+// ===========================================================================
+
+namespace {
+
+// A second partition on the leader, "payments-0", and node 2's empty copy of it.
+unique_ptr<storage::Log> addPayments(LeaderAndFollower& cluster, int batches) {
+    storage::LogConfig config   = testConfig();
+    config.replication.replicas = {1, 2};
+    storage::Log& onLeader = cluster.leader->logs().createPartition(TopicPartition{"payments", 0}, config);
+    for (int i = 0; i < batches; ++i) {
+        auto bytes = makeUnstampedBatch(7000 + i, 48);
+        onLeader.append(bytes);
+    }
+    return storage::Log::create(TopicPartition{"payments", 0},
+                                cluster.dir.file("follower/payments-0"), config);
+}
+
+}  // namespace
+
+TEST_CASE("A partition added while following is copied too") {
+    LeaderAndFollower cluster("fetchers-add", 3);
+    ReplicaFetchers   fetchers(followNode1(0));   // address comes from follow()
+    const cluster::NodeAddress leader{1, "127.0.0.1", cluster.leader->port()};
+
+    fetchers.follow(*cluster.follower, leader);
+    REQUIRE(eventually([&] { return cluster.follower->logEndOffset() == Offset(3); }));
+
+    // A topic created after the fetcher started: same leader, so it joins that
+    // fetcher's list rather than opening a second connection.
+    auto payments = addPayments(cluster, 2);
+    fetchers.follow(*payments, leader);
+    CHECK(eventually([&] { return payments->logEndOffset() == Offset(2); }));
+
+    fetchers.stop();
+}
+
+TEST_CASE("Once stopped, nothing more is followed") {
+    LeaderAndFollower cluster("fetchers-stopped", 3);
+    ReplicaFetchers   fetchers(followNode1(0));
+    fetchers.stop();
+
+    // A CreateReplicas racing with shutdown lands here. Starting a thread now
+    // would leave one running that nobody will ever join.
+    fetchers.follow(*cluster.follower, {1, "127.0.0.1", cluster.leader->port()});
+    this_thread::sleep_for(chrono::milliseconds(100));
+    CHECK(cluster.follower->logEndOffset() == Offset(0));
+}

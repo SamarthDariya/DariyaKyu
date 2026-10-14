@@ -4,11 +4,14 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "cluster/cluster_config.hpp"
 #include "common/types.hpp"
 #include "protocol/client.hpp"
 #include "protocol/error_codes.hpp"
@@ -74,6 +77,10 @@ public:
 
     // `partitions` must outlive the fetcher, as with ReplicaManager.
     ReplicaFetcher(Options options, std::vector<storage::Log*> partitions);
+
+    // Adds a partition to follow, from the next pass on. Safe while running:
+    // a topic created while the broker is up gets its copy followed at once.
+    void follow(storage::Log* log);
     ~ReplicaFetcher();
 
     ReplicaFetcher(const ReplicaFetcher&)            = delete;
@@ -94,14 +101,40 @@ private:
     // Sleeps up to `ms`, waking early for stop(). True if stopping.
     bool waitFor(std::int64_t ms);
 
-    Options                    options_;
-    std::vector<storage::Log*> partitions_;
+    Options options_;
 
     std::thread                thread_;
-    std::mutex                 mutex_;
+    std::mutex                 mutex_;        // guards partitions_ and stopping_
+    std::vector<storage::Log*> partitions_;
     std::condition_variable    wake_;
     bool                       stopping_ = false;
     std::atomic<std::uint64_t> failures_{0};
+};
+
+// Every ReplicaFetcher on this broker: one per leader it follows anything from.
+//
+// One per LEADER, not per partition, so a broker following fifty partitions on
+// one peer holds one connection to it rather than fifty.
+class ReplicaFetchers {
+public:
+    // `defaults` supplies everything but the leader's address: self, timeouts,
+    // waits.
+    explicit ReplicaFetchers(ReplicaFetcher::Options defaults);
+    ~ReplicaFetchers();
+
+    // Follows `log` from `leader`, starting that leader's fetcher if this is the
+    // first partition it has here. Ignored once stopped, so a CreateReplicas
+    // racing with shutdown cannot start a thread nobody will join.
+    void follow(storage::Log& log, const cluster::NodeAddress& leader);
+
+    // Stops every fetcher. Before the logs they write to are closed.
+    void stop();
+
+private:
+    ReplicaFetcher::Options                           defaults_;
+    std::mutex                                        mutex_;
+    std::map<NodeId, std::unique_ptr<ReplicaFetcher>> byLeader_;
+    bool                                              stopped_ = false;
 };
 
 }  // namespace dariyakyu::replication
